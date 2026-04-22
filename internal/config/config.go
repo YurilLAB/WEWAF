@@ -76,7 +76,7 @@ func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return cfg, nil
+			return nil, fmt.Errorf("config: file not found: %q", path)
 		}
 		return nil, fmt.Errorf("config: read %q: %w", path, err)
 	}
@@ -104,18 +104,40 @@ func (c *Config) Validate() error {
 	if c.MaxConcurrentReq <= 0 {
 		c.MaxConcurrentReq = 10000
 	}
+	if c.Mode != "active" && c.Mode != "detection" && c.Mode != "learning" {
+		c.Mode = "active"
+	}
 	return nil
 }
 
 // Snapshot returns a pointer to a shallow copy for safe read-only access.
 // Do not modify the returned value.
 func (c *Config) Snapshot() *Config {
-	cp := *c
-	cp.RuleFiles = make([]string, len(c.RuleFiles))
+	cp := &Config{
+		ListenAddr:      c.ListenAddr,
+		AdminAddr:       c.AdminAddr,
+		BackendURL:      c.BackendURL,
+		TrustXFF:        c.TrustXFF,
+		ReadTimeoutSec:  c.ReadTimeoutSec,
+		WriteTimeoutSec: c.WriteTimeoutSec,
+		MaxCPUCores:     c.MaxCPUCores,
+		MaxMemoryMB:     c.MaxMemoryMB,
+		MaxConcurrentReq: c.MaxConcurrentReq,
+		MaxBodyBytes:    c.MaxBodyBytes,
+		BlockThreshold:  c.BlockThreshold,
+		RateLimitRPS:    c.RateLimitRPS,
+		RateLimitBurst:  c.RateLimitBurst,
+		BruteForceWindowSec: c.BruteForceWindowSec,
+		BruteForceThreshold: c.BruteForceThreshold,
+		Mode:            c.ModeSnapshot(),
+		LogLevel:        c.LogLevel,
+		AuditLogPath:    c.AuditLogPath,
+		RuleFiles:       make([]string, len(c.RuleFiles)),
+	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	cp.modeAtomic = atomic.Value{}
-	cp.modeAtomic.Store(c.ModeSnapshot())
-	return &cp
+	cp.modeAtomic.Store(cp.Mode)
+	return cp
 }
 
 // SetMode updates the WAF mode at runtime.

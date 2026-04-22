@@ -84,10 +84,19 @@ func (m *Metrics) RecordPass(bytesOut int, statusCode int) {
 	_ = statusCode // reserved for future per-status telemetry
 }
 
+// RecordBlock increments blocked requests and stores a summary.
+func (m *Metrics) RecordBlockFromResponse(ip, method, path, ruleID, message string, score int) {
+	m.RecordBlock(ip, method, path, ruleID, message, score)
+}
+
 // Snapshot returns a read-only copy of current metrics.
 func (m *Metrics) Snapshot() map[string]interface{} {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	recent := make([]BlockRecord, len(m.RecentBlocks))
+	copy(recent, m.RecentBlocks)
+	history := make([]TrafficPoint, len(m.TrafficHistory))
+	copy(history, m.TrafficHistory)
 	return map[string]interface{}{
 		"total_requests":   m.TotalRequests,
 		"blocked_requests": m.BlockedRequests,
@@ -95,8 +104,8 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"total_bytes_in":   m.TotalBytesIn,
 		"total_bytes_out":  m.TotalBytesOut,
 		"unique_ips":       len(m.UniqueIPs),
-		"recent_blocks":    m.RecentBlocks,
-		"traffic_history":  m.TrafficHistory,
+		"recent_blocks":    recent,
+		"traffic_history":  history,
 	}
 }
 
@@ -125,6 +134,24 @@ func (m *Metrics) AddTrafficPoint(reqs, blocked int) {
 	})
 	// Keep last 24 hours of 5-minute buckets = 288 points.
 	if len(m.TrafficHistory) > 288 {
-		m.TrafficHistory = m.TrafficHistory[len(m.TrafficHistory)-288:]
+		trimmed := make([]TrafficPoint, 288)
+		copy(trimmed, m.TrafficHistory[len(m.TrafficHistory)-288:])
+		m.TrafficHistory = trimmed
 	}
+}
+
+// GetTrafficHistory returns a copy of the traffic history slice.
+func (m *Metrics) GetTrafficHistory() []TrafficPoint {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]TrafficPoint, len(m.TrafficHistory))
+	copy(out, m.TrafficHistory)
+	return out
+}
+
+// RecordError increments a backend error counter.
+func (m *Metrics) RecordError() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// TODO: add dedicated error counter field
 }

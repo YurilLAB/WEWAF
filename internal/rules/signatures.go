@@ -65,12 +65,12 @@ func DefaultRules() []core.Rule {
 		// === SSRF / Protocol Attacks ===
 		{ID: "SSRF-001", Name: "SSRF Cloud Metadata", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Cloud metadata endpoint", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)169\.254\.169\.254`},
 		{ID: "SSRF-002", Name: "SSRF Private IP", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Private IP in URL parameter", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})`},
-		{ID: "SMUG-001", Name: "HTTP Smuggling TE.CL", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Transfer-Encoding + Content-Length conflict", Targets: []string{"headers"}, Pattern: `(?i)^$`}, // handled by special logic, not regex
-		{ID: "SMUG-002", Name: "HTTP Smuggling Double CL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Duplicate Content-Length headers", Targets: []string{"headers"}, Pattern: `(?i)^$`}, // handled by special logic
+		{ID: "SMUG-001", Name: "HTTP Smuggling TE.CL", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Transfer-Encoding + Content-Length conflict", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic, not regex
+		{ID: "SMUG-002", Name: "HTTP Smuggling Double CL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Duplicate Content-Length headers", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic
 
 		// === Scanner / Bot UA ===
 		{ID: "SCAN-001", Name: "Known Scanner UA", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Known malicious scanner User-Agent", Targets: []string{"headers"}, Pattern: `(?i)(sqlmap|nikto|nmap|gobuster|dirbuster|wfuzz|burpsuite|burp|masscan|zgrab|commix)`},
-		{ID: "SCAN-002", Name: "Empty User-Agent", Phase: core.PhaseRequestHeaders, Score: 20, Action: core.ActionLog, Description: "Missing or empty User-Agent", Targets: []string{"headers"}, Pattern: `(?i)^$`}, // special logic
+		{ID: "SCAN-002", Name: "Empty User-Agent", Phase: core.PhaseRequestHeaders, Score: 20, Action: core.ActionLog, Description: "Missing or empty User-Agent", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // special logic
 	}
 }
 
@@ -139,7 +139,7 @@ func targetMatches(targets []string, key string) bool {
 			return true
 		}
 		// Allow "args" to match "args.foo" etc.
-		if strings.HasPrefix(strings.ToLower(key), strings.ToLower(t)) {
+		if t != "" && strings.HasPrefix(strings.ToLower(key), strings.ToLower(t)+".") {
 			return true
 		}
 	}

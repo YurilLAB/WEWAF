@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,15 +24,21 @@ import (
 
 // WAFProxy wraps a reverse proxy with WAF inspection.
 type WAFProxy struct {
-	cfg       *config.Config
-	eng       *engine.Engine
-	metrics   *telemetry.Metrics
-	bf        *bruteforce.Detector
-	sema      *limits.Semaphore
-	transport http.RoundTripper
-	backend   *url.URL
-	proxy     *httputil.ReverseProxy
+	cfg     *config.Config
+	eng     *engine.Engine
+	metrics *telemetry.Metrics
+	bf      *bruteforce.Detector
+	sema    *limits.Semaphore
+	backend *url.URL
+	proxy   *httputil.ReverseProxy
 }
+
+// seekableBody wraps a bytes.Reader so it can be re-read by the engine.
+type seekableBody struct {
+	*bytes.Reader
+}
+
+func (s *seekableBody) Close() error { return nil }
 
 // NewWAFProxy creates a proxy that inspects traffic before forwarding.
 func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metrics, bf *bruteforce.Detector) (*WAFProxy, error) {
@@ -49,15 +56,10 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 		bf:      bf,
 		sema:    sema,
 		backend: backend,
-		transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-		},
 	}
 
 	wp.proxy = httputil.NewSingleHostReverseProxy(backend)
-	wp.proxy.Transport = wp.wafTransport()
+	wp.proxy.ModifyResponse = wp.modifyResponse
 	wp.proxy.ErrorHandler = wp.errorHandler
 
 	return wp, nil
@@ -73,7 +75,6 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Create WAF transaction.
 	tx := core.NewTransaction(w, r, wp.cfg.TrustXFF)
-	// Clamp reported ContentLength to avoid uint64 wrap on chunked requests.
 	reportedLen := int(r.ContentLength)
 	if reportedLen < 0 {
 		reportedLen = 0
@@ -88,112 +89,148 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Phase 1: Request Headers.
-	if intr := wp.eng.ProcessRequestHeaders(tx); intr != nil {
-		wp.metrics.RecordBlock(tx.ClientIP, r.Method, r.URL.Path, "multi", intr.Message, tx.ScoreSnapshot())
-		wp.writeBlock(w, intr, tx.ID)
-		wp.eng.ProcessLogging(tx)
-		return
-	}
-
-	// Buffer body for inspection, capped at MaxBodyBytes regardless of Content-Length.
+	// Buffer body for inspection and forwarding.
+	var body []byte
 	if r.Body != nil {
 		limited := io.LimitReader(r.Body, wp.cfg.MaxBodyBytes)
-		body, err := io.ReadAll(limited)
-		if err == nil {
-			_ = r.Body.Close()
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			r.ContentLength = int64(len(body))
+		var err error
+		body, err = io.ReadAll(limited)
+		if err != nil {
+			wp.eng.LogError("proxy: body read error: %v", err)
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			wp.eng.ProcessLogging(tx)
+			return
 		}
+		_ = r.Body.Close()
+		r.Body = &seekableBody{Reader: bytes.NewReader(body)}
+		r.ContentLength = int64(len(body))
+		r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		r.GetBody = func() (io.ReadCloser, error) {
+			return &seekableBody{Reader: bytes.NewReader(body)}, nil
+		}
+		tx.SetMetadata("body", body)
+	}
+
+	// Brute-force record early so blocked attempts still count.
+	isLogin := isLoginRequest(r)
+	if wp.bf != nil && isLogin {
+		key := bruteforce.Key(tx.ClientIP, "")
+		wp.bf.Record(key)
+	}
+
+	// Phase 1: Request Headers.
+	if intr := wp.eng.ProcessRequestHeaders(tx); intr != nil {
+		wp.handleBlock(w, tx, intr)
+		return
 	}
 
 	// Phase 2: Request Body.
 	if intr := wp.eng.ProcessRequestBody(tx); intr != nil {
-		wp.metrics.RecordBlock(tx.ClientIP, r.Method, r.URL.Path, "multi", intr.Message, tx.ScoreSnapshot())
-		wp.writeBlock(w, intr, tx.ID)
-		wp.eng.ProcessLogging(tx)
+		wp.handleBlock(w, tx, intr)
 		return
 	}
 
-	// Brute-force check for login endpoints.
-	if wp.bf != nil && isLoginRequest(r) {
+	// Brute-force enforcement.
+	if wp.bf != nil && isLogin {
 		key := bruteforce.Key(tx.ClientIP, "")
-		count := wp.bf.Record(key)
-		if count >= wp.cfg.BruteForceThreshold {
-			wp.metrics.RecordBlock(tx.ClientIP, r.Method, r.URL.Path, "BRUTE-FORCE", "Brute-force threshold exceeded", 100)
-			wp.writeBlock(w, &core.Interruption{Action: core.ActionBlock, Status: http.StatusForbidden, Message: "Too many login attempts"}, tx.ID)
-			wp.eng.ProcessLogging(tx)
-			return
+		if wp.bf.IsBruteForce(key, wp.cfg.BruteForceThreshold) {
+			mode := wp.cfg.ModeSnapshot()
+			if mode != "detection" && mode != "learning" {
+				wp.metrics.RecordBlock(tx.ClientIP, r.Method, r.URL.Path, "BRUTE-FORCE", "Brute-force threshold exceeded", 100)
+				intr := &core.Interruption{Action: core.ActionBlock, Status: http.StatusForbidden, Message: "Too many login attempts"}
+				tx.SetBlocked(core.PhaseRequestBody)
+				tx.AddMatch(core.Match{
+					RuleID:    "BRUTE-FORCE",
+					RuleName:  "Brute-force threshold exceeded",
+					Phase:     core.PhaseRequestBody,
+					Target:    "login",
+					Value:     "",
+					Score:     100,
+					Action:    core.ActionBlock,
+					Message:   "Too many login attempts",
+					Timestamp: time.Now().UTC(),
+				})
+				wp.handleBlock(w, tx, intr)
+				return
+			}
 		}
 	}
 
 	// Wrap response writer to capture pass metrics.
 	rec := &responseRecorder{ResponseWriter: w}
 
-	// Attach transaction to context so the response inspector can access it.
+	// Attach transaction to context so ModifyResponse can access it.
 	r = WithTransaction(r, tx)
 
 	// Forward to backend.
 	wp.proxy.ServeHTTP(rec, r)
-	wp.metrics.RecordPass(rec.bytesWritten, rec.statusCode)
 
-	// Phases 3-5 happen inside the transport/response pipeline.
+	if !tx.IsBlocked() {
+		wp.metrics.RecordPass(rec.bytesWritten, rec.statusCode)
+	}
 	wp.eng.ProcessLogging(tx)
 }
 
-// wafTransport wraps the real transport to intercept responses.
-func (wp *WAFProxy) wafTransport() http.RoundTripper {
-	return &wafRoundTripper{
-		base: wp.transport,
-		eng:  wp.eng,
-	}
-}
-
-// wafRoundTripper inspects backend responses.
-type wafRoundTripper struct {
-	base http.RoundTripper
-	eng  *engine.Engine
-}
-
-func (rt *wafRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// We need the transaction context to associate with this request.
-	// Since http.Request carries a Context, we stash tx there.
-	tx, ok := req.Context().Value(txKey).(*core.Transaction)
+// modifyResponse inspects backend responses (Phase 3 and 4).
+func (wp *WAFProxy) modifyResponse(res *http.Response) error {
+	tx, ok := res.Request.Context().Value(txKey).(*core.Transaction)
 	if !ok {
-		// No WAF context; pass through directly (should not happen in normal flow).
-		return rt.base.RoundTrip(req)
-	}
-
-	resp, err := rt.base.RoundTrip(req)
-	if err != nil {
-		return resp, err
+		return nil
 	}
 
 	// Phase 3: Response Headers.
-	if intr := rt.eng.ProcessResponseHeaders(tx, resp.StatusCode, resp.Header); intr != nil {
-		// We cannot rewrite the response after headers are sent in standard RoundTripper,
-		// but we can drain the body and return a synthetic response.
-		if resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		return wpSyntheticResponse(intr), nil
+	if intr := wp.eng.ProcessResponseHeaders(tx, res.StatusCode, res.Header); intr != nil {
+		wp.recordBlockFromResponse(tx, intr)
+		return wp.replaceWithSynthetic(res, intr)
 	}
 
-	// Phase 4: Response Body (capped at 1 MiB to limit latency).
-	if resp.Body != nil {
-		const maxRespBody = 1 << 20 // 1 MiB
-		limited := io.LimitReader(resp.Body, maxRespBody)
-		body, _ := io.ReadAll(limited)
-		_ = resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		resp.ContentLength = int64(len(body))
-		if intr := rt.eng.ProcessResponseBody(tx, body); intr != nil {
-			resp.Body.Close()
-			return wpSyntheticResponse(intr), nil
+	// Phase 4: Response Body (inspect capped prefix, forward full body).
+	if res.Body != nil {
+		maxInspect := wp.cfg.MaxBodyBytes
+		if maxInspect <= 0 {
+			maxInspect = 1 << 20
 		}
+		limited := io.LimitReader(res.Body, maxInspect)
+		inspectBody, err := io.ReadAll(limited)
+		if err != nil {
+			return err
+		}
+
+		if intr := wp.eng.ProcessResponseBody(tx, inspectBody); intr != nil {
+			wp.recordBlockFromResponse(tx, intr)
+			return wp.replaceWithSynthetic(res, intr)
+		}
+
+		// Reconstruct full body: inspected prefix + remainder of original stream.
+		res.Body = io.NopCloser(io.MultiReader(bytes.NewReader(inspectBody), res.Body))
 	}
 
-	return resp, nil
+	return nil
+}
+
+func (wp *WAFProxy) recordBlockFromResponse(tx *core.Transaction, intr *core.Interruption) {
+	wp.metrics.RecordBlock(tx.ClientIP, tx.Request.Method, tx.Request.URL.Path, "multi", intr.Message, tx.ScoreSnapshot())
+	tx.SetBlocked(core.PhaseResponseBody)
+}
+
+func (wp *WAFProxy) replaceWithSynthetic(res *http.Response, intr *core.Interruption) error {
+	body := []byte(fmt.Sprintf("%d %s\nRequest blocked by WEWaf.\n", intr.Status, http.StatusText(intr.Status)))
+	res.StatusCode = intr.Status
+	res.Status = http.StatusText(intr.Status)
+	res.Header = http.Header{
+		"Content-Type":   []string{"text/plain; charset=utf-8"},
+		"X-WAF-Action":   []string{intr.Action.String()},
+		"Content-Length": []string{strconv.Itoa(len(body))},
+	}
+	res.Body = io.NopCloser(bytes.NewReader(body))
+	res.ContentLength = int64(len(body))
+	return nil
+}
+
+func (wp *WAFProxy) handleBlock(w http.ResponseWriter, tx *core.Transaction, intr *core.Interruption) {
+	wp.metrics.RecordBlock(tx.ClientIP, tx.Request.Method, tx.Request.URL.Path, "multi", intr.Message, tx.ScoreSnapshot())
+	wp.writeBlock(w, intr, tx.ID)
+	wp.eng.ProcessLogging(tx)
 }
 
 // writeBlock writes an HTTP error response for a blocked transaction,
@@ -207,18 +244,18 @@ func (wp *WAFProxy) writeBlock(w http.ResponseWriter, intr *core.Interruption, t
 				return
 			}
 		}
-		// Fallback: force close via chunked terminator trick.
 		w.Header().Set("Connection", "close")
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-WAF-Action", intr.Action.String())
 	w.WriteHeader(intr.Status)
-	_, _ = fmt.Fprintf(w, "403 Forbidden\nRequest blocked by WEWaf.\nIncident ID: %s\n", txID)
+	_, _ = fmt.Fprintf(w, "%d %s\nRequest blocked by WEWaf.\nIncident ID: %s\n", intr.Status, http.StatusText(intr.Status), txID)
 }
 
 // errorHandler handles backend connection errors.
 func (wp *WAFProxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
 	wp.eng.LogError("proxy: backend error: %v", err)
+	wp.metrics.RecordError()
 	http.Error(w, "Bad Gateway", http.StatusBadGateway)
 }
 
@@ -226,22 +263,6 @@ func (wp *WAFProxy) errorHandler(w http.ResponseWriter, r *http.Request, err err
 type txKeyType struct{}
 
 var txKey = txKeyType{}
-
-// wpSyntheticResponse creates a fake HTTP response when the WAF blocks during the response phase.
-func wpSyntheticResponse(intr *core.Interruption) *http.Response {
-	body := []byte("403 Forbidden\nRequest blocked by WEWaf.\n")
-	return &http.Response{
-		StatusCode: intr.Status,
-		Status:     http.StatusText(intr.Status),
-		Header: http.Header{
-			"Content-Type":   []string{"text/plain; charset=utf-8"},
-			"X-WAF-Action":   []string{intr.Action.String()},
-			"Content-Length": []string{fmt.Sprintf("%d", len(body))},
-		},
-		Body:          io.NopCloser(bytes.NewReader(body)),
-		ContentLength: int64(len(body)),
-	}
-}
 
 // WithTransaction returns a new request with the WAF transaction attached.
 func WithTransaction(req *http.Request, tx *core.Transaction) *http.Request {
@@ -287,7 +308,8 @@ func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 }
 
 func isWebSocket(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket")
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
 
 func isLoginRequest(r *http.Request) bool {

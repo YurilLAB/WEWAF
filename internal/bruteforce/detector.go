@@ -13,6 +13,7 @@ type Detector struct {
 	entries  map[string]*entry
 	ticker   *time.Ticker
 	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 type entry struct {
@@ -21,6 +22,9 @@ type entry struct {
 
 // NewDetector creates a brute-force detector with the given window.
 func NewDetector(window time.Duration) *Detector {
+	if window <= 0 {
+		window = time.Minute
+	}
 	d := &Detector{
 		window:  window,
 		entries: make(map[string]*entry),
@@ -45,7 +49,7 @@ func (d *Detector) Record(key string) int {
 	e.attempts = append(e.attempts, now)
 	// Trim old attempts outside the window.
 	cutoff := now.Add(-d.window)
-	idx := 0
+	idx := len(e.attempts)
 	for i, t := range e.attempts {
 		if t.After(cutoff) {
 			idx = i
@@ -81,8 +85,10 @@ func (d *Detector) IsBruteForce(key string, threshold int) bool {
 
 // Stop halts the background janitor.
 func (d *Detector) Stop() {
-	close(d.stopCh)
-	d.ticker.Stop()
+	d.stopOnce.Do(func() {
+		close(d.stopCh)
+		d.ticker.Stop()
+	})
 }
 
 func (d *Detector) janitor() {

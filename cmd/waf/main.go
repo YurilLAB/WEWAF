@@ -101,7 +101,11 @@ func main() {
 	// 9. Start background traffic sampler for the line graph.
 	stopSampler := startTrafficSampler(metrics)
 
-	// 10. Start servers.
+	// 10. Wait for shutdown signal.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	// 11. Start servers.
 	go func() {
 		log.Printf("admin dashboard listening on http://%s", cfg.AdminAddr)
 		if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -112,13 +116,11 @@ func main() {
 	go func() {
 		log.Printf("WAF proxy listening on http://%s -> %s", cfg.ListenAddr, cfg.BackendURL)
 		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("proxy server error: %v", err)
+			log.Printf("proxy server error: %v", err)
+			sigCh <- os.Interrupt
 		}
 	}()
 
-	// 11. Wait for shutdown signal.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	log.Println("shutdown signal received, gracefully stopping...")
 
@@ -147,7 +149,14 @@ func startTrafficSampler(m *telemetry.Metrics) func() {
 				snap := m.Snapshot()
 				currReq, _ := snap["total_requests"].(uint64)
 				currBlocked, _ := snap["blocked_requests"].(uint64)
-				m.AddTrafficPoint(int(currReq-lastReq), int(currBlocked-lastBlocked))
+				var reqDelta, blockedDelta int
+				if currReq >= lastReq {
+					reqDelta = int(currReq - lastReq)
+				}
+				if currBlocked >= lastBlocked {
+					blockedDelta = int(currBlocked - lastBlocked)
+				}
+				m.AddTrafficPoint(reqDelta, blockedDelta)
 				lastReq = currReq
 				lastBlocked = currBlocked
 			case <-stop:

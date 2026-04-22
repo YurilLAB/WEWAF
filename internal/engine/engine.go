@@ -76,8 +76,17 @@ func (e *Engine) ProcessRequestHeaders(tx *core.Transaction) *core.Interruption 
 // ProcessRequestBody evaluates rules against the buffered request body.
 // The caller must have already read and restored the body on the request.
 func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
+	var body string
+	if val, ok := tx.MetadataValue("body"); ok {
+		if b, ok := val.([]byte); ok {
+			body = string(b)
+		}
+	}
+	if body == "" {
+		body = readBodyString(tx.Request)
+	}
 	targets := map[string]string{
-		"body": readBodyString(tx.Request),
+		"body": body,
 	}
 	return e.evaluatePhase(tx, core.PhaseRequestBody, targets)
 }
@@ -108,7 +117,7 @@ func (e *Engine) LogError(format string, args ...interface{}) {
 func (e *Engine) ProcessLogging(tx *core.Transaction) {
 	mode := e.cfg.ModeSnapshot()
 	if mode == "learning" {
-		e.logger.Infof("[LEARN] tx=%s score=%d matches=%d", tx.ID, tx.ScoreSnapshot(), len(tx.MatchesSnapshot()))
+		e.logger.Infof("[LEARN] tx=%s score=%d matches=%d", tx.ID, tx.ScoreSnapshot(), tx.MatchCount())
 	}
 	if tx.IsBlocked() {
 		e.logger.Warnf("[BLOCK] tx=%s ip=%s score=%d phase=%s", tx.ID, tx.ClientIP, tx.ScoreSnapshot(), tx.BlockedAt)
@@ -133,13 +142,13 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 	specialMatches := e.evaluateSpecialRules(tx, phase, targets)
 	for _, m := range specialMatches {
 		tx.AddMatch(m)
-		if m.Score >= cfgSnap.BlockThreshold {
+		if m.Score >= cfgSnap.BlockThreshold || m.Action == core.ActionBlock || m.Action == core.ActionDrop {
 			hardBlock = true
 		}
 	}
 
 	score := tx.ScoreSnapshot()
-	mode := cfgSnap.Mode
+	mode := cfgSnap.ModeSnapshot()
 
 	if hardBlock || score >= cfgSnap.BlockThreshold {
 		tx.SetBlocked(phase)
@@ -257,9 +266,16 @@ func readBodyString(r *http.Request) string {
 		return ""
 	}
 	const maxBody = 1 << 20 // 1 MiB hard cap for engine inspection
+	// If body supports Seek, reset to beginning first (allows re-reading).
+	if seeker, ok := r.Body.(io.Seeker); ok {
+		_, _ = seeker.Seek(0, io.SeekStart)
+	}
 	limited := io.LimitReader(r.Body, maxBody)
 	body, err := io.ReadAll(limited)
 	if err != nil {
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(nil))
+		r.ContentLength = 0
 		return ""
 	}
 	_ = r.Body.Close()

@@ -160,6 +160,13 @@ func (tx *Transaction) MatchesSnapshot() []Match {
 	return out
 }
 
+// MatchCount returns the number of recorded matches.
+func (tx *Transaction) MatchCount() int {
+	tx.mu.RLock()
+	defer tx.mu.RUnlock()
+	return len(tx.Matches)
+}
+
 // SetBlocked marks the transaction as blocked at a specific phase.
 func (tx *Transaction) SetBlocked(at Phase) {
 	tx.mu.Lock()
