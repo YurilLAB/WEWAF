@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -83,7 +84,13 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 		}
 	}
 	if body == "" {
-		body = readBodyString(tx.Request)
+		b, err := readBodyString(tx.Request)
+		if err != nil {
+			e.logger.Warnf("engine: failed to read request body: %v", err)
+			body = ""
+		} else {
+			body = b
+		}
 	}
 	targets := map[string]string{
 		"body": body,
@@ -102,6 +109,9 @@ func (e *Engine) ProcessResponseHeaders(tx *core.Transaction, status int, header
 
 // ProcessResponseBody evaluates rules against the backend response body (if buffered).
 func (e *Engine) ProcessResponseBody(tx *core.Transaction, body []byte) *core.Interruption {
+	if len(body) == 0 {
+		return nil
+	}
 	targets := map[string]string{
 		"response_body": string(body),
 	}
@@ -128,6 +138,11 @@ func (e *Engine) ProcessLogging(tx *core.Transaction) {
 
 // evaluatePhase runs the rule set for a single phase and updates the transaction.
 func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets map[string]string) *core.Interruption {
+	defer func() {
+		if rec := recover(); rec != nil {
+			e.logger.Errorf("engine: panic during evaluation: %v", rec)
+		}
+	}()
 	e.mu.RLock()
 	rs := e.ruleSet
 	cfgSnap := e.cfg.Snapshot()
@@ -236,11 +251,24 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 // buildRequestHeaderTargets extracts inspectable strings from an HTTP request.
 func (e *Engine) buildRequestHeaderTargets(r *http.Request) map[string]string {
 	targets := make(map[string]string, 8)
-	targets["uri"] = r.URL.RequestURI()
+	if uri, err := url.PathUnescape(r.URL.RequestURI()); err == nil {
+		targets["uri"] = uri
+	} else {
+		targets["uri"] = r.URL.RequestURI()
+	}
 	targets["method"] = r.Method
-	targets["path"] = r.URL.Path
+	if path, err := url.PathUnescape(r.URL.Path); err == nil {
+		targets["path"] = path
+	} else {
+		targets["path"] = r.URL.Path
+	}
 	for k, v := range r.URL.Query() {
-		targets["args."+k] = strings.Join(v, ", ")
+		raw := strings.Join(v, ", ")
+		if decoded, err := url.QueryUnescape(raw); err == nil {
+			targets["args."+k] = decoded
+		} else {
+			targets["args."+k] = raw
+		}
 	}
 	for k, v := range r.Header {
 		targets["headers."+k] = strings.Join(v, ", ")
@@ -261,9 +289,9 @@ func headersToString(h http.Header) string {
 }
 
 // readBodyString reads the request body (capped at 1 MiB) and restores it so the proxy can forward it.
-func readBodyString(r *http.Request) string {
+func readBodyString(r *http.Request) (string, error) {
 	if r.Body == nil {
-		return ""
+		return "", nil
 	}
 	const maxBody = 1 << 20 // 1 MiB hard cap for engine inspection
 	// If body supports Seek, reset to beginning first (allows re-reading).
@@ -276,12 +304,12 @@ func readBodyString(r *http.Request) string {
 		_ = r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(nil))
 		r.ContentLength = 0
-		return ""
+		return "", err
 	}
 	_ = r.Body.Close()
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
-	return string(body)
+	return string(body), nil
 }
 
 func trunc(s string, n int) string {

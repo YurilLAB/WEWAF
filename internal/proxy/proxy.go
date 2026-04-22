@@ -29,6 +29,7 @@ type WAFProxy struct {
 	metrics *telemetry.Metrics
 	bf      *bruteforce.Detector
 	sema    *limits.Semaphore
+	rl      *limits.RateLimiter
 	backend *url.URL
 	proxy   *httputil.ReverseProxy
 }
@@ -48,6 +49,7 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	}
 
 	sema := limits.NewSemaphore(cfg.MaxConcurrentReq)
+	rl := limits.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
 	wp := &WAFProxy{
 		cfg:     cfg,
@@ -55,6 +57,7 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 		metrics: metrics,
 		bf:      bf,
 		sema:    sema,
+		rl:      rl,
 		backend: backend,
 	}
 
@@ -67,11 +70,26 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 
 // ServeHTTP implements http.Handler.
 func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			wp.eng.LogError("proxy: panic in ServeHTTP: %v", rec)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+	}()
+
 	if err := wp.sema.Acquire(r.Context()); err != nil {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	defer wp.sema.Release()
+
+	clientIP := getClientIP(r, wp.cfg.TrustXFF)
+	if !wp.rl.Allow(clientIP) {
+		w.Header().Set("Retry-After", "60")
+		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "RATE-LIMIT", "Rate limit exceeded", 0)
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
 
 	// Create WAF transaction.
 	tx := core.NewTransaction(w, r, wp.cfg.TrustXFF)
@@ -185,25 +203,26 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	}
 
 	// Phase 4: Response Body (inspect capped prefix, forward full body).
-	if res.Body != nil {
-		maxInspect := wp.cfg.MaxBodyBytes
-		if maxInspect <= 0 {
-			maxInspect = 1 << 20
-		}
-		limited := io.LimitReader(res.Body, maxInspect)
-		inspectBody, err := io.ReadAll(limited)
-		if err != nil {
-			return err
-		}
-
-		if intr := wp.eng.ProcessResponseBody(tx, inspectBody); intr != nil {
-			wp.recordBlockFromResponse(tx, intr)
-			return wp.replaceWithSynthetic(res, intr)
-		}
-
-		// Reconstruct full body: inspected prefix + remainder of original stream.
-		res.Body = io.NopCloser(io.MultiReader(bytes.NewReader(inspectBody), res.Body))
+	if res.Body == nil {
+		return nil
 	}
+	maxInspect := wp.cfg.MaxBodyBytes
+	if maxInspect <= 0 {
+		maxInspect = 1 << 20
+	}
+	limited := io.LimitReader(res.Body, maxInspect)
+	inspectBody, err := io.ReadAll(limited)
+	if err != nil {
+		return err
+	}
+
+	if intr := wp.eng.ProcessResponseBody(tx, inspectBody); intr != nil {
+		wp.recordBlockFromResponse(tx, intr)
+		return wp.replaceWithSynthetic(res, intr)
+	}
+
+	// Reconstruct full body: inspected prefix + remainder of original stream.
+	res.Body = io.NopCloser(io.MultiReader(bytes.NewReader(inspectBody), res.Body))
 
 	return nil
 }
@@ -217,11 +236,15 @@ func (wp *WAFProxy) replaceWithSynthetic(res *http.Response, intr *core.Interrup
 	body := []byte(fmt.Sprintf("%d %s\nRequest blocked by WEWaf.\n", intr.Status, http.StatusText(intr.Status)))
 	res.StatusCode = intr.Status
 	res.Status = http.StatusText(intr.Status)
-	res.Header = http.Header{
+	headers := http.Header{
 		"Content-Type":   []string{"text/plain; charset=utf-8"},
 		"X-WAF-Action":   []string{intr.Action.String()},
 		"Content-Length": []string{strconv.Itoa(len(body))},
 	}
+	if len(intr.Matches) > 0 {
+		headers.Set("X-WAF-Rule-ID", intr.Matches[0].RuleID)
+	}
+	res.Header = headers
 	res.Body = io.NopCloser(bytes.NewReader(body))
 	res.ContentLength = int64(len(body))
 	return nil
@@ -245,6 +268,8 @@ func (wp *WAFProxy) writeBlock(w http.ResponseWriter, intr *core.Interruption, t
 			}
 		}
 		w.Header().Set("Connection", "close")
+		w.WriteHeader(intr.Status)
+		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-WAF-Action", intr.Action.String())
@@ -307,6 +332,25 @@ func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("responseRecorder: Hijacker not supported by underlying writer")
 }
 
+func getClientIP(r *http.Request, trustXFF bool) string {
+	if trustXFF {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			if idx := strings.Index(xff, ","); idx != -1 {
+				return strings.TrimSpace(xff[:idx])
+			}
+			return strings.TrimSpace(xff)
+		}
+		if xri := r.Header.Get("X-Real-Ip"); xri != "" {
+			return strings.TrimSpace(xri)
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 func isWebSocket(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
@@ -319,7 +363,7 @@ func isLoginRequest(r *http.Request) bool {
 	path := strings.ToLower(r.URL.Path)
 	loginPaths := []string{"/login", "/auth", "/signin", "/wp-login.php", "/admin/login", "/api/login"}
 	for _, lp := range loginPaths {
-		if path == lp || strings.HasSuffix(path, lp) {
+		if path == lp {
 			return true
 		}
 	}

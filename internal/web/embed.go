@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"wewaf/internal/config"
@@ -22,11 +23,12 @@ var content embed.FS
 type Server struct {
 	cfg     *config.Config
 	metrics *telemetry.Metrics
+	rulesFn func() []map[string]interface{}
 }
 
 // NewServer creates the admin web server.
-func NewServer(cfg *config.Config, metrics *telemetry.Metrics) *Server {
-	return &Server{cfg: cfg, metrics: metrics}
+func NewServer(cfg *config.Config, metrics *telemetry.Metrics, rulesFn func() []map[string]interface{}) *Server {
+	return &Server{cfg: cfg, metrics: metrics, rulesFn: rulesFn}
 }
 
 // RegisterRoutes wires all admin endpoints.
@@ -39,6 +41,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	api.HandleFunc("/api/blocks", s.handleBlocks)
 	api.HandleFunc("/api/traffic", s.handleTraffic)
 	api.HandleFunc("/api/rules", s.handleRules)
+	api.HandleFunc("/api/health", s.handleHealth)
 
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
@@ -49,6 +52,11 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 		fileServer.ServeHTTP(w, r)
 	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			http.NotFound(w, r)
+			return
+		}
+		r.URL.Path = "/"
 		fileServer.ServeHTTP(w, r)
 	})
 }
@@ -152,15 +160,21 @@ func (s *Server) handleRules(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.rulesFn != nil {
+		writeJSON(w, map[string]interface{}{"rules": s.rulesFn()})
+	} else {
+		writeJSON(w, map[string]interface{}{"rules": []map[string]interface{}{}})
+	}
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	writeJSON(w, map[string]interface{}{
-		"rules": []map[string]string{
-			{"id": "XSS-001", "name": "XSS Script Tag", "severity": "critical"},
-			{"id": "SQLI-001", "name": "SQLi Union Select", "severity": "critical"},
-			{"id": "RCE-001", "name": "RCE Command Substitution", "severity": "critical"},
-			{"id": "TRAV-001", "name": "Traversal Null Byte", "severity": "high"},
-			{"id": "SSRF-001", "name": "SSRF Cloud Metadata", "severity": "high"},
-			{"id": "SCAN-001", "name": "Known Scanner UA", "severity": "medium"},
-		},
+		"status": "ok",
+		"mode":   s.cfg.ModeSnapshot(),
 	})
 }
 

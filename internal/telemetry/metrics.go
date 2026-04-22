@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const maxUniqueIPs = 100000
+
 // Metrics holds runtime counters and gauges.
 type Metrics struct {
 	mu sync.RWMutex
@@ -14,6 +16,7 @@ type Metrics struct {
 	PassedRequests     uint64
 	TotalBytesIn       uint64
 	TotalBytesOut      uint64
+	ErrorCount         uint64
 	UniqueIPs          map[string]struct{}
 	RecentBlocks       []BlockRecord
 	TrafficHistory     []TrafficPoint
@@ -51,7 +54,9 @@ func (m *Metrics) RecordRequest(ip string, bytesIn int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.TotalRequests++
-	m.UniqueIPs[ip] = struct{}{}
+	if len(m.UniqueIPs) < maxUniqueIPs {
+		m.UniqueIPs[ip] = struct{}{}
+	}
 	m.TotalBytesIn += uint64(bytesIn)
 }
 
@@ -103,6 +108,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"passed_requests":  m.PassedRequests,
 		"total_bytes_in":   m.TotalBytesIn,
 		"total_bytes_out":  m.TotalBytesOut,
+		"errors":           m.ErrorCount,
 		"unique_ips":       len(m.UniqueIPs),
 		"recent_blocks":    recent,
 		"traffic_history":  history,
@@ -153,5 +159,5 @@ func (m *Metrics) GetTrafficHistory() []TrafficPoint {
 func (m *Metrics) RecordError() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// TODO: add dedicated error counter field
+	m.ErrorCount++
 }

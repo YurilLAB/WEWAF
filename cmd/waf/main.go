@@ -80,7 +80,22 @@ func main() {
 	}
 
 	// 7. Create admin dashboard server.
-	admin := web.NewServer(cfg, metrics)
+	rulesFn := func() []map[string]interface{} {
+		compiled := rs.RulesSnapshot()
+		out := make([]map[string]interface{}, 0, len(compiled))
+		for _, cr := range compiled {
+			out = append(out, map[string]interface{}{
+				"id":          cr.ID,
+				"name":        cr.Name,
+				"phase":       cr.Phase.String(),
+				"action":      cr.Action.String(),
+				"score":       cr.Score,
+				"description": cr.Description,
+			})
+		}
+		return out
+	}
+	admin := web.NewServer(cfg, metrics, rulesFn)
 	adminMux := http.NewServeMux()
 	admin.RegisterRoutes(adminMux)
 	adminServer := &http.Server{
@@ -107,6 +122,11 @@ func main() {
 
 	// 11. Start servers.
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("admin server panic: %v", rec)
+			}
+		}()
 		log.Printf("admin dashboard listening on http://%s", cfg.AdminAddr)
 		if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("admin server error: %v", err)
@@ -114,6 +134,11 @@ func main() {
 	}()
 
 	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("proxy server panic: %v", rec)
+			}
+		}()
 		log.Printf("WAF proxy listening on http://%s -> %s", cfg.ListenAddr, cfg.BackendURL)
 		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("proxy server error: %v", err)

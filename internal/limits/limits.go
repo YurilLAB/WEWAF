@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/debug"
+	"sync"
+	"time"
 )
 
 // Apply configures OS-level and runtime-level resource constraints.
@@ -58,6 +60,90 @@ func (s *Semaphore) Release() {
 // Available returns the number of free slots.
 func (s *Semaphore) Available() int {
 	return cap(s.ch) - len(s.ch)
+}
+
+// rateBucket holds token-bucket state for a single IP.
+type rateBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+// RateLimiter implements a per-IP token-bucket rate limiter.
+type RateLimiter struct {
+	mu       sync.RWMutex
+	buckets  map[string]*rateBucket
+	rps      float64
+	burst    float64
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+// NewRateLimiter creates a rate limiter and starts a background janitor.
+func NewRateLimiter(rps, burst int) *RateLimiter {
+	rl := &RateLimiter{
+		buckets: make(map[string]*rateBucket),
+		rps:     float64(rps),
+		burst:   float64(burst),
+		stop:    make(chan struct{}),
+	}
+	go rl.janitor()
+	return rl
+}
+
+// Allow checks whether a single request from ip is permitted under the rate limit.
+func (rl *RateLimiter) Allow(ip string) bool {
+	if rl.rps <= 0 {
+		return true
+	}
+
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	b, ok := rl.buckets[ip]
+	if !ok {
+		b = &rateBucket{tokens: rl.burst - 1, last: now}
+		rl.buckets[ip] = b
+		return true
+	}
+
+	elapsed := now.Sub(b.last).Seconds()
+	b.tokens = min(rl.burst, b.tokens+elapsed*rl.rps)
+	b.last = now
+
+	if b.tokens >= 1 {
+		b.tokens--
+		return true
+	}
+	return false
+}
+
+// Stop halts the background janitor goroutine.
+func (rl *RateLimiter) Stop() {
+	rl.stopOnce.Do(func() {
+		close(rl.stop)
+	})
+}
+
+// janitor removes stale buckets every 5 minutes.
+func (rl *RateLimiter) janitor() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			rl.mu.Lock()
+			now := time.Now()
+			for ip, b := range rl.buckets {
+				if now.Sub(b.last) > 10*time.Minute {
+					delete(rl.buckets, ip)
+				}
+			}
+			rl.mu.Unlock()
+		case <-rl.stop:
+			return
+		}
+	}
 }
 
 // Stats returns current resource usage.
