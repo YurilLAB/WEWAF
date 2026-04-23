@@ -32,8 +32,10 @@ time range.
 - **SQLite history with automatic rotation** — every block, IP activity
   update, and traffic sample is persisted through a non-blocking queue and
   flushed in batched transactions. A fresh database is opened at each
-  rotation boundary (default 24 h) and the old one is finalised with an
+  rotation boundary (default 1 week) and the old one is finalised with an
   `ended_at` timestamp, so each file represents one contiguous time range.
+  The rotation interval is configurable via the Settings page or
+  `history_rotate_hours` in `config.json`.
 - **Embedded admin dashboard** — React + Vite SPA served from the same Go
   binary, no external web server required.
 - **Hot-swappable mode** — toggle active/detection/learning at runtime via
@@ -136,8 +138,8 @@ startup, and again each time the rotation window (default 24 h) elapses.
   is dropped and `history.dropped_events` is incremented. The request is
   unaffected.
 - **Rotation boundary.** Every minute the writer checks whether the current
-  DB is older than the rotation window. If so it sets `metadata.ended_at`,
-  closes the file, and opens a new one named
+  DB is older than the rotation window (default 168 hours / 1 week). If so
+  it sets `metadata.ended_at`, closes the file, and opens a new one named
   `history/waf-<rfc3339-timestamp>.sqlite`. Registered listeners (the
   telemetry layer) reset their in-memory aggregates so unique-IP counts etc.
   align with the fresh window.
@@ -214,7 +216,7 @@ override need to live in `config.json`.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `history_dir` | `history` | Directory the rotating SQLite files live in |
-| `history_rotate_hours` | `24` | Lifetime of a single DB before rotation |
+| `history_rotate_hours` | `168` | Lifetime of a single DB before rotation (default 1 week) |
 | `history_buffer_size` | `4096` | Queue capacity for the write pipeline |
 | `history_flush_seconds` | `2` | Maximum staleness before a batch is flushed |
 

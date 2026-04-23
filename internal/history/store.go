@@ -194,6 +194,16 @@ func (s *Store) OnRotate(fn RotationListener) {
 	s.mu.Unlock()
 }
 
+// SetRotation updates the rotation window dynamically.
+func (s *Store) SetRotation(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.rotation = d
+	s.mu.Unlock()
+}
+
 // Close stops the writer and closes the active DB. Safe to call multiple times.
 func (s *Store) Close() error {
 	var err error

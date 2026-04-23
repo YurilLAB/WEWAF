@@ -212,7 +212,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.cfg.Snapshot())
 	case http.MethodPost:
 		var payload struct {
-			Mode string `json:"mode"`
+			Mode               string `json:"mode"`
+			HistoryRotateHours int    `json:"history_rotate_hours"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -225,7 +226,13 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			}
 			s.cfg.SetMode(payload.Mode)
 		}
-		writeJSON(w, map[string]string{"status": "ok", "mode": s.cfg.ModeSnapshot()})
+		if payload.HistoryRotateHours > 0 {
+			s.cfg.HistoryRotateHours = payload.HistoryRotateHours
+			if s.history != nil {
+				s.history.SetRotation(time.Duration(payload.HistoryRotateHours) * time.Hour)
+			}
+		}
+		writeJSON(w, map[string]interface{}{"status": "ok", "mode": s.cfg.ModeSnapshot(), "history_rotate_hours": s.cfg.HistoryRotateHours})
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}

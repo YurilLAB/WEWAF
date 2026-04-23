@@ -99,6 +99,9 @@ export interface ConfigResponse {
   read_timeout_sec: number;
   write_timeout_sec: number;
   brute_force_window_sec: number;
+  history_rotate_hours: number;
+  history_buffer_size: number;
+  history_flush_seconds: number;
   [key: string]: unknown;
 }
 
@@ -240,6 +243,8 @@ export const api = {
   getConfig: () => get<ConfigResponse>('/config'),
   setMode: (mode: 'active' | 'detection' | 'learning') =>
     post<ConfigResponse & { status: string }>('/config', { mode }),
+  updateConfig: (payload: { mode?: string; history_rotate_hours?: number }) =>
+    post<ConfigResponse & { status: string }>('/config', payload),
   getBlocks: () => get<BlocksResponse>('/blocks'),
   getTraffic: () => get<TrafficPoint[]>('/traffic'),
   getRules: () => get<RulesResponse>('/rules'),

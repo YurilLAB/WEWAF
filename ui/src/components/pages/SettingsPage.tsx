@@ -1,22 +1,45 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Cpu, HardDrive, Bell, Shield, Save, RotateCcw } from 'lucide-react';
+import { Cpu, HardDrive, Bell, Shield, Save, RotateCcw, Database } from 'lucide-react';
 import { useWAF } from '../../store/wafStore';
+import { api } from '../../services/api';
 
 export default function SettingsPage() {
   const { state, dispatch } = useWAF();
   const { settings } = state;
   const [form, setForm] = useState({ ...settings });
   const [saved, setSaved] = useState(false);
+  const [backendError, setBackendError] = useState<string | null>(null);
 
-  const handleSave = () => {
+  useEffect(() => {
+    api.getConfig().then((cfg) => {
+      if (cfg && cfg.history_rotate_hours) {
+        setForm((prev) => ({ ...prev, historyRotateHours: cfg.history_rotate_hours }));
+        dispatch({ type: 'UPDATE_SETTINGS', payload: { historyRotateHours: cfg.history_rotate_hours } });
+      }
+    });
+  }, [dispatch]);
+
+  const handleSave = async () => {
+    setBackendError(null);
+    // Update local store
     dispatch({ type: 'SET_SETTINGS', payload: { ...form } });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    // Sync history rotation to backend
+    try {
+      const res = await api.updateConfig({ history_rotate_hours: form.historyRotateHours });
+      if (res && res.history_rotate_hours) {
+        dispatch({ type: 'UPDATE_SETTINGS', payload: { historyRotateHours: res.history_rotate_hours } });
+      }
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch {
+      setBackendError('Failed to sync rotation setting to backend.');
+    }
   };
 
   const handleReset = () => {
     setForm({ ...settings });
+    setBackendError(null);
   };
 
   return (
@@ -151,6 +174,33 @@ export default function SettingsPage() {
         </div>
       </motion.div>
 
+      {/* History & Database */}
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.25 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
+        <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2"><Database className="w-4 h-4 text-waf-orange" /> History &amp; Database</h3>
+        <div className="space-y-4">
+          <div>
+            <label className="text-xs text-waf-muted mb-1 block">Database Rotation (hours)</label>
+            <input
+              type="range"
+              min={1}
+              max={720}
+              step={1}
+              value={form.historyRotateHours}
+              onChange={(e) => setForm({ ...form, historyRotateHours: parseInt(e.target.value) || 168 })}
+              className="w-full accent-waf-orange"
+            />
+            <div className="flex justify-between text-xs text-waf-dim mt-1">
+              <span>1h</span>
+              <span className="text-waf-orange font-bold">{form.historyRotateHours}h ({(form.historyRotateHours / 24).toFixed(0)} days)</span>
+              <span>720h (30d)</span>
+            </div>
+            <p className="text-waf-dim text-[10px] mt-1">
+              How often the SQLite history database rotates to a new file. Default is 168 hours (1 week).
+            </p>
+          </div>
+        </div>
+      </motion.div>
+
       {/* Alerts */}
       <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
         <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2"><Bell className="w-4 h-4 text-waf-amber" /> Alerts</h3>
@@ -167,13 +217,20 @@ export default function SettingsPage() {
       </motion.div>
 
       {/* Save Buttons */}
-      <div className="flex gap-3">
-        <button onClick={handleSave} className="flex items-center gap-2 px-6 py-2.5 bg-waf-success text-white rounded-lg text-sm font-medium hover:bg-emerald-600 transition-colors">
-          <Save className="w-4 h-4" /> {saved ? 'Saved!' : 'Save Settings'}
-        </button>
-        <button onClick={handleReset} className="flex items-center gap-2 px-6 py-2.5 bg-waf-elevated text-waf-muted rounded-lg text-sm hover:bg-waf-border transition-colors">
-          <RotateCcw className="w-4 h-4" /> Reset
-        </button>
+      <div className="space-y-3">
+        {backendError && (
+          <div className="bg-red-500/5 border border-red-500/20 rounded-lg p-3 text-xs text-red-500">
+            {backendError}
+          </div>
+        )}
+        <div className="flex gap-3">
+          <button onClick={handleSave} className="flex items-center gap-2 px-6 py-2.5 bg-waf-success text-white rounded-lg text-sm font-medium hover:bg-emerald-600 transition-colors">
+            <Save className="w-4 h-4" /> {saved ? 'Saved!' : 'Save Settings'}
+          </button>
+          <button onClick={handleReset} className="flex items-center gap-2 px-6 py-2.5 bg-waf-elevated text-waf-muted rounded-lg text-sm hover:bg-waf-border transition-colors">
+            <RotateCcw className="w-4 h-4" /> Reset
+          </button>
+        </div>
       </div>
     </div>
   );

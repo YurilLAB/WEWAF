@@ -77,7 +77,7 @@ func Default() *Config {
 		AuditLogPath:             "",
 		RuleFiles:                []string{"rules.json"},
 		HistoryDir:               "history",
-		HistoryRotateHours:       24,
+		HistoryRotateHours:       168, // 7 days
 		HistoryBufferSize:        4096,
 		HistoryFlushSeconds:      2,
 	}
@@ -141,7 +141,7 @@ func (c *Config) Validate() error {
 		c.HistoryDir = "history"
 	}
 	if c.HistoryRotateHours <= 0 {
-		c.HistoryRotateHours = 24
+		c.HistoryRotateHours = 168
 	}
 	if c.HistoryBufferSize <= 0 {
 		c.HistoryBufferSize = 4096

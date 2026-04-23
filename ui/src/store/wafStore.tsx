@@ -160,6 +160,7 @@ export interface WAFSettings {
   autoUpdateRules: boolean;
   alertEmail: string;
   alertWebhook: string;
+  historyRotateHours: number;
 }
 
 export interface HostMachineStats {
@@ -335,6 +336,7 @@ const defaultSettings: WAFSettings = {
   autoUpdateRules: true,
   alertEmail: '',
   alertWebhook: '',
+  historyRotateHours: 168,
 };
 
 const defaultDDoS: DDoSConfig = {
