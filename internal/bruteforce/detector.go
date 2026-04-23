@@ -2,9 +2,12 @@ package bruteforce
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
+
+const maxAttemptsPerEntry = 10000
 
 // Detector tracks login attempts per key (e.g., IP or IP:user) in a sliding window.
 type Detector struct {
@@ -23,7 +26,8 @@ type entry struct {
 // NewDetector creates a brute-force detector with the given window.
 func NewDetector(window time.Duration) *Detector {
 	if window <= 0 {
-		window = time.Minute
+		log.Println("warning: bruteforce detector window must be > 0, defaulting to 5 minutes")
+		window = 5 * time.Minute
 	}
 	d := &Detector{
 		window:  window,
@@ -47,6 +51,10 @@ func (d *Detector) Record(key string) int {
 		d.entries[key] = e
 	}
 	e.attempts = append(e.attempts, now)
+	// Cap to prevent unbounded memory growth under sustained attack.
+	if len(e.attempts) > maxAttemptsPerEntry {
+		e.attempts = e.attempts[len(e.attempts)-maxAttemptsPerEntry:]
+	}
 	// Trim old attempts outside the window.
 	cutoff := now.Add(-d.window)
 	idx := len(e.attempts)
@@ -64,6 +72,9 @@ func (d *Detector) Record(key string) int {
 func (d *Detector) Count(key string) int {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	if d.window <= 0 {
+		return 0
+	}
 	e, ok := d.entries[key]
 	if !ok {
 		return 0
@@ -80,7 +91,17 @@ func (d *Detector) Count(key string) int {
 
 // IsBruteForce reports whether the key has exceeded the threshold.
 func (d *Detector) IsBruteForce(key string, threshold int) bool {
+	if threshold <= 0 {
+		threshold = 1
+	}
 	return d.Count(key) >= threshold
+}
+
+// Reset manually clears an IP's attempt history.
+func (d *Detector) Reset(key string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.entries, key)
 }
 
 // Stop halts the background janitor.
@@ -92,6 +113,11 @@ func (d *Detector) Stop() {
 }
 
 func (d *Detector) janitor() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic recovered in bruteforce janitor: %v", r)
+		}
+	}()
 	for {
 		select {
 		case <-d.ticker.C:
@@ -103,6 +129,11 @@ func (d *Detector) janitor() {
 }
 
 func (d *Detector) evict() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic recovered in bruteforce evict: %v", r)
+		}
+	}()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	cutoff := time.Now().UTC().Add(-d.window)

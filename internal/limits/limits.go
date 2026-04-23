@@ -3,6 +3,7 @@ package limits
 import (
 	"context"
 	"fmt"
+	"log"
 	"runtime"
 	"runtime/debug"
 	"sync"
@@ -13,16 +14,27 @@ import (
 func Apply(maxCPU int, maxMemMB int64) error {
 	if maxCPU > 0 {
 		runtime.GOMAXPROCS(maxCPU)
-	} else {
-		runtime.GOMAXPROCS(runtime.NumCPU())
 	}
 
 	if maxMemMB > 0 {
 		limit := maxMemMB * 1024 * 1024
-		debug.SetMemoryLimit(limit)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic recovered in debug.SetMemoryLimit: %v", r)
+				}
+			}()
+			debug.SetMemoryLimit(limit)
+		}()
 	} else {
-		// Remove any previous limit.
-		debug.SetMemoryLimit(-1)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("panic recovered in debug.SetMemoryLimit: %v", r)
+				}
+			}()
+			debug.SetMemoryLimit(-1)
+		}()
 	}
 
 	return nil
@@ -40,6 +52,10 @@ func NewSemaphore(n int) *Semaphore {
 
 // Acquire blocks until a slot is available or the context is cancelled.
 func (s *Semaphore) Acquire(ctx context.Context) error {
+	if s == nil {
+		log.Println("warning: Semaphore.Acquire called on nil semaphore")
+		return nil
+	}
 	select {
 	case s.ch <- struct{}{}:
 		return nil
@@ -50,6 +66,9 @@ func (s *Semaphore) Acquire(ctx context.Context) error {
 
 // Release returns a slot. It is safe to call even if unpaired (no-op).
 func (s *Semaphore) Release() {
+	if s == nil {
+		return
+	}
 	select {
 	case <-s.ch:
 	default:
@@ -92,6 +111,12 @@ func NewRateLimiter(rps, burst int) *RateLimiter {
 
 // Allow checks whether a single request from ip is permitted under the rate limit.
 func (rl *RateLimiter) Allow(ip string) bool {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic recovered in RateLimiter.Allow: %v", r)
+		}
+	}()
+
 	if rl.rps <= 0 {
 		return true
 	}
@@ -108,7 +133,7 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	}
 
 	elapsed := now.Sub(b.last).Seconds()
-	b.tokens = min(rl.burst, b.tokens+elapsed*rl.rps)
+	b.tokens = min(rl.burst*2, b.tokens+elapsed*rl.rps)
 	b.last = now
 
 	if b.tokens >= 1 {
@@ -127,6 +152,11 @@ func (rl *RateLimiter) Stop() {
 
 // janitor removes stale buckets every 5 minutes.
 func (rl *RateLimiter) janitor() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic recovered in RateLimiter.janitor: %v", r)
+		}
+	}()
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -148,11 +178,16 @@ func (rl *RateLimiter) janitor() {
 
 // Stats returns current resource usage.
 func Stats() map[string]interface{} {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic recovered in Stats: %v", r)
+		}
+	}()
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	return map[string]interface{}{
-		"goroutines":    runtime.NumGoroutine(),
-		"cpu_cores":     runtime.GOMAXPROCS(0),
+		"goroutines":     runtime.NumGoroutine(),
+		"cpu_cores":      runtime.GOMAXPROCS(0),
 		"memory_used_mb": fmt.Sprintf("%.2f", float64(m.Alloc)/(1024*1024)),
 		"memory_sys_mb":  fmt.Sprintf("%.2f", float64(m.Sys)/(1024*1024)),
 		"gc_count":       m.NumGC,

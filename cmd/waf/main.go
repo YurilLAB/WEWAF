@@ -12,13 +12,20 @@ import (
 
 	"wewaf/internal/bruteforce"
 	"wewaf/internal/config"
+	"wewaf/internal/connection"
+	"wewaf/internal/core"
 	"wewaf/internal/engine"
+	"wewaf/internal/history"
+	"wewaf/internal/host"
 	"wewaf/internal/limits"
 	"wewaf/internal/proxy"
 	"wewaf/internal/rules"
+	"wewaf/internal/ssl"
 	"wewaf/internal/telemetry"
 	"wewaf/internal/web"
 )
+
+const wafVersion = "0.2.0"
 
 // simpleLogger adapts Go's standard log to the engine.Logger interface.
 type simpleLogger struct{}
@@ -36,7 +43,6 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("WEWaf starting...")
 
-	// 1. Load and validate configuration.
 	cfg, err := config.Load(configPath)
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
@@ -46,13 +52,11 @@ func main() {
 	}
 	log.Printf("config loaded: listen=%s backend=%s mode=%s", cfg.ListenAddr, cfg.BackendURL, cfg.Mode)
 
-	// 2. Apply resource limits.
 	if err := limits.Apply(cfg.MaxCPUCores, cfg.MaxMemoryMB); err != nil {
 		log.Fatalf("failed to apply resource limits: %v", err)
 	}
 	log.Printf("resource limits applied: cpu=%d memory=%dMB", cfg.MaxCPUCores, cfg.MaxMemoryMB)
 
-	// 3. Build rule set.
 	rawRules := rules.DefaultRules()
 	rs, err := rules.NewRuleSet(rawRules)
 	if err != nil {
@@ -60,26 +64,72 @@ func main() {
 	}
 	log.Printf("rules compiled: %d signatures loaded", rs.Count())
 
-	// 4. Create WAF engine.
 	eng, err := engine.NewEngine(cfg, rs, &simpleLogger{})
 	if err != nil {
 		log.Fatalf("failed to create engine: %v", err)
 	}
 
-	// 5. Create metrics collector.
 	metrics := telemetry.NewMetrics()
 
-	// 5a. Create brute-force detector.
+	// History store — persistent SQLite with time-rotated databases.
+	historyStore, err := history.Open(history.Options{
+		Dir:        cfg.HistoryDir,
+		Rotation:   time.Duration(cfg.HistoryRotateHours) * time.Hour,
+		BufferSize: cfg.HistoryBufferSize,
+		FlushEvery: time.Duration(cfg.HistoryFlushSeconds) * time.Second,
+		WAFVersion: wafVersion,
+	})
+	if err != nil {
+		log.Fatalf("failed to open history store: %v", err)
+	}
+	defer func() {
+		if err := historyStore.Close(); err != nil {
+			log.Printf("history store close error: %v", err)
+		}
+	}()
+	log.Printf("history store opened: %s", historyStore.StatsSnapshot().CurrentPath)
+
+	// Attach persistence to the telemetry hot path.
+	metrics.SetPersister(newHistoryPersister(historyStore))
+	historyStore.OnRotate(func(_ time.Time) {
+		metrics.OnRotation()
+		log.Printf("history rotated: new db=%s", historyStore.StatsSnapshot().CurrentPath)
+	})
+
 	bf := bruteforce.NewDetector(time.Duration(cfg.BruteForceWindowSec) * time.Second)
 	defer bf.Stop()
 
-	// 6. Create WAF proxy.
 	wp, err := proxy.NewWAFProxy(cfg, eng, metrics, bf)
 	if err != nil {
 		log.Fatalf("failed to create proxy: %v", err)
 	}
 
-	// 7. Create admin dashboard server.
+	// Background telemetry collectors.
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+
+	historyStore.Start(rootCtx)
+
+	hostCollector := host.NewCollector(wafVersion)
+	hostCollector.Start(rootCtx)
+	defer hostCollector.Stop()
+
+	connMgr := connection.NewManager(connection.Config{
+		BackendURL:      cfg.BackendURL,
+		ListenAddr:      cfg.ListenAddr,
+		AdminAddr:       cfg.AdminAddr,
+		PollIntervalSec: 10,
+		RetryAttempts:   3,
+		TimeoutMs:       2000,
+	})
+	connMgr.Start(rootCtx)
+	defer connMgr.Stop()
+
+	sslMgr, err := ssl.NewManager("certs")
+	if err != nil {
+		log.Printf("ssl manager disabled: %v", err)
+	}
+
 	rulesFn := func() []map[string]interface{} {
 		compiled := rs.RulesSnapshot()
 		out := make([]map[string]interface{}, 0, len(compiled))
@@ -95,7 +145,20 @@ func main() {
 		}
 		return out
 	}
-	admin := web.NewServer(cfg, metrics, rulesFn)
+	banList := core.NewBanList()
+	stopBanCleanup := banList.StartCleanup(time.Minute)
+	defer stopBanCleanup()
+
+	admin := web.NewServer(web.Deps{
+		Config:     cfg,
+		Metrics:    metrics,
+		RulesFn:    rulesFn,
+		BanList:    banList,
+		Host:       hostCollector,
+		Connection: connMgr,
+		SSL:        sslMgr,
+		History:    historyStore,
+	})
 	adminMux := http.NewServeMux()
 	admin.RegisterRoutes(adminMux)
 	adminServer := &http.Server{
@@ -105,7 +168,6 @@ func main() {
 		WriteTimeout: time.Duration(cfg.WriteTimeoutSec) * time.Second,
 	}
 
-	// 8. Create proxy server.
 	proxyServer := &http.Server{
 		Addr:         cfg.ListenAddr,
 		Handler:      wp,
@@ -113,14 +175,11 @@ func main() {
 		WriteTimeout: time.Duration(cfg.WriteTimeoutSec) * time.Second,
 	}
 
-	// 9. Start background traffic sampler for the line graph.
 	stopSampler := startTrafficSampler(metrics)
 
-	// 10. Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	// 11. Start servers.
 	go func() {
 		defer func() {
 			if rec := recover(); rec != nil {

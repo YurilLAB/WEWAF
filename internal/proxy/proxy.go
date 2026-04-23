@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"wewaf/internal/bruteforce"
@@ -47,6 +49,9 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	if err != nil {
 		return nil, fmt.Errorf("proxy: invalid backend_url: %w", err)
 	}
+	if backend.Scheme != "http" && backend.Scheme != "https" {
+		return nil, fmt.Errorf("proxy: invalid backend_url scheme %q (must be http or https)", backend.Scheme)
+	}
 
 	sema := limits.NewSemaphore(cfg.MaxConcurrentReq)
 	rl := limits.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
@@ -73,9 +78,16 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			wp.eng.LogError("proxy: panic in ServeHTTP: %v", rec)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			if w != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
 		}
 	}()
+
+	if r == nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 
 	if err := wp.sema.Acquire(r.Context()); err != nil {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
@@ -107,6 +119,13 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce body size limit before reading.
+	if r.ContentLength > wp.cfg.MaxBodyBytes && r.ContentLength > 0 {
+		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+		wp.eng.ProcessLogging(tx)
+		return
+	}
+
 	// Buffer body for inspection and forwarding.
 	var body []byte
 	if r.Body != nil {
@@ -115,6 +134,8 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		body, err = io.ReadAll(limited)
 		if err != nil {
 			wp.eng.LogError("proxy: body read error: %v", err)
+			_ = r.Body.Close()
+			r.Body = io.NopCloser(&bytes.Reader{})
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			wp.eng.ProcessLogging(tx)
 			return
@@ -191,6 +212,10 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // modifyResponse inspects backend responses (Phase 3 and 4).
 func (wp *WAFProxy) modifyResponse(res *http.Response) error {
+	if res == nil || res.Request == nil {
+		return nil
+	}
+
 	tx, ok := res.Request.Context().Value(txKey).(*core.Transaction)
 	if !ok {
 		return nil
@@ -228,11 +253,19 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 }
 
 func (wp *WAFProxy) recordBlockFromResponse(tx *core.Transaction, intr *core.Interruption) {
-	wp.metrics.RecordBlock(tx.ClientIP, tx.Request.Method, tx.Request.URL.Path, "multi", intr.Message, tx.ScoreSnapshot())
+	if tx == nil || tx.Request == nil || intr == nil {
+		return
+	}
+	ruleID, _ := primaryMatch(intr)
+	wp.metrics.RecordBlock(tx.ClientIP, tx.Request.Method, tx.Request.URL.Path, ruleID, intr.Message, tx.ScoreSnapshot())
 	tx.SetBlocked(core.PhaseResponseBody)
 }
 
 func (wp *WAFProxy) replaceWithSynthetic(res *http.Response, intr *core.Interruption) error {
+	if intr == nil {
+		return errors.New("proxy: replaceWithSynthetic called with nil interruption")
+	}
+
 	body := []byte(fmt.Sprintf("%d %s\nRequest blocked by WEWaf.\n", intr.Status, http.StatusText(intr.Status)))
 	res.StatusCode = intr.Status
 	res.Status = http.StatusText(intr.Status)
@@ -251,9 +284,27 @@ func (wp *WAFProxy) replaceWithSynthetic(res *http.Response, intr *core.Interrup
 }
 
 func (wp *WAFProxy) handleBlock(w http.ResponseWriter, tx *core.Transaction, intr *core.Interruption) {
-	wp.metrics.RecordBlock(tx.ClientIP, tx.Request.Method, tx.Request.URL.Path, "multi", intr.Message, tx.ScoreSnapshot())
+	if tx == nil || tx.Request == nil || intr == nil {
+		if w != nil {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+		}
+		return
+	}
+	ruleID, _ := primaryMatch(intr)
+	wp.metrics.RecordBlock(tx.ClientIP, tx.Request.Method, tx.Request.URL.Path, ruleID, intr.Message, tx.ScoreSnapshot())
 	wp.writeBlock(w, intr, tx.ID)
 	wp.eng.ProcessLogging(tx)
+}
+
+// primaryMatch returns the rule ID + rule name for the first match in an
+// interruption. Callers get "multi" if there is no match info at all, which
+// keeps the metrics schema consistent with legacy behaviour.
+func primaryMatch(intr *core.Interruption) (string, string) {
+	if intr == nil || len(intr.Matches) == 0 {
+		return "multi", ""
+	}
+	m := intr.Matches[0]
+	return m.RuleID, m.RuleName
 }
 
 // writeBlock writes an HTTP error response for a blocked transaction,
@@ -269,6 +320,9 @@ func (wp *WAFProxy) writeBlock(w http.ResponseWriter, intr *core.Interruption, t
 		}
 		w.Header().Set("Connection", "close")
 		w.WriteHeader(intr.Status)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -279,7 +333,28 @@ func (wp *WAFProxy) writeBlock(w http.ResponseWriter, intr *core.Interruption, t
 
 // errorHandler handles backend connection errors.
 func (wp *WAFProxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
-	wp.eng.LogError("proxy: backend error: %v", err)
+	var logMsg string
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		logMsg = "proxy: backend connection refused"
+	case errors.Is(err, syscall.ETIMEDOUT):
+		logMsg = "proxy: backend connection timed out"
+	default:
+		if urlErr, ok := err.(*url.Error); ok {
+			if urlErr.Timeout() {
+				logMsg = "proxy: backend request timeout"
+			} else if dnsErr, ok := urlErr.Err.(*net.DNSError); ok {
+				logMsg = fmt.Sprintf("proxy: backend DNS error: %s", dnsErr.Error())
+			} else {
+				logMsg = fmt.Sprintf("proxy: backend error: %v", err)
+			}
+		} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			logMsg = "proxy: backend network timeout"
+		} else {
+			logMsg = fmt.Sprintf("proxy: backend error: %v", err)
+		}
+	}
+	wp.eng.LogError("%s", logMsg)
 	wp.metrics.RecordError()
 	http.Error(w, "Bad Gateway", http.StatusBadGateway)
 }
@@ -352,6 +427,9 @@ func getClientIP(r *http.Request, trustXFF bool) string {
 }
 
 func isWebSocket(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
 		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
 }
@@ -361,7 +439,11 @@ func isLoginRequest(r *http.Request) bool {
 		return false
 	}
 	path := strings.ToLower(r.URL.Path)
-	loginPaths := []string{"/login", "/auth", "/signin", "/wp-login.php", "/admin/login", "/api/login"}
+	loginPaths := []string{
+		"/login", "/auth", "/signin", "/wp-login.php", "/admin/login",
+		"/api/login", "/api/auth", "/oauth/token", "/v1/login",
+		"/register", "/signup",
+	}
 	for _, lp := range loginPaths {
 		if path == lp {
 			return true

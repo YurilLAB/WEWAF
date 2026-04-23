@@ -31,11 +31,22 @@ type Config struct {
 	BruteForceWindowSec int `json:"brute_force_window_sec"`
 	BruteForceThreshold int `json:"brute_force_threshold"`
 
+	// Reputation-based auto-ban
+	ReputationWindowSec      int `json:"reputation_window_sec"`       // default 600 (10 min)
+	ReputationThreshold      int `json:"reputation_threshold"`        // default 5 blocks before auto-ban
+	ReputationBanDurationSec int `json:"reputation_ban_duration_sec"` // default 3600 (1 hour)
+
 	// Engine behaviour
 	Mode         string   `json:"mode"`           // "active", "detection", "learning"
 	LogLevel     string   `json:"log_level"`      // "debug", "info", "warn", "error"
 	AuditLogPath string   `json:"audit_log_path"`
 	RuleFiles    []string `json:"rule_files"`
+
+	// Persistent history storage
+	HistoryDir          string `json:"history_dir"`           // default "history"
+	HistoryRotateHours  int    `json:"history_rotate_hours"`  // default 24
+	HistoryBufferSize   int    `json:"history_buffer_size"`   // default 4096
+	HistoryFlushSeconds int    `json:"history_flush_seconds"` // default 2
 
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 }
@@ -43,25 +54,32 @@ type Config struct {
 // Default returns a safe baseline configuration.
 func Default() *Config {
 	c := &Config{
-		ListenAddr:          ":8080",
-		AdminAddr:           ":8443",
-		BackendURL:          "http://localhost:3000",
-		TrustXFF:            false,
-		ReadTimeoutSec:      30,
-		WriteTimeoutSec:     30,
-		MaxCPUCores:         runtime.NumCPU(),
-		MaxMemoryMB:         0,
-		MaxConcurrentReq:    10000,
-		MaxBodyBytes:        10 * 1024 * 1024, // 10 MB
-		BlockThreshold:      100,
-		RateLimitRPS:        100,
-		RateLimitBurst:      150,
-		BruteForceWindowSec: 300,
-		BruteForceThreshold: 10,
-		Mode:                "active",
-		LogLevel:            "info",
-		AuditLogPath:        "",
-		RuleFiles:           []string{"rules.json"},
+		ListenAddr:               ":8080",
+		AdminAddr:                ":8443",
+		BackendURL:               "http://localhost:3000",
+		TrustXFF:                 false,
+		ReadTimeoutSec:           30,
+		WriteTimeoutSec:          30,
+		MaxCPUCores:              runtime.NumCPU(),
+		MaxMemoryMB:              0,
+		MaxConcurrentReq:         10000,
+		MaxBodyBytes:             10 * 1024 * 1024, // 10 MB
+		BlockThreshold:           100,
+		RateLimitRPS:             100,
+		RateLimitBurst:           150,
+		BruteForceWindowSec:      300,
+		BruteForceThreshold:      10,
+		ReputationWindowSec:      600,
+		ReputationThreshold:      5,
+		ReputationBanDurationSec: 3600,
+		Mode:                     "active",
+		LogLevel:                 "info",
+		AuditLogPath:             "",
+		RuleFiles:                []string{"rules.json"},
+		HistoryDir:               "history",
+		HistoryRotateHours:       24,
+		HistoryBufferSize:        4096,
+		HistoryFlushSeconds:      2,
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -76,7 +94,7 @@ func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("config: file not found: %q", path)
+			return cfg, nil
 		}
 		return nil, fmt.Errorf("config: read %q: %w", path, err)
 	}
@@ -107,6 +125,30 @@ func (c *Config) Validate() error {
 	if c.Mode != "active" && c.Mode != "detection" && c.Mode != "learning" {
 		c.Mode = "active"
 	}
+	if c.ReputationWindowSec <= 0 {
+		c.ReputationWindowSec = 600
+	}
+	if c.ReputationThreshold <= 0 {
+		c.ReputationThreshold = 5
+	}
+	if c.ReputationBanDurationSec <= 0 {
+		c.ReputationBanDurationSec = 3600
+	}
+	if c.ReputationBanDurationSec < 60 {
+		c.ReputationBanDurationSec = 60
+	}
+	if c.HistoryDir == "" {
+		c.HistoryDir = "history"
+	}
+	if c.HistoryRotateHours <= 0 {
+		c.HistoryRotateHours = 24
+	}
+	if c.HistoryBufferSize <= 0 {
+		c.HistoryBufferSize = 4096
+	}
+	if c.HistoryFlushSeconds <= 0 {
+		c.HistoryFlushSeconds = 2
+	}
 	return nil
 }
 
@@ -114,25 +156,32 @@ func (c *Config) Validate() error {
 // Do not modify the returned value.
 func (c *Config) Snapshot() *Config {
 	cp := &Config{
-		ListenAddr:      c.ListenAddr,
-		AdminAddr:       c.AdminAddr,
-		BackendURL:      c.BackendURL,
-		TrustXFF:        c.TrustXFF,
-		ReadTimeoutSec:  c.ReadTimeoutSec,
-		WriteTimeoutSec: c.WriteTimeoutSec,
-		MaxCPUCores:     c.MaxCPUCores,
-		MaxMemoryMB:     c.MaxMemoryMB,
-		MaxConcurrentReq: c.MaxConcurrentReq,
-		MaxBodyBytes:    c.MaxBodyBytes,
-		BlockThreshold:  c.BlockThreshold,
-		RateLimitRPS:    c.RateLimitRPS,
-		RateLimitBurst:  c.RateLimitBurst,
-		BruteForceWindowSec: c.BruteForceWindowSec,
-		BruteForceThreshold: c.BruteForceThreshold,
-		Mode:            c.ModeSnapshot(),
-		LogLevel:        c.LogLevel,
-		AuditLogPath:    c.AuditLogPath,
-		RuleFiles:       make([]string, len(c.RuleFiles)),
+		ListenAddr:               c.ListenAddr,
+		AdminAddr:                c.AdminAddr,
+		BackendURL:               c.BackendURL,
+		TrustXFF:                 c.TrustXFF,
+		ReadTimeoutSec:           c.ReadTimeoutSec,
+		WriteTimeoutSec:          c.WriteTimeoutSec,
+		MaxCPUCores:              c.MaxCPUCores,
+		MaxMemoryMB:              c.MaxMemoryMB,
+		MaxConcurrentReq:         c.MaxConcurrentReq,
+		MaxBodyBytes:             c.MaxBodyBytes,
+		BlockThreshold:           c.BlockThreshold,
+		RateLimitRPS:             c.RateLimitRPS,
+		RateLimitBurst:           c.RateLimitBurst,
+		BruteForceWindowSec:      c.BruteForceWindowSec,
+		BruteForceThreshold:      c.BruteForceThreshold,
+		ReputationWindowSec:      c.ReputationWindowSec,
+		ReputationThreshold:      c.ReputationThreshold,
+		ReputationBanDurationSec: c.ReputationBanDurationSec,
+		Mode:                     c.ModeSnapshot(),
+		LogLevel:                 c.LogLevel,
+		AuditLogPath:             c.AuditLogPath,
+		RuleFiles:                make([]string, len(c.RuleFiles)),
+		HistoryDir:               c.HistoryDir,
+		HistoryRotateHours:       c.HistoryRotateHours,
+		HistoryBufferSize:        c.HistoryBufferSize,
+		HistoryFlushSeconds:      c.HistoryFlushSeconds,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	cp.modeAtomic = atomic.Value{}

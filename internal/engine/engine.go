@@ -70,6 +70,9 @@ func (e *Engine) Reload(rs *rules.RuleSet) {
 
 // ProcessRequestHeaders evaluates rules against the incoming request line and headers.
 func (e *Engine) ProcessRequestHeaders(tx *core.Transaction) *core.Interruption {
+	if tx == nil || tx.Request == nil {
+		return nil
+	}
 	targets := e.buildRequestHeaderTargets(tx.Request)
 	return e.evaluatePhase(tx, core.PhaseRequestHeaders, targets)
 }
@@ -77,6 +80,9 @@ func (e *Engine) ProcessRequestHeaders(tx *core.Transaction) *core.Interruption 
 // ProcessRequestBody evaluates rules against the buffered request body.
 // The caller must have already read and restored the body on the request.
 func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
+	if tx == nil {
+		return nil
+	}
 	var body string
 	if val, ok := tx.MetadataValue("body"); ok {
 		if b, ok := val.([]byte); ok {
@@ -84,7 +90,7 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 		}
 	}
 	if body == "" {
-		b, err := readBodyString(tx.Request)
+		b, err := e.readBodyString(tx.Request)
 		if err != nil {
 			e.logger.Warnf("engine: failed to read request body: %v", err)
 			body = ""
@@ -100,17 +106,30 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 
 // ProcessResponseHeaders evaluates rules against the backend response headers.
 func (e *Engine) ProcessResponseHeaders(tx *core.Transaction, status int, headers http.Header) *core.Interruption {
+	if tx == nil {
+		return nil
+	}
 	targets := map[string]string{
 		"response_status":  fmt.Sprintf("%d", status),
-		"response_headers": headersToString(headers),
+		"response_headers": headersToString(headers, 64*1024),
 	}
 	return e.evaluatePhase(tx, core.PhaseResponseHeaders, targets)
 }
 
 // ProcessResponseBody evaluates rules against the backend response body (if buffered).
 func (e *Engine) ProcessResponseBody(tx *core.Transaction, body []byte) *core.Interruption {
+	if tx == nil {
+		return nil
+	}
 	if len(body) == 0 {
 		return nil
+	}
+	var maxBody int64 = 1 << 20
+	if e.cfg != nil && e.cfg.MaxBodyBytes > 0 {
+		maxBody = e.cfg.MaxBodyBytes
+	}
+	if int64(len(body)) > maxBody {
+		body = body[:int(maxBody)]
 	}
 	targets := map[string]string{
 		"response_body": string(body),
@@ -125,6 +144,9 @@ func (e *Engine) LogError(format string, args ...interface{}) {
 
 // ProcessLogging finalises the transaction and writes audit data.
 func (e *Engine) ProcessLogging(tx *core.Transaction) {
+	if tx == nil {
+		return
+	}
 	mode := e.cfg.ModeSnapshot()
 	if mode == "learning" {
 		e.logger.Infof("[LEARN] tx=%s score=%d matches=%d", tx.ID, tx.ScoreSnapshot(), tx.MatchCount())
@@ -148,14 +170,36 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 	cfgSnap := e.cfg.Snapshot()
 	e.mu.RUnlock()
 
-	matches, hardBlock := rs.Evaluate(phase, targets, cfgSnap.BlockThreshold)
+	const maxMatches = 1000
+	preMatchCount := tx.MatchCount()
+
+	// Isolate rs.Evaluate with its own panic recovery so a bad regex cannot crash the WAF.
+	var matches []core.Match
+	var hardBlock bool
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				e.logger.Errorf("engine: panic during rule evaluation: %v", rec)
+			}
+		}()
+		matches, hardBlock = rs.Evaluate(phase, targets, cfgSnap.BlockThreshold)
+	}()
+
 	for _, m := range matches {
+		if tx.MatchCount()-preMatchCount >= maxMatches {
+			e.logger.Warnf("engine: match limit (%d) reached for phase %s", maxMatches, phase)
+			break
+		}
 		tx.AddMatch(m)
 	}
 
 	// Check special non-regex rules.
 	specialMatches := e.evaluateSpecialRules(tx, phase, targets)
 	for _, m := range specialMatches {
+		if tx.MatchCount()-preMatchCount >= maxMatches {
+			e.logger.Warnf("engine: match limit (%d) reached for phase %s", maxMatches, phase)
+			break
+		}
 		tx.AddMatch(m)
 		if m.Score >= cfgSnap.BlockThreshold || m.Action == core.ActionBlock || m.Action == core.ActionDrop {
 			hardBlock = true
@@ -194,6 +238,9 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, targets map[string]string) []core.Match {
 	var matches []core.Match
 	if phase != core.PhaseRequestHeaders {
+		return matches
+	}
+	if tx.Request == nil {
 		return matches
 	}
 
@@ -249,51 +296,90 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 }
 
 // buildRequestHeaderTargets extracts inspectable strings from an HTTP request.
+// Individual values are capped at 8 KB and total entries at 100 to prevent DoS.
 func (e *Engine) buildRequestHeaderTargets(r *http.Request) map[string]string {
+	const maxValueLen = 8192
+	const maxEntries = 100
+
 	targets := make(map[string]string, 8)
-	if uri, err := url.PathUnescape(r.URL.RequestURI()); err == nil {
-		targets["uri"] = uri
-	} else {
-		targets["uri"] = r.URL.RequestURI()
+	add := func(key, value string) bool {
+		if len(targets) >= maxEntries {
+			return false
+		}
+		if len(value) > maxValueLen {
+			value = value[:maxValueLen]
+		}
+		targets[key] = value
+		return true
 	}
-	targets["method"] = r.Method
-	if path, err := url.PathUnescape(r.URL.Path); err == nil {
-		targets["path"] = path
+
+	if r == nil {
+		return targets
+	}
+
+	if uri, err := url.PathUnescape(r.URL.RequestURI()); err == nil {
+		add("uri", uri)
 	} else {
-		targets["path"] = r.URL.Path
+		add("uri", r.URL.RequestURI())
+	}
+	add("method", r.Method)
+	if path, err := url.PathUnescape(r.URL.Path); err == nil {
+		add("path", path)
+	} else {
+		add("path", r.URL.Path)
 	}
 	for k, v := range r.URL.Query() {
 		raw := strings.Join(v, ", ")
 		if decoded, err := url.QueryUnescape(raw); err == nil {
-			targets["args."+k] = decoded
+			if !add("args."+k, decoded) {
+				break
+			}
 		} else {
-			targets["args."+k] = raw
+			if !add("args."+k, raw) {
+				break
+			}
 		}
 	}
 	for k, v := range r.Header {
-		targets["headers."+k] = strings.Join(v, ", ")
+		if !add("headers."+k, strings.Join(v, ", ")) {
+			break
+		}
 	}
 	return targets
 }
 
-// headersToString serialises headers for inspection.
-func headersToString(h http.Header) string {
+// headersToString serialises headers for inspection, capped at maxBytes.
+func headersToString(h http.Header, maxBytes int) string {
 	var b strings.Builder
 	for k, v := range h {
-		b.WriteString(k)
-		b.WriteString(": ")
-		b.WriteString(strings.Join(v, ", "))
-		b.WriteString("\n")
+		line := k + ": " + strings.Join(v, ", ") + "\n"
+		if b.Len()+len(line) > maxBytes {
+			if b.Len() < maxBytes {
+				remaining := maxBytes - b.Len()
+				b.WriteString(line[:remaining])
+			}
+			break
+		}
+		b.WriteString(line)
 	}
 	return b.String()
 }
 
-// readBodyString reads the request body (capped at 1 MiB) and restores it so the proxy can forward it.
-func readBodyString(r *http.Request) (string, error) {
-	if r.Body == nil {
+// readBodyString reads the request body (capped at cfg.MaxBodyBytes) and restores it so the proxy can forward it.
+// It recovers from panics during body read.
+func (e *Engine) readBodyString(r *http.Request) (string, error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			e.logger.Errorf("engine: panic while reading body: %v", rec)
+		}
+	}()
+	if r == nil || r.Body == nil {
 		return "", nil
 	}
-	const maxBody = 1 << 20 // 1 MiB hard cap for engine inspection
+	var maxBody int64 = 1 << 20
+	if e.cfg != nil && e.cfg.MaxBodyBytes > 0 {
+		maxBody = e.cfg.MaxBodyBytes
+	}
 	// If body supports Seek, reset to beginning first (allows re-reading).
 	if seeker, ok := r.Body.(io.Seeker); ok {
 		_, _ = seeker.Seek(0, io.SeekStart)

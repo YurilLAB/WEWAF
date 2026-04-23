@@ -40,7 +40,7 @@ func DefaultRules() []core.Rule {
 	return []core.Rule{
 		// === XSS — immediate blocks ===
 		{ID: "XSS-001", Name: "XSS Script Tag", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "HTML script tag detected", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)<script\b[^>]*>[\s\S]{0,1000}</script>`},
-		{ID: "XSS-002", Name: "XSS JavaScript Protocol", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "javascript: protocol in URL/header", Targets: []string{"args", "headers"}, Pattern: `(?i)javascript\s*:`},
+		{ID: "XSS-002", Name: "XSS JavaScript Protocol", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "javascript: protocol in URL/header", Targets: []string{"args", "headers"}, Pattern: `(?i)java(?:\s|%0[9aAdD]|%20|&#[xX]?[0-9a-fA-F]+;)*script(?:\s|%0[9aAdD]|%20|&#[xX]?[0-9a-fA-F]+;)*:`},
 		{ID: "XSS-003", Name: "XSS Event Handler + Sink", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "DOM event handler with sink", Targets: []string{"args", "body"}, Pattern: `(?i)\bon\w+\s*=\s*["']?[^"'>]{0,200}\b(alert|confirm|prompt|eval)\s*\(`},
 		{ID: "XSS-004", Name: "XSS Template Injection", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "Possible template injection", Targets: []string{"args", "body"}, Pattern: `(?i)\{\{.*?\}\}`},
 		{ID: "XSS-005", Name: "XSS IMG Onerror", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "IMG tag with onerror handler", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)<img\b[^>]*\bonerror\s*=`},
@@ -52,9 +52,9 @@ func DefaultRules() []core.Rule {
 		{ID: "XSS-011", Name: "XSS MHTML Protocol", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "MHTML protocol payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)mhtml:`},
 
 		// === SQL Injection — immediate / high score ===
-		{ID: "SQLI-001", Name: "SQLi Union Select", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "UNION SELECT pattern", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)union\s+(all\s+)?select`},
+		{ID: "SQLI-001", Name: "SQLi Union Select", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "UNION SELECT pattern", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)union(\s+|/\*[\s\S]{0,100}\*/)+(all(\s+|/\*[\s\S]{0,100}\*/)+)?select`},
 		{ID: "SQLI-002", Name: "SQLi Stacked Destructive", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Stacked destructive query", Targets: []string{"args", "body"}, Pattern: `(?i);\s*(drop|delete|truncate|insert|update)\s`},
-		{ID: "SQLI-003", Name: "SQLi Tautology + Comment", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Tautology with comment sequence", Targets: []string{"args", "body"}, Pattern: `(?i)'\s*or\s+'[^']*'\s*=\s*'[^']*'\s*(--|#|/\*.*\*/)`},
+		{ID: "SQLI-003", Name: "SQLi Tautology + Comment", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Tautology with comment sequence", Targets: []string{"args", "body"}, Pattern: `(?i)(['"]?\s*\b(?:or|and)\b\s*['"]?[^'"\s=]+['"]?\s*=\s*['"]?[^'"\s=]+|\d+\s*=\s*\d+)`},
 		{ID: "SQLI-004", Name: "SQLi Time-based Function", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Time-based SQLi function", Targets: []string{"args", "body"}, Pattern: `(?i)(sleep\s*\(|benchmark\s*\(|pg_sleep\s*\(|waitfor\s+delay)`},
 		{ID: "SQLI-005", Name: "SQLi Blind Boolean", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Blind boolean tautology", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(\band\b\s*\(?\s*1\s*=\s*1|\bor\b\s*\(?\s*1\s*=\s*1|\band\b\s*\(?\s*2\s*>\s*1|\bor\b\s*\(?\s*2\s*>\s*1)`},
 		{ID: "SQLI-006", Name: "SQLi Error Based", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Error-based SQLi information extraction", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(convert\s*\(\s*int\s*,\s*@@version|@@datadir|@@version|@@hostname|db_name\s*\()`},
@@ -111,18 +111,79 @@ func DefaultRules() []core.Rule {
 		{ID: "SCAN-003", Name: "Extended Scanner UA", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Extended scanner User-Agent list", Targets: []string{"headers"}, Pattern: `(?i)(acunetix|netsparker|w3af|arachni|wpscan|openvas|skipfish|nessus|appscan|whatweb|wappalyzer)`},
 
 		// === Command Injection / RCE ===
-		{ID: "RCE-001", Name: "RCE Command Substitution", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Command substitution $() or backticks", Targets: []string{"args", "body", "headers"}, Pattern: "(?i)(\\$\\([^)]+\\)|`[^`]+`)"},
+		{ID: "RCE-001", Name: "RCE Command Substitution", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Command substitution $() or backticks", Targets: []string{"args", "body", "headers"}, Pattern: "(?i)(\\$\\([\\s\\S]{0,300}\\)|`[\\s\\S]{0,300}`)"},
 		{ID: "RCE-002", Name: "RCE Reverse Shell", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Reverse shell indicator", Targets: []string{"args", "body"}, Pattern: `(?i)(bash\s+-i|nc\s+-[ev]|python\s+-c\s*['"]import socket)`},
-		{ID: "RCE-003", Name: "RCE Dangerous Chain", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Shell meta-char followed by binary", Targets: []string{"args", "body"}, Pattern: `(?i)[;&|]\s*(curl|wget|python|perl|ruby|bash|sh|cmd|powershell)\s+`},
+		{ID: "RCE-003", Name: "RCE Dangerous Chain", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Shell meta-char followed by binary", Targets: []string{"args", "body"}, Pattern: `(?i)[;&|]\s*(curl|wget|python|perl|ruby|bash|sh|cmd|powershell|php|node|nodejs|lua|luajit|awk|gawk|nawk|expect|telnet|ssh|scp|ftp|tftp|nc|netcat|socat)\s+`},
 		{ID: "RCE-004", Name: "RCE IFS Evasion", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionLog, Description: "IFS evasion pattern", Targets: []string{"args", "body"}, Pattern: `(?i)\$\{IFS\}`},
 		{ID: "RCE-005", Name: "RCE Scripting One-Liners", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Scripting language one-liner execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(base64\s+-d|python\s+-c|perl\s+-e|ruby\s+-e|php\s+-r)`},
 		{ID: "RCE-006", Name: "RCE Dangerous Functions", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dangerous PHP/function execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(eval\s*\(|assert\s*\(|exec\s*\(|system\s*\(|passthru\s*\(|popen\s*\(|proc_open\s*\(|shell_exec\s*\()`},
 
 		// === Path Traversal / LFI / RFI ===
 		{ID: "TRAV-001", Name: "Traversal Null Byte", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Null byte in path", Targets: []string{"args", "uri"}, Pattern: `\x00`},
-		{ID: "TRAV-002", Name: "Traversal Dot-Dot-Slash", Phase: core.PhaseRequestHeaders, Score: 75, Action: core.ActionBlock, Description: "Directory traversal sequence", Targets: []string{"args", "uri"}, Pattern: `(?i)(\.\./|\.\.\\|\.\.%2f|\.\.%5c|%2e%2e%2f|%2e%2e%5c)`},
+		{ID: "TRAV-002", Name: "Traversal Dot-Dot-Slash", Phase: core.PhaseRequestHeaders, Score: 75, Action: core.ActionBlock, Description: "Directory traversal sequence", Targets: []string{"args", "uri"}, Pattern: `(?i)(?:(?:\.|%2e|%252e|%c0%ae|%e0%80%ae|%f0%80%80%ae){2}(?:/|\\|%2f|%5c|%252f|%255c|%c0%af|%c1%9c|%e0%80%af|%f0%80%80%af))`},
 		{ID: "TRAV-003", Name: "Traversal PHP Wrapper", Phase: core.PhaseRequestBody, Score: 75, Action: core.ActionBlock, Description: "PHP/file wrapper in parameter", Targets: []string{"args", "body"}, Pattern: `(?i)(file|php|expect|data|input|zip|compress)://`},
 		{ID: "TRAV-004", Name: "Traversal Sensitive File", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Sensitive system file requested", Targets: []string{"args", "uri"}, Pattern: `(?i)(/etc/passwd|boot\.ini|win\.ini|web\.config|\.htaccess|\.env|\.git/)`},
+
+		// === JWT / Token Attacks ===
+		{ID: "JWT-001", Name: "JWT Alg None", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "JWT algorithm none attack", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)"alg"\s*:\s*["']?\s*none\s*["']?`},
+
+		// === GraphQL Abuse ===
+		{ID: "GRAPHQL-001", Name: "GraphQL Introspection", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "GraphQL introspection query", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(__schema|__type|__typename|introspectionquery|query\s+introspectionquery)`},
+
+		// === Host Header Attacks ===
+		{ID: "HOST-001", Name: "Host Header Injection", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Suspicious Host header manipulation", Targets: []string{"headers"}, Pattern: `(?i)(X-Forwarded-Host|X-HTTP-Host-Override|X-Original-Host|X-Host)\s*:\s*[^:\s]{3,}`},
+
+		// === XML-RPC / WordPress Attacks ===
+		{ID: "XMLRPC-001", Name: "XML-RPC WordPress Attack", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "XML-RPC or WordPress attack payload", Targets: []string{"args", "uri", "body"}, Pattern: `(?i)<methodcall>|<methodname>wp\.|xmlrpc\.php|system\.multicall`},
+
+		// === OAuth Abuse ===
+		{ID: "OAUTH-001", Name: "OAuth Redirect Abuse", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "OAuth redirect_uri pointing to internal/localhost", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)redirect_uri\s*=\s*https?://[^&\s]*(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\.local|\.internal)`},
+
+		// === Base64 Encoded Payloads ===
+		{ID: "B64-001", Name: "Base64 Decode Execution", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Execution after base64 decode", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:eval|exec|system|assert|passthru)\s*\(\s*(?:base64_decode|atob)\s*\(\s*["']?[A-Za-z0-9+/]{20,}=?["']?\s*\)\s*\)`},
+
+		// === HTTP Parameter Pollution ===
+		{ID: "HPP-001", Name: "HTTP Parameter Pollution", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "Duplicate parameters suggesting HPP", Targets: []string{"args", "uri"}, Pattern: `(?i)([?&]id=[^&]*&.*[?&]id=|[?&]user=[^&]*&.*[?&]user=|[?&]role=[^&]*&.*[?&]role=)`},
+
+		// === XPath Injection ===
+		{ID: "XPATH-001", Name: "XPath Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "XPath injection payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(/'?\s*(?:or|and)\s+['"]?\d+['"]?\s*=\s*['"]?\d+|count\s*\(\s*child::|local-name\s*\(\s*\)|namespace-uri\s*\(\s*\)|/text\s*\(\s*\)|substring\s*\(\s*|\]\s*\|\s*//|\*/\*)`},
+
+		// === SSI Injection ===
+		{ID: "SSI-001", Name: "SSI Injection", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Server-Side Include directive", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)<!--#(?:include|exec|printenv|config|fsize|flastmod|echo)\s+`},
+
+		// === Cache Poisoning ===
+		{ID: "CACHE-001", Name: "Cache Poisoning Headers", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Suspicious cache poisoning headers", Targets: []string{"headers"}, Pattern: `(?i)(X-Original-Url|X-Rewrite-Url|X-Forwarded-Host|X-Forwarded-Scheme|X-HTTP-Method-Override|Transfer-Encoding)\s*:\s*[^:\r\n]{2,}`},
+
+		// === HTTP Method Override ===
+		{ID: "METHOD-001", Name: "HTTP Method Override", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "HTTP method override header", Targets: []string{"headers"}, Pattern: `(?i)(X-HTTP-Method|X-HTTP-Method-Override|X-Method-Override|_method)\s*:\s*(?:GET|POST|PUT|DELETE|PATCH|TRACE|CONNECT|OPTIONS)`},
+
+		// === Spring4Shell ===
+		{ID: "SPRING-001", Name: "Spring4Shell", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Spring4Shell classloader manipulation", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)class\.module\.classLoader\.`},
+
+		// === SSRF Cloud Variants (IMDSv2, etc.) ===
+		{ID: "SSRF-006", Name: "SSRF Cloud Metadata Variants", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Cloud metadata endpoint variant", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(169\.254\.169\.254/(?:latest|metadata|api)|169\.254\.170\.2|100\.100\.100\.200|metadata\.google\.internal|192\.0\.0\.192)`},
+
+		// === Additional RCE ===
+		{ID: "RCE-007", Name: "RCE Python Import OS", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Python one-liner importing dangerous modules", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)python\s+-c\s*['"][^'"]*import\s+(?:os|subprocess|socket|pty)`},
+		{ID: "RCE-008", Name: "RCE Perl Open", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Perl open command execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)perl\s+-e\s*['"][^'"]*\bopen\s*[\s\(]`},
+
+		// === XSS Template Injection / Polyglots ===
+		{ID: "XSS-012", Name: "XSS Template Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Template expression or polyglot payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\$\{[^}]{0,200}\}`},
+
+		// === JSON Injection ===
+		{ID: "JSON-001", Name: "JSON Injection", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Suspicious JSON privilege escalation", Targets: []string{"args", "body"}, Pattern: `(?i)\{\s*["']?(?:admin|role|isAdmin|permissions|access)\s*["']?\s*:\s*(?:true|1|null)\s*\}`},
+
+		// === CORS Bypass ===
+		{ID: "CORS-001", Name: "CORS Bypass", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Suspicious CORS origin header", Targets: []string{"headers"}, Pattern: `(?i)(Origin|Access-Control-Request-Method)\s*:\s*(?:[^:\r\n]*(?:127\.0\.0\.1|localhost|0\.0\.0\.0|null)|\s*\*)`},
+
+		// === Additional Scanner / Bot UAs ===
+		{ID: "SCAN-004", Name: "Extended Recon UA", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Reconnaissance scanner User-Agent", Targets: []string{"headers"}, Pattern: `(?i)(censys|shodan|zoomeye|fofa|binaryedge|onyphe|spyse|greynoise|internet-measurement|nuclei|jaeles|xray|goby)`},
+
+		// === PHP Specific Attacks ===
+		{ID: "PHP-001", Name: "PHP Dangerous Functions", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "PHP dangerous function call", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(pcntl_exec\s*\(|create_function\s*\(|call_user_func(?:_array)?\s*\(\s*["']?(?:assert|eval|system|exec|passthru))`},
+
+		// === Header Manipulation ===
+		{ID: "HEADER-001", Name: "IP Header Spoofing", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Private IP in forwarding header", Targets: []string{"headers"}, Pattern: `(?i)(X-Forwarded-For|X-Real-IP|True-Client-IP)\s*:\s*.*(?:127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})`},
 	}
 }
 

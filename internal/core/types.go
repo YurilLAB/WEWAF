@@ -13,11 +13,11 @@ import (
 type Phase int
 
 const (
-	PhaseRequestHeaders Phase = iota // headers received
-	PhaseRequestBody                 // body fully buffered
-	PhaseResponseHeaders             // backend response headers
-	PhaseResponseBody                // backend response body (optional)
-	PhaseLogging                     // after response sent
+	PhaseRequestHeaders  Phase = iota // headers received
+	PhaseRequestBody                  // body fully buffered
+	PhaseResponseHeaders              // backend response headers
+	PhaseResponseBody                 // backend response body (optional)
+	PhaseLogging                      // after response sent
 )
 
 func (p Phase) String() string {
@@ -41,10 +41,10 @@ func (p Phase) String() string {
 type Action int
 
 const (
-	ActionPass Action = iota // allow traffic
-	ActionBlock              // return HTTP error
-	ActionDrop               // close connection (no response)
-	ActionLog                // log only, do not block
+	ActionPass  Action = iota // allow traffic
+	ActionBlock               // return HTTP error
+	ActionDrop                // close connection (no response)
+	ActionLog                 // log only, do not block
 )
 
 func (a Action) String() string {
@@ -66,11 +66,11 @@ func (a Action) String() string {
 type Severity int
 
 const (
-	SeverityInfo Severity = iota // 0-24
-	SeverityLow                  // 25-49
-	SeverityMedium               // 50-74
-	SeverityHigh                 // 75-99
-	SeverityCritical             // 100+
+	SeverityInfo     Severity = iota // 0-24
+	SeverityLow                      // 25-49
+	SeverityMedium                   // 50-74
+	SeverityHigh                     // 75-99
+	SeverityCritical                 // 100+
 )
 
 // Rule is a single WAF inspection rule.
@@ -90,8 +90,8 @@ type Match struct {
 	RuleID    string    `json:"rule_id"`
 	RuleName  string    `json:"rule_name"`
 	Phase     Phase     `json:"phase"`
-	Target    string    `json:"target"`    // e.g. "args.q"
-	Value     string    `json:"value"`     // truncated snippet
+	Target    string    `json:"target"` // e.g. "args.q"
+	Value     string    `json:"value"`  // truncated snippet
 	Score     int       `json:"score"`
 	Action    Action    `json:"action"`
 	Message   string    `json:"message"`
@@ -232,4 +232,125 @@ func clientIP(r *http.Request, trustXFF bool) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// BanEntry records a single IP ban.
+type BanEntry struct {
+	IP        string    `json:"ip"`
+	Reason    string    `json:"reason"`
+	ExpiresAt time.Time `json:"expires_at"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// BanList is a thread-safe in-memory IP ban list with automatic expiry.
+type BanList struct {
+	mu       sync.RWMutex
+	entries  map[string]BanEntry
+	stopCh   chan struct{}
+	stopOnce sync.Once
+}
+
+// NewBanList creates a new empty BanList.
+func NewBanList() *BanList {
+	return &BanList{
+		entries: make(map[string]BanEntry),
+		stopCh:  make(chan struct{}),
+	}
+}
+
+// StartCleanup launches a background goroutine that evicts expired entries
+// every `interval`. Returns a stop function. Safe to call multiple times —
+// subsequent calls are no-ops. This was previously missing, so expired bans
+// stayed in memory forever under long-running daemons.
+func (bl *BanList) StartCleanup(interval time.Duration) func() {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		defer func() { _ = recover() }()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				bl.Cleanup()
+			case <-bl.stopCh:
+				return
+			}
+		}
+	}()
+	return func() {
+		bl.stopOnce.Do(func() { close(bl.stopCh) })
+	}
+}
+
+// Ban adds or updates a ban entry for the given IP.
+func (bl *BanList) Ban(ip, reason string, duration time.Duration) {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	now := time.Now().UTC()
+	bl.entries[ip] = BanEntry{
+		IP:        ip,
+		Reason:    reason,
+		ExpiresAt: now.Add(duration),
+		Timestamp: now,
+	}
+}
+
+// Unban removes a ban for the given IP.
+func (bl *BanList) Unban(ip string) {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	delete(bl.entries, ip)
+}
+
+// IsBanned returns true if the IP exists in the ban list and has not expired.
+func (bl *BanList) IsBanned(ip string) bool {
+	bl.mu.RLock()
+	defer bl.mu.RUnlock()
+	entry, ok := bl.entries[ip]
+	if !ok {
+		return false
+	}
+	return !time.Now().UTC().After(entry.ExpiresAt)
+}
+
+// List returns all active (non-expired) bans.
+func (bl *BanList) List() []BanEntry {
+	bl.mu.RLock()
+	defer bl.mu.RUnlock()
+	now := time.Now().UTC()
+	out := make([]BanEntry, 0, len(bl.entries))
+	for _, entry := range bl.entries {
+		if !now.After(entry.ExpiresAt) {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// Cleanup removes expired entries from the ban list.
+func (bl *BanList) Cleanup() {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	now := time.Now().UTC()
+	for ip, entry := range bl.entries {
+		if now.After(entry.ExpiresAt) {
+			delete(bl.entries, ip)
+		}
+	}
+}
+
+// Count returns the number of active (non-expired) bans.
+func (bl *BanList) Count() int {
+	bl.mu.RLock()
+	defer bl.mu.RUnlock()
+	now := time.Now().UTC()
+	count := 0
+	for _, entry := range bl.entries {
+		if !now.After(entry.ExpiresAt) {
+			count++
+		}
+	}
+	return count
 }
