@@ -17,10 +17,12 @@ import (
 	"wewaf/internal/config"
 	"wewaf/internal/connection"
 	"wewaf/internal/core"
+	"wewaf/internal/graphql"
 	"wewaf/internal/history"
 	"wewaf/internal/host"
 	"wewaf/internal/limits"
 	"wewaf/internal/proxy"
+	"wewaf/internal/session"
 	"wewaf/internal/setup"
 	"wewaf/internal/ssl"
 	"wewaf/internal/telemetry"
@@ -44,6 +46,8 @@ type Server struct {
 	proxy      *proxy.WAFProxy
 	checker    *setup.Checker
 	watchdog   *watchdog.Watchdog
+	sessions   *session.Tracker
+	graphql    *graphql.Validator
 
 	meshEnabled  bool
 	meshPeers    []string
@@ -108,15 +112,17 @@ func (s *Server) AttachWatchdog(w *watchdog.Watchdog) {
 
 // Deps wires optional subsystems into the admin server.
 type Deps struct {
-	Config     *config.Config
-	Metrics    *telemetry.Metrics
-	RulesFn    func() []map[string]interface{}
-	BanList    *core.BanList
-	Host       *host.Collector
-	Connection *connection.Manager
-	SSL        *ssl.Manager
-	History    *history.Store
-	Proxy      *proxy.WAFProxy
+	Config         *config.Config
+	Metrics        *telemetry.Metrics
+	RulesFn        func() []map[string]interface{}
+	BanList        *core.BanList
+	Host           *host.Collector
+	Connection     *connection.Manager
+	SSL            *ssl.Manager
+	History        *history.Store
+	Proxy          *proxy.WAFProxy
+	SessionTracker *session.Tracker
+	GraphQL        *graphql.Validator
 
 	MeshEnabled bool
 	MeshPeers   []string
@@ -137,6 +143,8 @@ func NewServer(d Deps) *Server {
 		history:    d.History,
 		proxy:      d.Proxy,
 		checker:    checker,
+		sessions:   d.SessionTracker,
+		graphql:    d.GraphQL,
 		errBufCap:  200,
 		errBuf:     make([]ErrorEvent, 0, 200),
 
@@ -236,6 +244,12 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// Per-subsystem health from the watchdog.
 	api.HandleFunc("/api/health/detail", s.handleHealthDetail)
 
+	// Session tracking + browser integrity (authenticated admin endpoints).
+	api.HandleFunc("/api/sessions", s.handleSessions)
+	api.HandleFunc("/api/sessions/", s.handleSessionByID)
+	api.HandleFunc("/api/graphql/stats", s.handleGraphQLStats)
+	api.HandleFunc("/api/graphql/recent", s.handleGraphQLRecent)
+
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
 	// Prometheus scrape endpoint — unauthenticated on the admin port because
@@ -244,6 +258,14 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// with withAuth as appropriate.
 	mux.HandleFunc("/metrics", s.handlePrometheus)
 	api.HandleFunc("/api/rules/counters", s.handleRuleCounters)
+
+	// The browser-challenge + beacon JS are served on a separate prefix
+	// that bypasses auth — they're public (served to every page visitor)
+	// and CORS-open (the JS runs on the protected site, not the admin UI).
+	mux.HandleFunc("/api/browser-challenge.js", s.handleBrowserChallengeJS)
+	mux.HandleFunc("/api/browser-beacon.js", s.handleBrowserBeaconJS)
+	mux.HandleFunc("/api/browser-challenge/verify", s.handleBrowserChallengeVerify)
+	mux.HandleFunc("/api/session/beacon", s.handleSessionBeacon)
 
 	// Serve the embedded SPA.
 	spaFS, err := fs.Sub(distFS, "dist")
@@ -380,6 +402,20 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			BlockThreshold      int   `json:"block_threshold"`
 			RateLimitRPS        int   `json:"rate_limit_rps"`
 			RateLimitBurst      int   `json:"rate_limit_burst"`
+
+			SessionTrackingEnabled    *bool `json:"session_tracking_enabled"`
+			BrowserChallengeEnabled   *bool `json:"browser_challenge_enabled"`
+			BrowserChallengeBlock     *bool `json:"browser_challenge_block"`
+			SessionBlockThreshold     *int  `json:"session_block_threshold"`
+			SessionRequestRateCeiling int   `json:"session_request_rate_ceiling"`
+			SessionPathCountCeiling   int   `json:"session_path_count_ceiling"`
+
+			GraphQLEnabled      *bool  `json:"graphql_enabled"`
+			GraphQLBlockOnError *bool  `json:"graphql_block_on_error"`
+			GraphQLMaxDepth     int    `json:"graphql_max_depth"`
+			GraphQLMaxAliases   int    `json:"graphql_max_aliases"`
+			GraphQLMaxFields    int    `json:"graphql_max_fields"`
+			GraphQLRoleHeader   string `json:"graphql_role_header"`
 		}
 		// Bounded reader so a malicious request can't OOM us with a 1 GB JSON.
 		// 64 KiB is generous — every legitimate config payload is under 8 KiB.
@@ -502,6 +538,44 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if payload.RateLimitBurst > 0 {
 			s.cfg.RateLimitBurst = payload.RateLimitBurst
 		}
+		if payload.SessionTrackingEnabled != nil {
+			s.cfg.SessionTrackingEnabled = *payload.SessionTrackingEnabled
+		}
+		if payload.BrowserChallengeEnabled != nil {
+			s.cfg.BrowserChallengeEnabled = *payload.BrowserChallengeEnabled
+		}
+		if payload.BrowserChallengeBlock != nil {
+			s.cfg.BrowserChallengeBlock = *payload.BrowserChallengeBlock
+		}
+		if payload.SessionBlockThreshold != nil {
+			if v := *payload.SessionBlockThreshold; v >= 0 && v <= 100 {
+				s.cfg.SessionBlockThreshold = v
+			}
+		}
+		if payload.SessionRequestRateCeiling > 0 {
+			s.cfg.SessionRequestRateCeiling = payload.SessionRequestRateCeiling
+		}
+		if payload.SessionPathCountCeiling > 0 {
+			s.cfg.SessionPathCountCeiling = payload.SessionPathCountCeiling
+		}
+		if payload.GraphQLEnabled != nil {
+			s.cfg.GraphQLEnabled = *payload.GraphQLEnabled
+		}
+		if payload.GraphQLBlockOnError != nil {
+			s.cfg.GraphQLBlockOnError = *payload.GraphQLBlockOnError
+		}
+		if payload.GraphQLMaxDepth > 0 {
+			s.cfg.GraphQLMaxDepth = payload.GraphQLMaxDepth
+		}
+		if payload.GraphQLMaxAliases > 0 {
+			s.cfg.GraphQLMaxAliases = payload.GraphQLMaxAliases
+		}
+		if payload.GraphQLMaxFields > 0 {
+			s.cfg.GraphQLMaxFields = payload.GraphQLMaxFields
+		}
+		if payload.GraphQLRoleHeader != "" {
+			s.cfg.GraphQLRoleHeader = payload.GraphQLRoleHeader
+		}
 		// Push updated ban-list backoff to the live object so changes take
 		// effect without a restart. Capture values under the write lock so
 		// the ConfigureBackoff call outside the lock sees a consistent set.
@@ -514,6 +588,22 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 
 		if s.banList != nil {
 			s.banList.ConfigureBackoff(backoffEnabled, backoffMult, backoffWindow, backoffMax)
+		}
+		// Push updated session + GraphQL toggles to the live subsystems.
+		if s.sessions != nil {
+			s.sessions.SetEnabled(s.cfg.SessionTrackingEnabled)
+			s.sessions.SetThresholds(s.cfg.SessionRequestRateCeiling, s.cfg.SessionPathCountCeiling)
+		}
+		if s.graphql != nil {
+			_ = s.graphql.Reload(graphql.Config{
+				Enabled:        s.cfg.GraphQLEnabled,
+				MaxDepth:       s.cfg.GraphQLMaxDepth,
+				MaxAliases:     s.cfg.GraphQLMaxAliases,
+				MaxFields:      s.cfg.GraphQLMaxFields,
+				SchemaSDL:      s.graphql.ConfigSnapshot().SchemaSDL, // keep loaded schema
+				RequireRoleHdr: s.cfg.GraphQLRoleHeader,
+				BlockOnError:   s.cfg.GraphQLBlockOnError,
+			})
 		}
 		// Persist a config snapshot after any successful change so operators
 		// have a rollback target.

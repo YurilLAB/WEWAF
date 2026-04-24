@@ -135,6 +135,26 @@ type Config struct {
 	BanBackoffWindowSec     int  `json:"ban_backoff_window_sec"`
 	MaxBanDurationSec       int  `json:"max_ban_duration_sec"`
 
+	// Session tracking + browser-integrity challenge + anomaly scoring.
+	SessionTrackingEnabled    bool   `json:"session_tracking_enabled"`
+	SessionCookieSecret       string `json:"session_cookie_secret"`
+	SessionIdleTTLSec         int    `json:"session_idle_ttl_sec"`
+	SessionMaxSessions        int    `json:"session_max_sessions"`
+	SessionRequestRateCeiling int    `json:"session_request_rate_ceiling"`
+	SessionPathCountCeiling   int    `json:"session_path_count_ceiling"`
+	BrowserChallengeEnabled   bool   `json:"browser_challenge_enabled"`
+	BrowserChallengeBlock     bool   `json:"browser_challenge_block"` // if true, failed challenge blocks; else score-only
+	SessionBlockThreshold     int    `json:"session_block_threshold"` // risk score at/above which to block; 0 = never
+
+	// GraphQL schema-aware validation.
+	GraphQLEnabled       bool   `json:"graphql_enabled"`
+	GraphQLBlockOnError  bool   `json:"graphql_block_on_error"`
+	GraphQLMaxDepth      int    `json:"graphql_max_depth"`
+	GraphQLMaxAliases    int    `json:"graphql_max_aliases"`
+	GraphQLMaxFields     int    `json:"graphql_max_fields"`
+	GraphQLSchemaFile    string `json:"graphql_schema_file"`
+	GraphQLRoleHeader    string `json:"graphql_role_header"`
+
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 	// mu protects runtime mutation of any non-atomic field (admin API POST
 	// /api/config edits, config watcher hot-reloads). Snapshot() takes an
@@ -233,6 +253,22 @@ func Default() *Config {
 		BanBackoffMultiplier: 2,
 		BanBackoffWindowSec:  86400,
 		MaxBanDurationSec:    7 * 24 * 3600,
+
+		SessionTrackingEnabled:    false,
+		SessionIdleTTLSec:         1800,
+		SessionMaxSessions:        200000,
+		SessionRequestRateCeiling: 600,
+		SessionPathCountCeiling:   40,
+		BrowserChallengeEnabled:   false,
+		BrowserChallengeBlock:     false,
+		SessionBlockThreshold:     0, // disabled by default — observe first
+
+		GraphQLEnabled:      false,
+		GraphQLBlockOnError: false,
+		GraphQLMaxDepth:     7,
+		GraphQLMaxAliases:   10,
+		GraphQLMaxFields:    200,
+		GraphQLRoleHeader:   "X-User-Role",
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -395,6 +431,30 @@ func (c *Config) Validate() error {
 	if c.MaxBanDurationSec <= 0 {
 		c.MaxBanDurationSec = 7 * 24 * 3600
 	}
+	if c.SessionIdleTTLSec <= 0 {
+		c.SessionIdleTTLSec = 1800
+	}
+	if c.SessionMaxSessions <= 0 {
+		c.SessionMaxSessions = 200000
+	}
+	if c.SessionRequestRateCeiling <= 0 {
+		c.SessionRequestRateCeiling = 600
+	}
+	if c.SessionPathCountCeiling <= 0 {
+		c.SessionPathCountCeiling = 40
+	}
+	if c.GraphQLMaxDepth <= 0 {
+		c.GraphQLMaxDepth = 7
+	}
+	if c.GraphQLMaxAliases <= 0 {
+		c.GraphQLMaxAliases = 10
+	}
+	if c.GraphQLMaxFields <= 0 {
+		c.GraphQLMaxFields = 200
+	}
+	if c.GraphQLRoleHeader == "" {
+		c.GraphQLRoleHeader = "X-User-Role"
+	}
 	return nil
 }
 
@@ -481,6 +541,24 @@ func (c *Config) Snapshot() *Config {
 		BanBackoffMultiplier: c.BanBackoffMultiplier,
 		BanBackoffWindowSec:  c.BanBackoffWindowSec,
 		MaxBanDurationSec:    c.MaxBanDurationSec,
+
+		SessionTrackingEnabled:    c.SessionTrackingEnabled,
+		SessionCookieSecret:       c.SessionCookieSecret,
+		SessionIdleTTLSec:         c.SessionIdleTTLSec,
+		SessionMaxSessions:        c.SessionMaxSessions,
+		SessionRequestRateCeiling: c.SessionRequestRateCeiling,
+		SessionPathCountCeiling:   c.SessionPathCountCeiling,
+		BrowserChallengeEnabled:   c.BrowserChallengeEnabled,
+		BrowserChallengeBlock:     c.BrowserChallengeBlock,
+		SessionBlockThreshold:     c.SessionBlockThreshold,
+
+		GraphQLEnabled:      c.GraphQLEnabled,
+		GraphQLBlockOnError: c.GraphQLBlockOnError,
+		GraphQLMaxDepth:     c.GraphQLMaxDepth,
+		GraphQLMaxAliases:   c.GraphQLMaxAliases,
+		GraphQLMaxFields:    c.GraphQLMaxFields,
+		GraphQLSchemaFile:   c.GraphQLSchemaFile,
+		GraphQLRoleHeader:   c.GraphQLRoleHeader,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	copy(cp.EgressAllowlist, c.EgressAllowlist)

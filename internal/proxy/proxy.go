@@ -23,7 +23,9 @@ import (
 	"wewaf/internal/core"
 	"wewaf/internal/ddos"
 	"wewaf/internal/engine"
+	"wewaf/internal/graphql"
 	"wewaf/internal/limits"
+	"wewaf/internal/session"
 	"wewaf/internal/shaper"
 	"wewaf/internal/telemetry"
 	"wewaf/internal/zerotrust"
@@ -43,10 +45,30 @@ type WAFProxy struct {
 	breaker   *limits.Breaker
 	zeroTrust *zerotrust.Engine
 	shaper    *shaper.Shaper
+	sessions  *session.Tracker
+	gql       *graphql.Validator
 	// shaperAttack tracks the shaper's "tightened" state so Tighten/Relax
 	// are only invoked at the state-transition edge. Calling them on every
 	// request was an unnecessary mutex acquisition per hit.
 	shaperAttack atomic.Bool
+}
+
+// AttachSessionTracker wires in the session tracker so the proxy can
+// issue cookies and score sessions in real time. Pass nil to disable.
+func (wp *WAFProxy) AttachSessionTracker(t *session.Tracker) {
+	if wp == nil {
+		return
+	}
+	wp.sessions = t
+}
+
+// AttachGraphQLValidator wires in the GraphQL validator used before the
+// request body reaches the rule engine on GraphQL endpoints.
+func (wp *WAFProxy) AttachGraphQLValidator(v *graphql.Validator) {
+	if wp == nil {
+		return
+	}
+	wp.gql = v
 }
 
 // ShaperStats returns the admission controller's counters.
@@ -267,6 +289,18 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Session tracking — issues a cookie on first contact, accumulates
+	// per-session signals for anomaly scoring. Handled very early so
+	// challenge cookies round-trip to every page visitor, but nothing
+	// here ever blocks — scoring + enforcement happens below after we
+	// know the session's current risk.
+	var sessID string
+	if wp.sessions != nil && wp.sessions.Enabled() {
+		if s := wp.sessions.EnsureSession(w, r); s != nil {
+			sessID = s.ID
+		}
+	}
+
 	// Pre-WAF admission control: if the shaper is enabled and the global
 	// token bucket is empty, we early-reject with 429 before spending any
 	// effort on inspection. Under attack the detector tells the shaper to
@@ -478,8 +512,75 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GraphQL schema-aware validation runs *before* the general body
+	// rule engine so that malformed / over-complex queries get a clean
+	// reason code and metrics row rather than a generic XSS/SQLi false
+	// positive on field names. The validator no-ops when disabled.
+	if wp.gql != nil && wp.gql.Enabled() && graphql.IsGraphQLRequest(r) {
+		role := ""
+		if hdr := wp.gql.ConfigSnapshot().RequireRoleHdr; hdr != "" {
+			role = r.Header.Get(hdr)
+		}
+		res := wp.gql.Validate(body, role)
+		if res.Blocked {
+			intr := &core.Interruption{
+				Action:  core.ActionBlock,
+				Status:  http.StatusForbidden,
+				Message: "GraphQL: " + res.Reason,
+			}
+			tx.SetBlocked(core.PhaseRequestBody)
+			tx.AddMatch(core.Match{
+				RuleID:    "GRAPHQL-VALIDATE",
+				RuleName:  "GraphQL validation",
+				Phase:     core.PhaseRequestBody,
+				Target:    "body",
+				Value:     res.Reason,
+				Score:     100,
+				Action:    core.ActionBlock,
+				Message:   res.Reason,
+				Timestamp: time.Now().UTC(),
+			})
+			wp.handleBlock(w, tx, intr)
+			return
+		}
+	}
+
+	// Session risk evaluation — happens right before phase-2 so the rule
+	// engine still runs (score-only by default). When SessionBlockThreshold
+	// is positive and the session is above it, we treat the request as a
+	// soft block now, giving admins a score-based enforcement knob without
+	// changing any rule.
+	if sessID != "" && wp.sessions != nil && wp.sessions.Enabled() {
+		risk := wp.sessions.Score(sessID)
+		if threshold := wp.cfg.SessionBlockThreshold; threshold > 0 && risk >= threshold {
+			intr := &core.Interruption{
+				Action:  core.ActionBlock,
+				Status:  http.StatusForbidden,
+				Message: fmt.Sprintf("Session risk score %d >= threshold %d", risk, threshold),
+			}
+			tx.SetBlocked(core.PhaseRequestBody)
+			tx.AddMatch(core.Match{
+				RuleID:    "SESSION-RISK",
+				RuleName:  "Session anomaly score",
+				Phase:     core.PhaseRequestBody,
+				Target:    "session",
+				Value:     sessID,
+				Score:     risk,
+				Action:    core.ActionBlock,
+				Message:   intr.Message,
+				Timestamp: time.Now().UTC(),
+			})
+			wp.sessions.RecordBlock(sessID)
+			wp.handleBlock(w, tx, intr)
+			return
+		}
+	}
+
 	// Phase 2: Request Body.
 	if intr := wp.eng.ProcessRequestBody(tx); intr != nil {
+		if sessID != "" && wp.sessions != nil {
+			wp.sessions.RecordBlock(sessID)
+		}
 		wp.handleBlock(w, tx, intr)
 		return
 	}

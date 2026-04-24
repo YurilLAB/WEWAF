@@ -20,11 +20,13 @@ import (
 	"wewaf/internal/connection"
 	"wewaf/internal/core"
 	"wewaf/internal/engine"
+	"wewaf/internal/graphql"
 	"wewaf/internal/history"
 	"wewaf/internal/host"
 	"wewaf/internal/limits"
 	"wewaf/internal/proxy"
 	"wewaf/internal/rules"
+	"wewaf/internal/session"
 	"wewaf/internal/ssl"
 	"wewaf/internal/telemetry"
 	"wewaf/internal/watchdog"
@@ -115,10 +117,47 @@ func main() {
 	bf := bruteforce.NewDetector(time.Duration(cfg.BruteForceWindowSec) * time.Second)
 	defer bf.Stop()
 
+	// Session tracker — foundation for anomaly scoring and browser challenge.
+	sessionTracker := session.NewTracker(session.Config{
+		Secret:             cfg.SessionCookieSecret,
+		MaxSessions:        cfg.SessionMaxSessions,
+		IdleTTL:            time.Duration(cfg.SessionIdleTTLSec) * time.Second,
+		Enabled:            cfg.SessionTrackingEnabled,
+		RequestRateCeiling: cfg.SessionRequestRateCeiling,
+		PathCountCeiling:   cfg.SessionPathCountCeiling,
+	})
+	defer sessionTracker.Stop()
+
+	// GraphQL schema-aware validator. If the operator supplied a schema
+	// file and it fails to parse, we log and keep structural-only mode —
+	// better than refusing to start.
+	var gqlSchemaSDL string
+	if cfg.GraphQLSchemaFile != "" {
+		if data, rerr := os.ReadFile(cfg.GraphQLSchemaFile); rerr != nil {
+			log.Printf("graphql: could not read schema file %q: %v", cfg.GraphQLSchemaFile, rerr)
+		} else {
+			gqlSchemaSDL = string(data)
+		}
+	}
+	gqlValidator, gqlErr := graphql.New(graphql.Config{
+		Enabled:        cfg.GraphQLEnabled,
+		MaxDepth:       cfg.GraphQLMaxDepth,
+		MaxAliases:     cfg.GraphQLMaxAliases,
+		MaxFields:      cfg.GraphQLMaxFields,
+		SchemaSDL:      gqlSchemaSDL,
+		RequireRoleHdr: cfg.GraphQLRoleHeader,
+		BlockOnError:   cfg.GraphQLBlockOnError,
+	})
+	if gqlErr != nil {
+		log.Printf("graphql: schema parse failed, running structural-only: %v", gqlErr)
+	}
+
 	wp, err := proxy.NewWAFProxy(cfg, eng, metrics, bf)
 	if err != nil {
 		log.Fatalf("failed to create proxy: %v", err)
 	}
+	wp.AttachSessionTracker(sessionTracker)
+	wp.AttachGraphQLValidator(gqlValidator)
 
 	// Background telemetry collectors.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
@@ -218,18 +257,20 @@ func main() {
 	}
 
 	admin := web.NewServer(web.Deps{
-		Config:      cfg,
-		Metrics:     metrics,
-		RulesFn:     rulesFn,
-		BanList:     banList,
-		Host:        hostCollector,
-		Connection:  connMgr,
-		SSL:         sslMgr,
-		History:     historyStore,
-		Proxy:       wp,
-		MeshEnabled: cfg.MeshEnabled,
-		MeshPeers:   cfg.MeshPeers,
-		MeshAPIKey:  cfg.MeshAPIKey,
+		Config:         cfg,
+		Metrics:        metrics,
+		RulesFn:        rulesFn,
+		BanList:        banList,
+		Host:           hostCollector,
+		Connection:     connMgr,
+		SSL:            sslMgr,
+		History:        historyStore,
+		Proxy:          wp,
+		SessionTracker: sessionTracker,
+		GraphQL:        gqlValidator,
+		MeshEnabled:    cfg.MeshEnabled,
+		MeshPeers:      cfg.MeshPeers,
+		MeshAPIKey:     cfg.MeshAPIKey,
 	})
 
 	// Watchdog — rotates through lightweight checks on the critical paths

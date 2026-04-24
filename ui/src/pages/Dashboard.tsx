@@ -32,6 +32,8 @@ import ZeroTrustPage from '../components/pages/ZeroTrustPage';
 import SSLTLSPage from '../components/pages/SSLTLSPage';
 import ConnectionManagementPage from '../components/pages/ConnectionManagementPage';
 import SettingsPage from '../components/pages/SettingsPage';
+import SessionsPage from '../components/pages/SessionsPage';
+import GraphQLPage from '../components/pages/GraphQLPage';
 import { useWAFSync } from '../store/useWAFSync';
 
 export default function Dashboard() {
@@ -86,6 +88,8 @@ export default function Dashboard() {
       'tls-versions': wrap('TLS Versions', <SSLTLSPage initialTab="tls-versions" />),
       'connection-status': wrap('Connection Status', <ConnectionManagementPage />),
       'api-config': wrap('API Configuration', <ConnectionManagementPage />),
+      sessions: wrap('Sessions & Integrity', <SessionsPage />),
+      graphql: wrap('GraphQL Guard', <GraphQLPage />),
       settings: wrap('Settings', <SettingsPage />),
     };
 

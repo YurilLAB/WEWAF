@@ -4,6 +4,7 @@ import {
   Search, LayoutDashboard, Globe, Server, BarChart3, Shield, Lock,
   ChevronDown, Zap, Network, Eye, Fingerprint, FileText, Timer,
   UserX, Settings, Activity, Logs, X, Link2, Cpu, Monitor, Target,
+  Users, Database,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -53,6 +54,8 @@ const navItems: NavItem[] = [
       { id: 'ip-reputation', label: 'IP Reputation', icon: UserX },
       { id: 'ip-intelligence', label: 'IP Intelligence', icon: Target },
       { id: 'bot-management', label: 'Bot Management', icon: UserX },
+      { id: 'sessions', label: 'Sessions & Integrity', icon: Users },
+      { id: 'graphql', label: 'GraphQL Guard', icon: Database },
     ],
   },
   {

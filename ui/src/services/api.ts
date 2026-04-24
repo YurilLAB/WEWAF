@@ -449,6 +449,51 @@ export interface BotEvent {
   score: number;
 }
 
+export interface SessionView {
+  id: string;
+  first_seen: string;
+  last_seen: string;
+  request_count: number;
+  block_count: number;
+  paths: string[];
+  user_agents: string[];
+  ips: string[];
+  mouse_events: number;
+  key_events: number;
+  time_on_page_ms: number;
+  beacon_count: number;
+  challenge_passed: boolean;
+  risk_score: number;
+}
+
+export interface GraphQLStatsResponse {
+  enabled: boolean;
+  max_depth?: number;
+  max_aliases?: number;
+  max_fields?: number;
+  block?: boolean;
+  role_header?: string;
+  stats?: {
+    requests: number;
+    blocked: number;
+    depth_fails: number;
+    alias_fails: number;
+    field_fails: number;
+    auth_fails: number;
+    parse_fails: number;
+  };
+}
+
+export interface GraphQLSample {
+  timestamp: string;
+  operation: string;
+  depth: number;
+  aliases: number;
+  fields: number;
+  blocked: boolean;
+  reason?: string;
+}
+
 export interface BotsDetectedResponse {
   bots: BotEvent[];
   count: number;
@@ -494,9 +539,29 @@ export const api = {
     block_threshold?: number;
     rate_limit_rps?: number;
     rate_limit_burst?: number;
+    session_tracking_enabled?: boolean;
+    browser_challenge_enabled?: boolean;
+    browser_challenge_block?: boolean;
+    session_block_threshold?: number;
+    session_request_rate_ceiling?: number;
+    session_path_count_ceiling?: number;
+    graphql_enabled?: boolean;
+    graphql_block_on_error?: boolean;
+    graphql_max_depth?: number;
+    graphql_max_aliases?: number;
+    graphql_max_fields?: number;
+    graphql_role_header?: string;
   }) =>
     post<ConfigResponse & { status: string }>('/config', payload),
   getRuleCounters: () => get<{ counters: Record<string, number> }>('/rules/counters'),
+
+  // Sessions + browser integrity.
+  getSessions: (limit = 200) => get<{ sessions: SessionView[]; enabled: boolean; count: number }>(`/sessions?limit=${limit}`),
+  getSession: (id: string) => get<SessionView>(`/sessions/${encodeURIComponent(id)}`),
+
+  // GraphQL Guard.
+  getGraphQLStats: () => get<GraphQLStatsResponse>('/graphql/stats'),
+  getGraphQLRecent: () => get<{ recent: GraphQLSample[] }>('/graphql/recent'),
   getBlocks: () => get<BlocksResponse>('/blocks'),
   getTraffic: () => get<TrafficPoint[]>('/traffic'),
   getRules: () => get<RulesResponse>('/rules'),
