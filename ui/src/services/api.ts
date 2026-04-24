@@ -56,10 +56,13 @@ export interface MetricsResponse {
   passed_requests: number;
   total_bytes_in: number;
   total_bytes_out: number;
+  bytes_in_per_sec?: number;
+  bytes_out_per_sec?: number;
   errors: number;
   unique_ips: number;
   recent_blocks: BlockRecord[];
   traffic_history: TrafficPoint[];
+  status_code_buckets?: Record<string, number>;
   egress_blocked?: number;
   egress_allowed?: number;
   bots_detected?: number;
@@ -255,9 +258,56 @@ export interface EgressStatusResponse {
   enabled: boolean;
   addr: string;
   block_private_ips: boolean;
+  allowlist: string[];
   allowlist_count: number;
   total_blocked: number;
   total_allowed: number;
+  recent?: EgressEvent[];
+}
+
+export interface EgressEvent {
+  timestamp: string;
+  target_url: string;
+  reason?: string;
+  allowed: boolean;
+}
+
+export interface NetworkSummaryResponse {
+  total_requests?: number;
+  blocked_requests?: number;
+  passed_requests?: number;
+  total_bytes_in?: number;
+  total_bytes_out?: number;
+  bytes_in_per_sec?: number;
+  bytes_out_per_sec?: number;
+  egress_blocked?: number;
+  egress_allowed?: number;
+  status_code_buckets?: Record<string, number>;
+  recent_egress?: EgressEvent[];
+  host_network_io?: {
+    bytes_sent: number;
+    bytes_recv: number;
+    packets_sent: number;
+    packets_recv: number;
+  };
+  host_bandwidth_in_bps?: number;
+  host_bandwidth_out_bps?: number;
+  backend_connected?: boolean;
+  backend_latency_ms?: number;
+  timestamp: string;
+}
+
+export interface TopPathEntry {
+  path: string;
+  count: number;
+}
+
+export interface IPActivityEntry {
+  ip: string;
+  first_seen: string;
+  last_seen: string;
+  request_count: number;
+  block_count: number;
 }
 
 export interface MeshPeersResponse {
@@ -266,14 +316,17 @@ export interface MeshPeersResponse {
   status: string;
 }
 
+export interface BotEvent {
+  timestamp: string;
+  ip: string;
+  user_agent: string;
+  bot_name: string;
+  score: number;
+}
+
 export interface BotsDetectedResponse {
-  bots: Array<{
-    timestamp: string;
-    ip: string;
-    user_agent: string;
-    bot_name: string;
-    score: number;
-  }>;
+  bots: BotEvent[];
+  count: number;
 }
 
 // =====================
@@ -336,7 +389,14 @@ export const api = {
   getEgressConfig: () => get<EgressConfigResponse>('/config'),
   getMeshStatus: () => get<MeshStatusResponse>('/mesh/status'),
   getEgressStatus: () => get<EgressStatusResponse>('/egress/status'),
+  getEgressRecent: (limit = 100) => get<{ events: EgressEvent[] }>(`/egress/recent?limit=${limit}`),
   getMeshPeers: () => get<MeshPeersResponse>('/mesh/peers'),
+
+  // Network Monitoring
+  getNetworkSummary: () => get<NetworkSummaryResponse>('/network/summary'),
+  getTopPaths: (limit = 25) => get<{ paths: TopPathEntry[]; from: string; to: string }>(`/network/top-paths?limit=${limit}`),
+  getTopIPs: (limit = 50) => get<{ ips: IPActivityEntry[]; from: string; to: string }>(`/network/top-ips?limit=${limit}`),
+  getBots: (limit = 100) => get<BotsDetectedResponse>(`/bots/detected?limit=${limit}`),
   syncMeshPeer: (peerUrl: string, apiKey: string) =>
     fetch(`${peerUrl}/api/mesh/sync`, {
       method: 'POST',

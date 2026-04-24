@@ -14,7 +14,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -179,8 +178,18 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Phase 1: Request Headers.
-	if intr := wp.eng.ProcessRequestHeaders(tx); intr != nil {
-		wp.handleBlock(w, tx, intr)
+	intrHeaders := wp.eng.ProcessRequestHeaders(tx)
+	// Record any bot-fingerprint matches so /api/bots/detected reflects live
+	// state. We do this whether or not the request is ultimately blocked
+	// because detection happens at this phase.
+	for _, m := range tx.MatchesSnapshot() {
+		if strings.HasPrefix(m.RuleID, "BOT-") || strings.HasPrefix(m.RuleID, "SCAN-") {
+			wp.metrics.RecordBotEvent(tx.ClientIP, r.UserAgent(), m.Value, m.Score)
+			break // one bot event per transaction is enough
+		}
+	}
+	if intrHeaders != nil {
+		wp.handleBlock(w, tx, intrHeaders)
 		return
 	}
 
@@ -482,7 +491,7 @@ func isLoginRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	path := strings.ToLower(r.URL.Path)
+	path := strings.ToLower(strings.TrimRight(r.URL.Path, "/"))
 	loginPaths := []string{
 		"/login", "/auth", "/signin", "/wp-login.php", "/admin/login",
 		"/api/login", "/api/auth", "/oauth/token", "/v1/login",
@@ -561,17 +570,10 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check allowlist.
+	// Check allowlist — exact host match or dot-bounded subdomain match so
+	// "google.com" does NOT allow "googlecompromise.evil.com".
 	if len(ep.cfg.EgressAllowlist) > 0 {
-		allowed := false
-		hostLower := strings.ToLower(parsed.Host)
-		for _, a := range ep.cfg.EgressAllowlist {
-			if strings.Contains(hostLower, strings.ToLower(a)) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
+		if !allowlistMatch(parsed.Hostname(), ep.cfg.EgressAllowlist) {
 			ep.recordEgressBlock(targetURL, "destination not in egress allowlist")
 			ep.eng.LogError("egress: blocked request to %s: destination not in egress allowlist", targetURL)
 			http.Error(w, "Forbidden: destination not in egress allowlist", http.StatusForbidden)
@@ -579,19 +581,20 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Block private IPs.
+	// Block private IPs. Resolves the hostname so an attacker-controlled DNS
+	// record that points to 127.0.0.1 / 169.254.169.254 is caught too.
 	if ep.cfg.EgressBlockPrivateIPs {
-		if isPrivateHost(parsed.Hostname()) {
-			ep.recordEgressBlock(targetURL, "private IP destination blocked")
-			ep.eng.LogError("egress: blocked request to %s: private IP destination blocked", targetURL)
-			http.Error(w, "Forbidden: private IP destination blocked", http.StatusForbidden)
+		if reason := resolvedDangerReason(parsed.Hostname()); reason != "" {
+			ep.recordEgressBlock(targetURL, reason)
+			ep.eng.LogError("egress: blocked request to %s: %s", targetURL, reason)
+			http.Error(w, "Forbidden: "+reason, http.StatusForbidden)
 			return
 		}
 	}
 
 	// CONNECT tunnel support for HTTPS egress.
 	if r.Method == http.MethodConnect {
-		ep.recordEgressAllow()
+		ep.recordEgressAllow(targetURL)
 		ep.handleConnect(w, r)
 		return
 	}
@@ -632,13 +635,17 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if intr := ep.eng.EvaluateEgress(tx, targets); intr != nil {
-		ep.recordEgressBlock(targetURL, "egress policy violation")
-		ep.eng.LogError("egress: blocked request to %s: egress policy violation", targetURL)
+		reason := "egress policy violation"
+		if len(intr.Matches) > 0 && intr.Matches[0].RuleID != "" {
+			reason = "egress rule: " + intr.Matches[0].RuleID
+		}
+		ep.recordEgressBlock(targetURL, reason)
+		ep.eng.LogError("egress: blocked request to %s: %s", targetURL, reason)
 		http.Error(w, "Forbidden: egress policy violation", http.StatusForbidden)
 		return
 	}
 
-	ep.recordEgressAllow()
+	ep.recordEgressAllow(targetURL)
 
 	// Forward the request.
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(body))
@@ -701,19 +708,30 @@ func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	// Bidirectional pipe. When either direction ends, close both sides so
+	// the other goroutine can unblock instead of leaking for io.Copy's
+	// lifetime (which was previously unbounded).
+	done := make(chan struct{}, 2)
+	pipe := func(dst, src net.Conn) {
+		defer func() {
+			_ = recover()
+			done <- struct{}{}
+		}()
+		_, _ = io.Copy(dst, src)
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+	}
+	go pipe(destConn, clientConn)
+	go pipe(clientConn, destConn)
 
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(destConn, clientConn)
-	}()
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(clientConn, destConn)
-	}()
-
-	wg.Wait()
+	// Wait for the first copy to finish, then force-close both sides so the
+	// other goroutine unblocks. Previously an idle peer could keep the other
+	// direction parked indefinitely.
+	<-done
+	_ = destConn.Close()
+	_ = clientConn.Close()
+	<-done
 }
 
 func (ep *EgressProxy) recordEgressBlock(targetURL, reason string) {
@@ -722,18 +740,115 @@ func (ep *EgressProxy) recordEgressBlock(targetURL, reason string) {
 	}
 }
 
-func (ep *EgressProxy) recordEgressAllow() {
+func (ep *EgressProxy) recordEgressAllow(targetURL string) {
 	if ep.metrics != nil {
-		ep.metrics.RecordEgressAllow()
+		ep.metrics.RecordEgressAllow(targetURL)
 	}
 }
 
-func isPrivateHost(host string) bool {
+// allowlistMatch returns true if host equals an allowlist entry exactly or is
+// a subdomain of an entry (dot-bounded). Patterns prefixed with "*." are
+// treated as wildcard subdomain entries ("*.example.com" matches
+// "api.example.com" but not "example.com"). The previous implementation used
+// strings.Contains which let "google.com" permit "googlecompromise.evil.com".
+func allowlistMatch(host string, allowlist []string) bool {
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	for _, raw := range allowlist {
+		entry := strings.ToLower(strings.TrimSpace(raw))
+		if entry == "" {
+			continue
+		}
+		if strings.HasPrefix(entry, "*.") {
+			suffix := entry[2:]
+			if strings.HasSuffix(host, "."+suffix) {
+				return true
+			}
+			continue
+		}
+		if host == entry {
+			return true
+		}
+		if strings.HasSuffix(host, "."+entry) {
+			return true
+		}
+	}
+	return false
+}
+
+// metadataIPs is the set of cloud-provider metadata endpoints we never want
+// outbound requests to reach. These are blocked even if the hostname resolves
+// indirectly (DNS rebinding or user-controlled CNAMEs).
+var metadataIPs = map[string]struct{}{
+	"169.254.169.254": {}, // AWS, GCP, Azure, OpenStack, DO
+	"100.100.100.200": {}, // Alibaba Cloud
+	"fd00:ec2::254":   {}, // AWS IMDSv2 over IPv6
+}
+
+// resolvedDangerReason returns a non-empty reason string if host either is or
+// resolves to a private / loopback / link-local / cloud-metadata address.
+// Returning an empty string means the host is safe to contact.
+func resolvedDangerReason(host string) string {
 	host = strings.Trim(host, "[]")
-	ip := net.ParseIP(host)
-	if ip != nil {
-		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	if host == "" {
+		return "empty destination host"
 	}
 	lower := strings.ToLower(host)
-	return lower == "localhost" || strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal")
+	if lower == "localhost" || strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal") {
+		return "internal hostname blocked"
+	}
+	// Literal IP — direct classification.
+	if ip := net.ParseIP(host); ip != nil {
+		if reason := classifyIP(ip); reason != "" {
+			return reason
+		}
+		return ""
+	}
+	// Hostname — resolve and check every answer. A short timeout keeps the
+	// hot path snappy; resolution failures fail closed.
+	resolver := net.Resolver{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := resolver.LookupIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return "dns resolution failed"
+	}
+	for _, ip := range ips {
+		if reason := classifyIP(ip); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+func classifyIP(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	if _, ok := metadataIPs[ip.String()]; ok {
+		return "cloud metadata endpoint blocked"
+	}
+	if ip.IsLoopback() {
+		return "loopback IP destination blocked"
+	}
+	if ip.IsPrivate() {
+		return "private IP destination blocked"
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return "link-local IP destination blocked"
+	}
+	if ip.IsUnspecified() {
+		return "unspecified IP destination blocked"
+	}
+	if ip.IsMulticast() {
+		return "multicast IP destination blocked"
+	}
+	return ""
+}
+
+// isPrivateHost is retained for legacy callers. Prefer resolvedDangerReason.
+func isPrivateHost(host string) bool {
+	return resolvedDangerReason(host) != ""
 }

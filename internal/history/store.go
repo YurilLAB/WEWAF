@@ -58,6 +58,8 @@ type TrafficPoint struct {
 	Timestamp time.Time `json:"timestamp"`
 	Requests  int       `json:"requests"`
 	Blocked   int       `json:"blocked"`
+	BytesIn   uint64    `json:"bytes_in"`
+	BytesOut  uint64    `json:"bytes_out"`
 }
 
 // DatabaseInfo describes one on-disk history DB.
@@ -371,8 +373,8 @@ func (s *Store) writeBatch(batch []event) error {
 		case kindTrafficPoint:
 			p := ev.point
 			_, err = tx.Exec(
-				`INSERT INTO traffic_points (ts, requests, blocked) VALUES (?, ?, ?)`,
-				p.Timestamp.UTC().Format(time.RFC3339Nano), p.Requests, p.Blocked,
+				`INSERT INTO traffic_points (ts, requests, blocked, bytes_in, bytes_out) VALUES (?, ?, ?, ?, ?)`,
+				p.Timestamp.UTC().Format(time.RFC3339Nano), p.Requests, p.Blocked, int64(p.BytesIn), int64(p.BytesOut),
 			)
 			points++
 		}
@@ -688,7 +690,8 @@ func queryTrafficFromFile(path string, from, to time.Time, limit int) ([]Traffic
 	}
 	defer db.Close()
 	rows, err := db.Query(
-		`SELECT ts, requests, blocked FROM traffic_points WHERE ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?`,
+		`SELECT ts, requests, blocked, COALESCE(bytes_in, 0), COALESCE(bytes_out, 0)
+		 FROM traffic_points WHERE ts >= ? AND ts <= ? ORDER BY ts DESC LIMIT ?`,
 		from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano), limit,
 	)
 	if err != nil {
@@ -699,11 +702,18 @@ func queryTrafficFromFile(path string, from, to time.Time, limit int) ([]Traffic
 	for rows.Next() {
 		var p TrafficPoint
 		var ts string
-		if err := rows.Scan(&ts, &p.Requests, &p.Blocked); err != nil {
+		var bytesIn, bytesOut int64
+		if err := rows.Scan(&ts, &p.Requests, &p.Blocked, &bytesIn, &bytesOut); err != nil {
 			continue
 		}
 		if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
 			p.Timestamp = t
+		}
+		if bytesIn > 0 {
+			p.BytesIn = uint64(bytesIn)
+		}
+		if bytesOut > 0 {
+			p.BytesOut = uint64(bytesOut)
 		}
 		out = append(out, p)
 	}
@@ -758,10 +768,20 @@ CREATE TABLE IF NOT EXISTS traffic_points (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	ts TEXT NOT NULL,
 	requests INTEGER NOT NULL,
-	blocked INTEGER NOT NULL
+	blocked INTEGER NOT NULL,
+	bytes_in INTEGER NOT NULL DEFAULT 0,
+	bytes_out INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_ts ON traffic_points(ts);
 `
+
+// migrations adds columns introduced after the initial schema so long-lived
+// history files pick up the newer shape on reopen. Errors from duplicate
+// columns are ignored by design.
+var migrations = []string{
+	`ALTER TABLE traffic_points ADD COLUMN bytes_in INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE traffic_points ADD COLUMN bytes_out INTEGER NOT NULL DEFAULT 0`,
+}
 
 func openDB(path string) (*sql.DB, error) {
 	db, err := sql.Open(driverName, "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)")
@@ -783,8 +803,15 @@ func openReadOnly(path string) (*sql.DB, error) {
 }
 
 func applySchema(db *sql.DB) error {
-	_, err := db.Exec(schema)
-	return err
+	if _, err := db.Exec(schema); err != nil {
+		return err
+	}
+	// Best-effort migrations. Duplicate-column errors are expected when the
+	// DB already has the newest shape and are ignored.
+	for _, stmt := range migrations {
+		_, _ = db.Exec(stmt)
+	}
+	return nil
 }
 
 // describeDB opens a DB read-only and extracts its metadata + counts.

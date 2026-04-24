@@ -2,9 +2,14 @@
 *.dll
 *.so
 *.dylib
-waf
-waf.exe
+/waf
+/waf.exe
 .DS_Store
 .idea/
 .vscode/
+
+# Runtime artefacts — rotating history DBs and local log file.
+/history/
+*.log
+*.bak
 

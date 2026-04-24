@@ -337,8 +337,10 @@ func main() {
 }
 
 // startTrafficSampler periodically snapshots request counters for the dashboard graph.
+// Ticks every 10s so the bandwidth rate refreshes quickly enough for a live
+// view, while keeping persisted traffic_points bounded.
 func startTrafficSampler(m *telemetry.Metrics) func() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 	stop := make(chan struct{})
 	var lastReq, lastBlocked uint64
 	go func() {

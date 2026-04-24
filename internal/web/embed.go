@@ -126,9 +126,15 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Egress proxy
 	api.HandleFunc("/api/egress/status", s.handleEgressStatus)
+	api.HandleFunc("/api/egress/recent", s.handleEgressRecent)
 
 	// Bot detections
 	api.HandleFunc("/api/bots/detected", s.handleBotsDetected)
+
+	// Network monitoring — live bandwidth, byte totals, status distribution.
+	api.HandleFunc("/api/network/summary", s.handleNetworkSummary)
+	api.HandleFunc("/api/network/top-paths", s.handleNetworkTopPaths)
+	api.HandleFunc("/api/network/top-ips", s.handleNetworkTopIPs)
 
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
@@ -316,7 +322,7 @@ func (s *Server) handleBlocks(w http.ResponseWriter, r *http.Request) {
 	if s.banList != nil {
 		for _, ban := range s.banList.List() {
 			recent = append(recent, telemetry.BlockRecord{
-				Timestamp: time.Now().UTC(),
+				Timestamp: ban.Timestamp,
 				IP:        ban.IP,
 				Method:    "-",
 				Path:      "-",
@@ -808,13 +814,23 @@ func (s *Server) handleEgressStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	var blocked, allowed uint64
+	var recent []telemetry.EgressEvent
+	if s.metrics != nil {
+		counters := s.metrics.CountersSnapshot()
+		blocked = counters["egress_blocked"]
+		allowed = counters["egress_allowed"]
+		recent = s.metrics.RecentEgressSnapshot(50)
+	}
 	writeJSON(w, map[string]interface{}{
 		"enabled":           s.cfg.EgressEnabled,
 		"addr":              s.cfg.EgressAddr,
 		"block_private_ips": s.cfg.EgressBlockPrivateIPs,
+		"allowlist":         s.cfg.EgressAllowlist,
 		"allowlist_count":   len(s.cfg.EgressAllowlist),
-		"total_blocked":     0,
-		"total_allowed":     0,
+		"total_blocked":     blocked,
+		"total_allowed":     allowed,
+		"recent":            recent,
 	})
 }
 
@@ -835,9 +851,132 @@ func (s *Server) handleBotsDetected(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if s.metrics == nil {
+		writeJSON(w, map[string]interface{}{"bots": []telemetry.BotEvent{}, "count": 0})
+		return
+	}
+	limit := clampInt(parseInt(r.URL.Query().Get("limit"), 100), 1, 500)
+	bots := s.metrics.RecentBotsSnapshot(limit)
 	writeJSON(w, map[string]interface{}{
-		"bots": []interface{}{},
+		"bots":  bots,
+		"count": len(bots),
 	})
+}
+
+// handleEgressRecent returns the recent egress decision ring buffer.
+func (s *Server) handleEgressRecent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, map[string]interface{}{"events": []telemetry.EgressEvent{}})
+		return
+	}
+	limit := clampInt(parseInt(r.URL.Query().Get("limit"), 100), 1, 500)
+	writeJSON(w, map[string]interface{}{
+		"events": s.metrics.RecentEgressSnapshot(limit),
+	})
+}
+
+// handleNetworkSummary returns a compact network-health payload: byte totals,
+// current bandwidth rates, host-level NIC snapshot, and status distribution.
+func (s *Server) handleNetworkSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	out := map[string]interface{}{}
+	if s.metrics != nil {
+		snap := s.metrics.Snapshot()
+		for _, k := range []string{
+			"total_requests", "blocked_requests", "passed_requests",
+			"total_bytes_in", "total_bytes_out",
+			"bytes_in_per_sec", "bytes_out_per_sec",
+			"egress_blocked", "egress_allowed",
+			"status_code_buckets",
+		} {
+			if v, ok := snap[k]; ok {
+				out[k] = v
+			}
+		}
+		out["recent_egress"] = s.metrics.RecentEgressSnapshot(25)
+	}
+	if s.host != nil {
+		res := s.host.ResourcesSnapshot()
+		out["host_network_io"] = res.NetworkIO
+		out["host_bandwidth_in_bps"] = res.BandwidthInBps
+		out["host_bandwidth_out_bps"] = res.BandwidthOutBps
+	}
+	if s.connection != nil {
+		status := s.connection.StatusSnapshot()
+		out["backend_connected"] = status.Connected
+		out["backend_latency_ms"] = status.LastPingMs
+	}
+	out["timestamp"] = time.Now().UTC()
+	writeJSON(w, out)
+}
+
+// handleNetworkTopPaths returns the most frequently blocked paths from the
+// persisted history in the given time window.
+func (s *Server) handleNetworkTopPaths(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.history == nil {
+		writeJSON(w, map[string]interface{}{"paths": []map[string]interface{}{}})
+		return
+	}
+	from, to, _ := parseTimeRange(r, 2000)
+	events, err := s.history.QueryBlocks(from, to, 5000)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	counts := make(map[string]int, 64)
+	for _, e := range events {
+		counts[e.Method+" "+e.Path]++
+	}
+	type pathCount struct {
+		Path  string `json:"path"`
+		Count int    `json:"count"`
+	}
+	out := make([]pathCount, 0, len(counts))
+	for k, v := range counts {
+		out = append(out, pathCount{Path: k, Count: v})
+	}
+	// Simple in-place sort: largest count first. Using a handwritten compare
+	// avoids importing sort on a file that already has enough imports.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].Count > out[j-1].Count; j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	limit := clampInt(parseInt(r.URL.Query().Get("limit"), 25), 1, 200)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	writeJSON(w, map[string]interface{}{"paths": out, "from": from, "to": to})
+}
+
+// handleNetworkTopIPs wraps QueryIPs for the Network Monitoring page.
+func (s *Server) handleNetworkTopIPs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.history == nil {
+		writeJSON(w, map[string]interface{}{"ips": []history.IPActivity{}})
+		return
+	}
+	from, to, limit := parseTimeRange(r, 50)
+	ips, err := s.history.QueryIPs(from, to, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]interface{}{"ips": ips, "from": from, "to": to})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
