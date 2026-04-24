@@ -1,11 +1,27 @@
 // Package connection tracks the WAF's connectivity to its upstream backend.
+//
+// The Manager probes the backend on a fixed interval, stores the last status,
+// and maintains two ring buffers:
+//
+//   - Ping history: every probe's latency, so the UI can render a sparkline.
+//   - Event history: state transitions (online↔offline), so the UI can show a
+//     session timeline without synthesising it client-side.
+//
+// Probes are guarded so only one runs at a time — a slow backend can't pile
+// up an unbounded queue of in-flight requests.
 package connection
 
 import (
 	"context"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+const (
+	pingHistoryCap  = 100
+	eventHistoryCap = 100
 )
 
 // Status is returned by /api/connection/status.
@@ -15,6 +31,8 @@ type Status struct {
 	LastConnectedAt  time.Time `json:"last_connected_at"`
 	ConnectionMethod string    `json:"connection_method"`
 	FailoverActive   bool      `json:"failover_active"`
+	TotalProbes      uint64    `json:"total_probes"`
+	FailedProbes     uint64    `json:"failed_probes"`
 }
 
 // Config is returned/accepted by /api/connection/config.
@@ -27,14 +45,33 @@ type Config struct {
 	TimeoutMs       int    `json:"timeout_ms"`
 }
 
+// PingSample is a single latency observation.
+type PingSample struct {
+	Timestamp time.Time `json:"timestamp"`
+	PingMs    int64     `json:"ping_ms"`
+	OK        bool      `json:"ok"`
+}
+
+// Event records a connection state transition.
+type Event struct {
+	Timestamp time.Time `json:"timestamp"`
+	State     string    `json:"state"` // "online" | "offline"
+	PingMs    int64     `json:"ping_ms"`
+}
+
 // Manager probes the backend and exposes live connection status.
 type Manager struct {
-	mu       sync.RWMutex
-	cfg      Config
-	status   Status
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	client   *http.Client
+	mu           sync.RWMutex
+	cfg          Config
+	status       Status
+	pingHistory  []PingSample
+	events       []Event
+	stopOnce     sync.Once
+	stopCh       chan struct{}
+	client       *http.Client
+	probing      atomic.Bool // true while a probe is in flight
+	totalProbes  atomic.Uint64
+	failedProbes atomic.Uint64
 }
 
 // NewManager constructs a manager seeded with initial config.
@@ -49,9 +86,11 @@ func NewManager(initial Config) *Manager {
 		initial.RetryAttempts = 3
 	}
 	m := &Manager{
-		cfg:    initial,
-		stopCh: make(chan struct{}),
-		status: Status{ConnectionMethod: "http"},
+		cfg:         initial,
+		stopCh:      make(chan struct{}),
+		status:      Status{ConnectionMethod: "http"},
+		pingHistory: make([]PingSample, 0, pingHistoryCap),
+		events:      make([]Event, 0, eventHistoryCap),
 	}
 	m.rebuildClient()
 	return m
@@ -94,15 +133,30 @@ func (m *Manager) loop(ctx context.Context) {
 }
 
 // Probe sends a single health request to the backend and updates status.
+// Concurrent calls are coalesced: only one probe runs at a time — additional
+// callers get the last known status without triggering a new request.
 func (m *Manager) Probe(ctx context.Context) Status {
+	if !m.probing.CompareAndSwap(false, true) {
+		return m.StatusSnapshot()
+	}
+	defer m.probing.Store(false)
+
 	m.mu.RLock()
 	backend := m.cfg.BackendURL
+	timeout := time.Duration(m.cfg.TimeoutMs) * time.Millisecond
+	prevConnected := m.status.Connected
 	m.mu.RUnlock()
+
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	started := time.Now()
 	ok := false
 	if backend != "" {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, backend, nil)
+		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, backend, nil)
 		if err == nil {
 			resp, err := m.client.Do(req)
 			if err == nil {
@@ -114,12 +168,46 @@ func (m *Manager) Probe(ctx context.Context) Status {
 	}
 	ping := time.Since(started).Milliseconds()
 
+	m.totalProbes.Add(1)
+	if !ok {
+		m.failedProbes.Add(1)
+	}
+
+	now := time.Now().UTC()
 	m.mu.Lock()
 	m.status.Connected = ok
 	m.status.LastPingMs = ping
+	m.status.TotalProbes = m.totalProbes.Load()
+	m.status.FailedProbes = m.failedProbes.Load()
 	if ok {
-		m.status.LastConnectedAt = time.Now().UTC()
+		m.status.LastConnectedAt = now
 	}
+
+	// Record ping history.
+	sample := PingSample{Timestamp: now, PingMs: ping, OK: ok}
+	m.pingHistory = append(m.pingHistory, sample)
+	if len(m.pingHistory) > pingHistoryCap {
+		over := len(m.pingHistory) - pingHistoryCap
+		copy(m.pingHistory, m.pingHistory[over:])
+		m.pingHistory = m.pingHistory[:pingHistoryCap]
+	}
+
+	// Record transition events only when state changes.
+	if ok != prevConnected {
+		ev := Event{Timestamp: now, PingMs: ping}
+		if ok {
+			ev.State = "online"
+		} else {
+			ev.State = "offline"
+		}
+		m.events = append(m.events, ev)
+		if len(m.events) > eventHistoryCap {
+			over := len(m.events) - eventHistoryCap
+			copy(m.events, m.events[over:])
+			m.events = m.events[:eventHistoryCap]
+		}
+	}
+
 	snap := m.status
 	m.mu.Unlock()
 	return snap
@@ -129,7 +217,10 @@ func (m *Manager) Probe(ctx context.Context) Status {
 func (m *Manager) StatusSnapshot() Status {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.status
+	s := m.status
+	s.TotalProbes = m.totalProbes.Load()
+	s.FailedProbes = m.failedProbes.Load()
+	return s
 }
 
 // ConfigSnapshot returns the current connection config.
@@ -137,6 +228,24 @@ func (m *Manager) ConfigSnapshot() Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.cfg
+}
+
+// PingHistory returns a copy of the ping-latency ring buffer.
+func (m *Manager) PingHistory() []PingSample {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]PingSample, len(m.pingHistory))
+	copy(out, m.pingHistory)
+	return out
+}
+
+// EventHistory returns a copy of state transition events.
+func (m *Manager) EventHistory() []Event {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]Event, len(m.events))
+	copy(out, m.events)
+	return out
 }
 
 // UpdateConfig merges non-zero fields from patch into the current config.

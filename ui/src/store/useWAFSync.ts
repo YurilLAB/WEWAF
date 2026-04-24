@@ -164,6 +164,14 @@ export function useWAFSync() {
       }
     } catch { /* silently fail */ }
 
+    // Bot detections feed BotManagementPage's counter.
+    try {
+      const bots = await api.getBots(50);
+      if (bots) {
+        dispatch({ type: 'SET_BOTS_DETECTED', payload: bots.count || 0 });
+      }
+    } catch { /* silently fail */ }
+
     // Request logs (blocks from history)
     try {
       const reqData = await api.getRequests();

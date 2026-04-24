@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { motion } from 'framer-motion';
 import { ArrowDown, Shield, AlertTriangle, CheckCircle, Server, Ban, Activity } from 'lucide-react';
 import { useWAF } from '../store/wafStore';
@@ -5,14 +6,28 @@ import ConnectionBadge from './ConnectionBadge';
 
 export default function TrafficPanel() {
   const { state } = useWAF();
-  const { trafficStats, wafRules } = state;
+  const { trafficStats, securityEvents, settings, connectionState } = state;
+
+  // Derive category hits from actual recent blocks so the panel reflects live
+  // attack mix rather than mock counters on wafRules.
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const ev of securityEvents) {
+      const t = (ev.type || 'other').toLowerCase();
+      counts[t] = (counts[t] || 0) + 1;
+    }
+    return counts;
+  }, [securityEvents]);
 
   const threatTypes = [
-    { label: 'Known XSS Patterns', count: wafRules.find(r => r.category === 'xss')?.hits || 0, icon: AlertTriangle },
-    { label: 'Brute Force Attempts', count: wafRules.find(r => r.category === 'command_injection')?.hits || 0, icon: Ban },
-    { label: 'SQL Injection', count: wafRules.find(r => r.category === 'sqli')?.hits || 0, icon: Shield },
-    { label: 'Rate Limit Violations', count: 0, icon: Activity },
+    { label: 'XSS Attempts', count: categoryCounts['xss'] || 0, icon: AlertTriangle },
+    { label: 'SQL Injection', count: categoryCounts['sql_injection'] || categoryCounts['sqli'] || 0, icon: Shield },
+    { label: 'Brute Force', count: categoryCounts['brute_force'] || 0, icon: Ban },
+    { label: 'Rate Limit', count: categoryCounts['rate_limit'] || 0, icon: Activity },
   ];
+
+  const modeLabel = settings.mode === 'active' ? 'Active' : settings.mode === 'detection' ? 'Detection' : 'Learning';
+  const endpointOk = connectionState === 'online';
 
   return (
     <div className="bg-waf-panel border border-waf-border rounded-xl p-3 sm:p-4 lg:p-5 h-full">
@@ -31,9 +46,15 @@ export default function TrafficPanel() {
           </div>
           <div className="min-w-0">
             <p className="text-waf-text text-[11px] sm:text-sm font-medium">Endpoint Status</p>
-            <p className="text-waf-dim text-[9px] sm:text-xs">Pass Through Active</p>
+            <p className="text-waf-dim text-[9px] sm:text-xs">
+              {endpointOk ? 'Backend reachable' : 'Backend unreachable'}
+            </p>
           </div>
-          <CheckCircle className="w-3.5 h-3.5 sm:w-4 sm:h-4 lg:w-5 lg:h-5 text-waf-orange ml-auto shrink-0" />
+          <CheckCircle
+            className={`w-3.5 h-3.5 sm:w-4 sm:h-4 lg:w-5 lg:h-5 ml-auto shrink-0 ${
+              endpointOk ? 'text-waf-orange' : 'text-waf-dim'
+            }`}
+          />
         </div>
       </div>
 
@@ -71,12 +92,14 @@ export default function TrafficPanel() {
       <div className="bg-waf-elevated/50 rounded-lg p-2 sm:p-3 border border-waf-border/50">
         <p className="text-waf-dim text-[9px] sm:text-xs mb-1 sm:mb-2">WAF Actions</p>
         <div className="flex items-center justify-between text-[10px] sm:text-xs lg:text-sm">
-          <span className="text-waf-muted">Block Mode</span>
-          <span className="text-waf-orange font-medium">Active</span>
+          <span className="text-waf-muted">Mode</span>
+          <span className="text-waf-orange font-medium">{modeLabel}</span>
         </div>
         <div className="flex items-center justify-between text-[10px] sm:text-xs lg:text-sm mt-0.5 sm:mt-1">
           <span className="text-waf-muted">Pass Through</span>
-          <span className="text-waf-orange font-medium">Enabled</span>
+          <span className={`font-medium ${endpointOk ? 'text-waf-orange' : 'text-waf-dim'}`}>
+            {endpointOk ? 'Enabled' : 'Offline'}
+          </span>
         </div>
       </div>
     </div>

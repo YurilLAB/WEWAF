@@ -99,6 +99,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	api.HandleFunc("/api/connection/status", s.handleConnectionStatus)
 	api.HandleFunc("/api/connection/config", s.handleConnectionConfig)
 	api.HandleFunc("/api/connection/test", s.handleConnectionTest)
+	api.HandleFunc("/api/connection/history", s.handleConnectionHistory)
+	api.HandleFunc("/api/connection/events", s.handleConnectionEvents)
 
 	// SSL / TLS.
 	api.HandleFunc("/api/ssl/certificates", s.handleSSLCertificates)
@@ -135,6 +137,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	api.HandleFunc("/api/network/summary", s.handleNetworkSummary)
 	api.HandleFunc("/api/network/top-paths", s.handleNetworkTopPaths)
 	api.HandleFunc("/api/network/top-ips", s.handleNetworkTopIPs)
+
+	// IP Intelligence — per-IP insights + one-click auto-mitigation.
+	api.HandleFunc("/api/ip/", s.handleIPInsights)
+	api.HandleFunc("/api/ip-auto-mitigate", s.handleAutoMitigate)
+
+	// Live events — Server-Sent Events stream of blocks/egress/bots.
+	api.HandleFunc("/api/events/stream", s.handleEventsStream)
 
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
@@ -487,6 +496,37 @@ func (s *Server) handleConnectionTest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"success":    status.Connected,
 		"latency_ms": status.LastPingMs,
+	})
+}
+
+// handleConnectionHistory returns the ping-latency ring buffer so the UI
+// can render a sparkline without synthesising it client-side.
+func (s *Server) handleConnectionHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.connection == nil {
+		writeJSON(w, map[string]interface{}{"history": []connection.PingSample{}})
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"history": s.connection.PingHistory(),
+	})
+}
+
+// handleConnectionEvents returns state-transition events.
+func (s *Server) handleConnectionEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.connection == nil {
+		writeJSON(w, map[string]interface{}{"events": []connection.Event{}})
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"events": s.connection.EventHistory(),
 	})
 }
 
@@ -977,6 +1017,220 @@ func (s *Server) handleNetworkTopIPs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"ips": ips, "from": from, "to": to})
+}
+
+// ---- IP Intelligence ----
+
+// handleIPInsights returns everything known about one IP: request + block
+// counts, first/last seen, triggered rule categories, ban status.
+// Path: /api/ip/<ip>
+func (s *Server) handleIPInsights(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ip := strings.TrimPrefix(r.URL.Path, "/api/ip/")
+	ip = strings.Trim(ip, "/")
+	if ip == "" || stdnet.ParseIP(ip) == nil {
+		http.Error(w, "Invalid IP", http.StatusBadRequest)
+		return
+	}
+
+	out := map[string]interface{}{
+		"ip":       ip,
+		"banned":   false,
+		"activity": history.IPActivity{IP: ip},
+	}
+	if s.banList != nil {
+		for _, b := range s.banList.List() {
+			if b.IP == ip {
+				out["banned"] = true
+				out["ban"] = b
+				break
+			}
+		}
+	}
+
+	// Aggregate 24 h of history for this IP.
+	categories := map[string]int{}
+	var recent []history.BlockEvent
+	if s.history != nil {
+		now := time.Now().UTC()
+		events, _ := s.history.QueryBlocks(now.Add(-24*time.Hour), now, 5000)
+		for _, e := range events {
+			if e.IP != ip {
+				continue
+			}
+			recent = append(recent, e)
+			if len(recent) > 100 {
+				recent = recent[len(recent)-100:]
+			}
+			cat := e.RuleCategory
+			if cat == "" {
+				cat = "other"
+			}
+			categories[cat]++
+		}
+
+		// IP activity aggregate.
+		ips, _ := s.history.QueryIPs(now.Add(-24*time.Hour), now, 10000)
+		for _, a := range ips {
+			if a.IP == ip {
+				out["activity"] = a
+				break
+			}
+		}
+	}
+	out["categories"] = categories
+	out["recent_blocks"] = recent
+	writeJSON(w, out)
+}
+
+// handleAutoMitigate scans the top attacker IPs from the last hour and bans
+// any whose block_count exceeds the given threshold. Returns the list of
+// newly banned IPs. Requires POST with JSON body:
+//
+//	{ "threshold": 10, "duration_sec": 3600 }
+func (s *Server) handleAutoMitigate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.history == nil || s.banList == nil {
+		writeJSON(w, map[string]interface{}{"banned": []string{}, "scanned": 0})
+		return
+	}
+	var req struct {
+		Threshold   int `json:"threshold"`
+		DurationSec int `json:"duration_sec"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.Threshold <= 0 {
+		req.Threshold = 10
+	}
+	if req.DurationSec <= 0 {
+		req.DurationSec = 3600
+	}
+	now := time.Now().UTC()
+	ips, err := s.history.QueryIPs(now.Add(-time.Hour), now, 500)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var banned []string
+	for _, a := range ips {
+		if int(a.BlockCount) < req.Threshold {
+			continue
+		}
+		if s.banList.IsBanned(a.IP) {
+			continue
+		}
+		s.banList.Ban(a.IP, "auto-mitigation: exceeded block threshold", time.Duration(req.DurationSec)*time.Second)
+		banned = append(banned, a.IP)
+	}
+	writeJSON(w, map[string]interface{}{
+		"banned":    banned,
+		"scanned":   len(ips),
+		"threshold": req.Threshold,
+	})
+}
+
+// ---- Live Events (Server-Sent Events) ----
+
+// handleEventsStream pushes blocks/egress/bots to connected clients in real
+// time using SSE. Each client gets its own goroutine polling the telemetry
+// ring buffers with a short cadence; new entries are flushed immediately.
+// No channel-based pub/sub so telemetry stays lock-local and simple.
+func (s *Server) handleEventsStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	// Send an initial hello so the client knows the stream is open.
+	_, _ = w.Write([]byte("event: hello\ndata: {\"status\":\"connected\"}\n\n"))
+	flusher.Flush()
+
+	ctx := r.Context()
+	ticker := time.NewTicker(750 * time.Millisecond)
+	defer ticker.Stop()
+	keepalive := time.NewTicker(25 * time.Second)
+	defer keepalive.Stop()
+
+	// Per-client cursors — we stream only new events since the last tick so
+	// the same entry isn't sent twice. Cursors track the last-seen UTC timestamp.
+	var lastBlockTS, lastEgressTS, lastBotTS time.Time
+
+	send := func(event, data string) bool {
+		if _, err := w.Write([]byte("event: " + event + "\ndata: " + data + "\n\n")); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-keepalive.C:
+			if !send("ping", `{}`) {
+				return
+			}
+		case <-ticker.C:
+			if s.metrics == nil {
+				continue
+			}
+			for _, b := range s.metrics.RecentBlocksSnapshot(50) {
+				if !b.Timestamp.After(lastBlockTS) {
+					continue
+				}
+				lastBlockTS = b.Timestamp
+				buf, err := json.Marshal(b)
+				if err != nil {
+					continue
+				}
+				if !send("block", string(buf)) {
+					return
+				}
+			}
+			for _, e := range s.metrics.RecentEgressSnapshot(50) {
+				if !e.Timestamp.After(lastEgressTS) {
+					continue
+				}
+				lastEgressTS = e.Timestamp
+				buf, err := json.Marshal(e)
+				if err != nil {
+					continue
+				}
+				if !send("egress", string(buf)) {
+					return
+				}
+			}
+			for _, b := range s.metrics.RecentBotsSnapshot(50) {
+				if !b.Timestamp.After(lastBotTS) {
+					continue
+				}
+				lastBotTS = b.Timestamp
+				buf, err := json.Marshal(b)
+				if err != nil {
+					continue
+				}
+				if !send("bot", string(buf)) {
+					return
+				}
+			}
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

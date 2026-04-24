@@ -33,65 +33,71 @@ export default function ConnectionManagementPage() {
     setTesting(true);
     setTestResult(null);
     const startTime = Date.now();
-    const STEP_DELAY = 1200;
+    const MIN_TOTAL_MS = 2400;
 
-    // Step 1: Resolve backend URL
-    setTestResult({ success: true, message: 'Step 1/3: Resolving backend URL...' });
-    await new Promise((r) => setTimeout(r, STEP_DELAY));
-
-    // Step 2: Attempt TCP connection
-    setTestResult({ success: true, message: 'Step 2/3: Attempting handshake...' });
-    let latency = -1;
+    setTestResult({ success: true, message: 'Probing backend via admin API...' });
     try {
-      const t0 = performance.now();
-      const health = await api.getHealth();
-      latency = Math.round(performance.now() - t0);
-      await new Promise((r) => setTimeout(r, Math.max(STEP_DELAY - latency, 200)));
-
-      if (health && health.status === 'ok') {
-        // Step 3: Verify API response
-        setTestResult({ success: true, message: 'Step 3/3: Verifying API response...' });
-        try {
-          const metrics = await api.getMetrics();
-          await new Promise((r) => setTimeout(r, 600));
-          const elapsed = Date.now() - startTime;
-          if (elapsed < 4000) await new Promise((r) => setTimeout(r, 4000 - elapsed));
-
-          setTestResult({
-            success: true,
-            message: `Connected in ${latency}ms — API responding (${metrics ? 'metrics OK' : 'no metrics'})`,
-          });
-          dispatch({
-            type: 'UPDATE_CONNECTION_INFO',
-            payload: { last_ping_ms: latency, connected: true },
-          });
-        } catch {
-          setTestResult({ success: true, message: `Connected in ${latency}ms — health OK, API limited` });
-          dispatch({ type: 'UPDATE_CONNECTION_INFO', payload: { last_ping_ms: latency, connected: true } });
-        }
+      const result = await api.testConnection();
+      const elapsed = Date.now() - startTime;
+      if (elapsed < MIN_TOTAL_MS) {
+        await new Promise((r) => setTimeout(r, MIN_TOTAL_MS - elapsed));
+      }
+      if (result && result.success) {
+        setTestResult({
+          success: true,
+          message: `Backend reachable — ${result.latency_ms}ms round-trip`,
+        });
+        dispatch({
+          type: 'UPDATE_CONNECTION_INFO',
+          payload: { last_ping_ms: result.latency_ms, connected: true },
+        });
       } else {
-        const elapsed = Date.now() - startTime;
-        if (elapsed < 4000) await new Promise((r) => setTimeout(r, 4000 - elapsed));
-        setTestResult({ success: false, message: 'Backend responded but status is not OK' });
+        setTestResult({
+          success: false,
+          message: result
+            ? `Backend unreachable — probe finished in ${result.latency_ms}ms`
+            : 'Connection test failed — admin API did not respond',
+        });
         dispatch({ type: 'UPDATE_CONNECTION_INFO', payload: { connected: false } });
       }
     } catch {
-      const elapsed = Date.now() - startTime;
-      if (elapsed < 4000) await new Promise((r) => setTimeout(r, 4000 - elapsed));
-      setTestResult({ success: false, message: 'Connection test failed — backend unreachable' });
+      setTestResult({ success: false, message: 'Connection test failed — admin API unreachable' });
       dispatch({ type: 'UPDATE_CONNECTION_INFO', payload: { connected: false } });
     }
     setTesting(false);
   };
 
-  const handleSave = () => {
-    dispatch({ type: 'SET_CONNECTION_INFO', payload: { ...form } });
+  const handleSave = async () => {
+    // Persist to the backend so the connection.Manager rebuilds its HTTP
+    // client with the new timeout / backend URL. Falls back to local-only if
+    // the API call fails so the form still reflects the user's intent.
+    const result = await api.setConnectionConfig({
+      backend_url: form.backend_url,
+      listen_addr: form.listen_addr,
+      admin_addr: form.admin_addr,
+      poll_interval_sec: form.poll_interval_sec,
+      retry_attempts: form.retry_attempts,
+      timeout_ms: form.timeout_ms,
+    });
+    const merged = result ? { ...form, ...result } : { ...form };
+    dispatch({ type: 'SET_CONNECTION_INFO', payload: merged });
+    setForm(merged);
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
   };
 
   const handleReset = () => {
-    setForm({ ...connectionInfo });
+    // Snap back to a safe, documented baseline — the actual defaults the
+    // backend expects if no overrides are configured.
+    setForm({
+      ...form,
+      backend_url: 'http://localhost:3000',
+      listen_addr: ':8080',
+      admin_addr: ':8443',
+      poll_interval_sec: 10,
+      retry_attempts: 3,
+      timeout_ms: 2000,
+    });
   };
 
   const statusConfig = {

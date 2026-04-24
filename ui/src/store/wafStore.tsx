@@ -429,10 +429,10 @@ const defaultSSLConfig: SSLTLSConfig = {
 const defaultConnectionInfo: ConnectionInfo = {
   backend_url: 'http://localhost:3000',
   listen_addr: ':8080',
-  admin_addr: ':9090',
-  poll_interval_sec: 5,
+  admin_addr: ':8443',
+  poll_interval_sec: 10,
   retry_attempts: 3,
-  timeout_ms: 5000,
+  timeout_ms: 2000,
   last_ping_ms: -1,
   connected: false,
   last_connected_at: '',

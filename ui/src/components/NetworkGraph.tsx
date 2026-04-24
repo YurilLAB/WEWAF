@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import * as d3 from 'd3';
 import { TrendingUp } from 'lucide-react';
-import { useWAF } from '../store/wafStore';
+import { api } from '../services/api';
 
 interface DataPoint {
   time: Date;
@@ -9,35 +9,44 @@ interface DataPoint {
   blocked: number;
 }
 
+// The backend samples traffic every 10s into a 288-point ring (~48 min at
+// the default cadence). We render the most recent 48 buckets so the graph
+// shows a live, moving window rather than cumulative totals.
+const WINDOW_SIZE = 48;
+const REFRESH_MS = 5000;
+
 export default function NetworkGraph() {
   const svgRef = useRef<SVGSVGElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [data, setData] = useState<DataPoint[]>([]);
-  const { state } = useWAF();
-  const { trafficStats } = state;
 
+  // Poll traffic_history from the backend. Each point already represents a
+  // per-interval delta (see startTrafficSampler), so we don't need to
+  // difference anything client-side.
   useEffect(() => {
-    const now = new Date();
-    const initialData: DataPoint[] = [];
-    for (let i = 20; i >= 0; i--) {
-      initialData.push({ time: new Date(now.getTime() - i * 3000), allowed: 0, blocked: 0 });
-    }
-    setData(initialData);
+    let cancelled = false;
+    const pull = async () => {
+      const points = await api.getTraffic();
+      if (cancelled || !points || !Array.isArray(points)) return;
+      const slice = points.slice(-WINDOW_SIZE);
+      setData(
+        slice.map((p) => ({
+          time: new Date(p.time),
+          allowed: Math.max(0, (p.requests || 0) - (p.blocked || 0)),
+          blocked: p.blocked || 0,
+        })),
+      );
+    };
+    pull();
+    const id = setInterval(pull, REFRESH_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
 
   useEffect(() => {
-    if (data.length === 0) return;
-    const lastPoint = data[data.length - 1];
-    if (trafficStats.totalRequests > 0 && lastPoint.allowed === 0 && lastPoint.blocked === 0) {
-      const now = new Date();
-      const newData = [...data.slice(1)];
-      newData.push({ time: now, allowed: trafficStats.allowedRequests, blocked: trafficStats.blockedRequests });
-      setData(newData);
-    }
-  }, [trafficStats]);
-
-  useEffect(() => {
-    if (!svgRef.current || !wrapperRef.current || data.length === 0) return;
+    if (!svgRef.current || !wrapperRef.current) return;
 
     const draw = () => {
       const svg = d3.select(svgRef.current);
@@ -50,7 +59,6 @@ export default function NetworkGraph() {
       const height = rect.height;
       if (width < 50 || height < 50) return;
 
-      // Set SVG dimensions to match container exactly
       svg.attr('width', width).attr('height', height);
 
       const margin = { top: 12, right: 12, bottom: 30, left: 40 };
@@ -58,47 +66,82 @@ export default function NetworkGraph() {
       const innerHeight = Math.max(40, height - margin.top - margin.bottom);
       const g = svg.append('g').attr('transform', `translate(${margin.left},${margin.top})`);
 
-      const xScale = d3.scaleTime()
+      if (data.length === 0) {
+        g.append('text')
+          .attr('x', innerWidth / 2)
+          .attr('y', innerHeight / 2)
+          .attr('text-anchor', 'middle')
+          .attr('fill', '#525252')
+          .attr('font-size', '11px')
+          .text('waiting for samples...');
+        return;
+      }
+
+      const xScale = d3
+        .scaleTime()
         .domain(d3.extent(data, (d: DataPoint) => d.time) as [Date, Date])
         .range([0, innerWidth]);
 
-      const maxVal = Math.max(10, d3.max(data, (d: DataPoint) => Math.max(d.allowed, d.blocked)) || 10);
+      const maxVal = Math.max(
+        1,
+        d3.max(data, (d: DataPoint) => Math.max(d.allowed, d.blocked)) || 1,
+      );
       const yScale = d3.scaleLinear().domain([0, maxVal]).nice().range([innerHeight, 0]);
 
-      // Grid
       const gridG = g.append('g');
       gridG.call(d3.axisLeft(yScale).tickSize(-innerWidth).tickFormat(() => ''));
       gridG.selectAll('line').attr('stroke', '#2a2a2a').attr('stroke-dasharray', '2,2');
       gridG.select('.domain')?.remove();
 
-      // X Axis
       const xAxisG = g.append('g').attr('transform', `translate(0,${innerHeight})`);
       const tickCount = width < 360 ? 2 : width < 500 ? 3 : 5;
-      xAxisG.call(d3.axisBottom(xScale).ticks(tickCount).tickFormat((d: any) => d3.timeFormat('%H:%M')(d)));
+      xAxisG.call(
+        d3
+          .axisBottom(xScale)
+          .ticks(tickCount)
+          .tickFormat((d: any) => d3.timeFormat('%H:%M')(d)),
+      );
       xAxisG.selectAll('text').attr('fill', '#525252').attr('font-size', width < 400 ? '8px' : '9px');
       xAxisG.select('.domain').attr('stroke', '#2a2a2a');
 
-      // Y Axis
       const yAxisG = g.append('g');
       yAxisG.call(d3.axisLeft(yScale).ticks(Math.min(4, height > 180 ? 4 : 3)));
       yAxisG.selectAll('text').attr('fill', '#525252').attr('font-size', width < 400 ? '8px' : '9px');
       yAxisG.select('.domain').attr('stroke', '#2a2a2a');
 
-      const allowedArea = d3.area<DataPoint>()
-        .x((d) => xScale(d.time)).y0(innerHeight).y1((d) => yScale(d.allowed))
+      const allowedArea = d3
+        .area<DataPoint>()
+        .x((d) => xScale(d.time))
+        .y0(innerHeight)
+        .y1((d) => yScale(d.allowed))
         .curve(d3.curveMonotoneX);
 
-      const allowedLine = d3.line<DataPoint>()
-        .x((d) => xScale(d.time)).y((d) => yScale(d.allowed))
+      const allowedLine = d3
+        .line<DataPoint>()
+        .x((d) => xScale(d.time))
+        .y((d) => yScale(d.allowed))
         .curve(d3.curveMonotoneX);
 
-      const blockedLine = d3.line<DataPoint>()
-        .x((d) => xScale(d.time)).y((d) => yScale(d.blocked))
+      const blockedLine = d3
+        .line<DataPoint>()
+        .x((d) => xScale(d.time))
+        .y((d) => yScale(d.blocked))
         .curve(d3.curveMonotoneX);
 
       g.append('path').datum(data).attr('fill', 'rgba(249, 115, 22, 0.08)').attr('d', allowedArea as any);
-      g.append('path').datum(data).attr('fill', 'none').attr('stroke', '#f97316').attr('stroke-width', 1.5).attr('d', allowedLine as any);
-      g.append('path').datum(data).attr('fill', 'none').attr('stroke', '#ef4444').attr('stroke-width', 1.5).attr('stroke-dasharray', '3,3').attr('d', blockedLine as any);
+      g.append('path')
+        .datum(data)
+        .attr('fill', 'none')
+        .attr('stroke', '#f97316')
+        .attr('stroke-width', 1.5)
+        .attr('d', allowedLine as any);
+      g.append('path')
+        .datum(data)
+        .attr('fill', 'none')
+        .attr('stroke', '#ef4444')
+        .attr('stroke-width', 1.5)
+        .attr('stroke-dasharray', '3,3')
+        .attr('d', blockedLine as any);
     };
 
     draw();

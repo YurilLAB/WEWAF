@@ -9,20 +9,22 @@ interface ResourceConfig {
   unit: string;
   icon: React.ElementType;
   color: string;
+  max: number; // denominator used to convert value → 0-100% for the ring
 }
 
 const resourceConfigs: ResourceConfig[] = [
-  { label: 'CPU', unit: '%', icon: Cpu, color: '#f97316' },
-  { label: 'Memory', unit: '%', icon: Activity, color: '#fb923c' },
-  { label: 'Disk I/O', unit: '%', icon: HardDrive, color: '#f59e0b' },
-  { label: 'Network', unit: 'ms', icon: Wifi, color: '#ef4444' },
+  { label: 'CPU', unit: '%', icon: Cpu, color: '#f97316', max: 100 },
+  { label: 'Memory', unit: '%', icon: Activity, color: '#fb923c', max: 100 },
+  { label: 'Disk I/O', unit: '%', icon: HardDrive, color: '#f59e0b', max: 100 },
+  // Latency ring scales to 500ms — anything above is "pegged red".
+  { label: 'Latency', unit: 'ms', icon: Wifi, color: '#ef4444', max: 500 },
 ];
 
 function CircularGauge({ config, index, value }: { config: ResourceConfig; index: number; value: number }) {
   const [animatedValue, setAnimatedValue] = useState(0);
   const radius = 32;
   const circumference = 2 * Math.PI * radius;
-  const percentage = Math.min((value / (config.label === 'Network' ? 200 : 100)) * 100, 100);
+  const percentage = Math.min((value / config.max) * 100, 100);
   const offset = circumference - (percentage / 100) * circumference;
 
   useEffect(() => {

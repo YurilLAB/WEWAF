@@ -7,6 +7,7 @@ import ResourceWidgets from '../components/ResourceWidgets';
 import WorldMap from '../components/WorldMap';
 import TrafficPanel from '../components/TrafficPanel';
 import NetworkGraph from '../components/NetworkGraph';
+import LiveEventsPanel from '../components/LiveEventsPanel';
 import NextSteps from '../components/NextSteps';
 import PageErrorBoundary from '../components/PageErrorBoundary';
 import DomainsPage from '../components/pages/DomainsPage';
@@ -25,6 +26,7 @@ import RateLimitingPage from '../components/pages/RateLimitingPage';
 import DDoSPage from '../components/pages/DDoSPage';
 import IPReputationPage from '../components/pages/IPReputationPage';
 import BotManagementPage from '../components/pages/BotManagementPage';
+import IPIntelligencePage from '../components/pages/IPIntelligencePage';
 import SSLTLSPage from '../components/pages/SSLTLSPage';
 import ConnectionManagementPage from '../components/pages/ConnectionManagementPage';
 import SettingsPage from '../components/pages/SettingsPage';
@@ -51,8 +53,9 @@ export default function Dashboard() {
           </div>
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
             <PageErrorBoundary name="Network Graph"><NetworkGraph /></PageErrorBoundary>
-            <PageErrorBoundary name="Next Steps"><NextSteps /></PageErrorBoundary>
+            <PageErrorBoundary name="Live Events"><LiveEventsPanel /></PageErrorBoundary>
           </div>
+          <PageErrorBoundary name="Next Steps"><NextSteps /></PageErrorBoundary>
         </motion.div>
       ),
       domains: wrap('Domains', <DomainsPage />),
@@ -71,6 +74,7 @@ export default function Dashboard() {
       ddos: wrap('DDoS Protection', <DDoSPage />),
       'ip-reputation': wrap('IP Reputation', <IPReputationPage />),
       'bot-management': wrap('Bot Management', <BotManagementPage />),
+      'ip-intelligence': wrap('IP Intelligence', <IPIntelligencePage />),
       certificates: wrap('SSL / TLS', <SSLTLSPage initialTab="certificates" />),
       'ssl-settings': wrap('SSL Settings', <SSLTLSPage initialTab="settings" />),
       'tls-versions': wrap('TLS Versions', <SSLTLSPage initialTab="tls-versions" />),
@@ -98,6 +102,7 @@ export default function Dashboard() {
     activePage === 'rate-limiting' ? 'Rate Limiting' :
     activePage === 'ip-reputation' ? 'IP Reputation' :
     activePage === 'bot-management' ? 'Bot Management' :
+    activePage === 'ip-intelligence' ? 'IP Intelligence' :
     activePage === 'ssl-settings' ? 'SSL Settings' :
     activePage === 'tls-versions' ? 'TLS Versions' :
     activePage === 'connection-status' ? 'Connection Status' :

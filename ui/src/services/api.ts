@@ -217,6 +217,44 @@ export interface ConnectionStatus {
   last_connected_at: string;
   connection_method: string;
   failover_active: boolean;
+  total_probes?: number;
+  failed_probes?: number;
+}
+
+export interface PingSample {
+  timestamp: string;
+  ping_ms: number;
+  ok: boolean;
+}
+
+export interface ConnectionEvent {
+  timestamp: string;
+  state: 'online' | 'offline';
+  ping_ms: number;
+}
+
+export interface IPInsights {
+  ip: string;
+  banned: boolean;
+  ban?: BanEntry;
+  activity: IPActivityEntry;
+  categories: Record<string, number>;
+  recent_blocks: Array<{
+    timestamp: string;
+    ip: string;
+    method: string;
+    path: string;
+    rule_id: string;
+    rule_category: string;
+    score: number;
+    message: string;
+  }>;
+}
+
+export interface AutoMitigateResponse {
+  banned: string[];
+  scanned: number;
+  threshold: number;
 }
 
 export interface SSLCertificate {
@@ -377,6 +415,13 @@ export const api = {
   setConnectionConfig: (config: Partial<ConnectionConfig>) =>
     put<ConnectionConfig>('/connection/config', config),
   testConnection: () => post<{ success: boolean; latency_ms: number }>('/connection/test', {}),
+  getConnectionHistory: () => get<{ history: PingSample[] }>('/connection/history'),
+  getConnectionEvents: () => get<{ events: ConnectionEvent[] }>('/connection/events'),
+
+  // IP Intelligence
+  getIPInsights: (ip: string) => get<IPInsights>(`/ip/${encodeURIComponent(ip)}`),
+  autoMitigate: (threshold = 10, durationSec = 3600) =>
+    post<AutoMitigateResponse>('/ip-auto-mitigate', { threshold, duration_sec: durationSec }),
 
   // SSL/TLS
   getCertificates: () => get<{ certificates: SSLCertificate[] }>('/ssl/certificates'),
@@ -412,4 +457,55 @@ export function startPolling(
 ): () => void {
   const id = setInterval(callback, intervalMs);
   return () => clearInterval(id);
+}
+
+// Live-events SSE helper. Returns a cleanup function that closes the stream.
+export interface LiveEventHandlers {
+  onBlock?: (e: BlockRecord) => void;
+  onEgress?: (e: EgressEvent) => void;
+  onBot?: (e: BotEvent) => void;
+  onError?: (err: Event) => void;
+  onOpen?: () => void;
+}
+
+export function connectLiveEvents(handlers: LiveEventHandlers): () => void {
+  let es: EventSource | null = null;
+  let stopped = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const open = () => {
+    if (stopped) return;
+    try {
+      es = new EventSource(`${API_PREFIX}/events/stream`);
+    } catch (err) {
+      handlers.onError?.(err as unknown as Event);
+      return;
+    }
+    es.addEventListener('hello', () => handlers.onOpen?.());
+    es.addEventListener('block', (ev) => {
+      try { handlers.onBlock?.(JSON.parse((ev as MessageEvent).data)); } catch { /* ignore parse */ }
+    });
+    es.addEventListener('egress', (ev) => {
+      try { handlers.onEgress?.(JSON.parse((ev as MessageEvent).data)); } catch { /* ignore parse */ }
+    });
+    es.addEventListener('bot', (ev) => {
+      try { handlers.onBot?.(JSON.parse((ev as MessageEvent).data)); } catch { /* ignore parse */ }
+    });
+    es.onerror = (ev) => {
+      handlers.onError?.(ev);
+      // Reconnect after a backoff so transient network loss recovers.
+      if (!stopped) {
+        es?.close();
+        es = null;
+        reconnectTimer = setTimeout(open, 3000);
+      }
+    };
+  };
+
+  open();
+  return () => {
+    stopped = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    es?.close();
+  };
 }

@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import {
   Search, LayoutDashboard, Globe, Server, BarChart3, Shield, Lock,
   ChevronDown, Zap, Network, Eye, Fingerprint, FileText, Timer,
-  UserX, Settings, Activity, Logs, X, Link2, Cpu, Monitor,
+  UserX, Settings, Activity, Logs, X, Link2, Cpu, Monitor, Target,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -50,6 +50,7 @@ const navItems: NavItem[] = [
       { id: 'rate-limiting', label: 'Rate Limiting', icon: Timer },
       { id: 'ddos', label: 'DDoS Protection', icon: Zap },
       { id: 'ip-reputation', label: 'IP Reputation', icon: UserX },
+      { id: 'ip-intelligence', label: 'IP Intelligence', icon: Target },
       { id: 'bot-management', label: 'Bot Management', icon: UserX },
     ],
   },
