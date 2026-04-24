@@ -7,7 +7,10 @@ import (
 	"time"
 )
 
-const maxAttemptsPerEntry = 10000
+const (
+	maxAttemptsPerEntry = 10000
+	maxEntries          = 100000
+)
 
 // Detector tracks login attempts per key (e.g., IP or IP:user) in a sliding window.
 type Detector struct {
@@ -34,19 +37,50 @@ func NewDetector(window time.Duration) *Detector {
 		entries: make(map[string]*entry),
 		stopCh:  make(chan struct{}),
 	}
-	// Start a background janitor to evict stale entries.
-	d.ticker = time.NewTicker(window / 2)
+	// Start a background janitor to evict stale entries with jitter.
+	jitter := time.Duration(0)
+	if wb := window / 10; wb > 0 {
+		jitter = time.Duration(time.Now().UnixNano() % int64(wb))
+	}
+	d.ticker = time.NewTicker(window/2 + jitter)
 	go d.janitor()
 	return d
 }
 
 // Record increments the attempt counter for a key and returns the current count.
 func (d *Detector) Record(key string) int {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic recovered in bruteforce Record: %v", r)
+		}
+	}()
+
+	if key == "" {
+		return 0
+	}
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now().UTC()
 	e, ok := d.entries[key]
 	if !ok {
+		if len(d.entries) >= maxEntries {
+			var oldestKey string
+			var oldestTime time.Time
+			for k, v := range d.entries {
+				if len(v.attempts) > 0 {
+					last := v.attempts[len(v.attempts)-1]
+					if oldestTime.IsZero() || last.Before(oldestTime) {
+						oldestKey = k
+						oldestTime = last
+					}
+				} else {
+					oldestKey = k
+					break
+				}
+			}
+			delete(d.entries, oldestKey)
+		}
 		e = &entry{}
 		d.entries[key] = e
 	}
@@ -91,6 +125,11 @@ func (d *Detector) Count(key string) int {
 
 // IsBruteForce reports whether the key has exceeded the threshold.
 func (d *Detector) IsBruteForce(key string, threshold int) bool {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic recovered in bruteforce IsBruteForce: %v", r)
+		}
+	}()
 	if threshold <= 0 {
 		threshold = 1
 	}

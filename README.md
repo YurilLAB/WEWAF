@@ -12,7 +12,7 @@ time range.
 
 ## Highlights
 
-- **In-process WAF engine** — 75+ compiled signatures across XSS, SQLi, RCE,
+- **In-process WAF engine** — 95+ compiled signatures across XSS, SQLi, RCE,
   SSRF, XXE, path traversal, CRLF, NoSQLi, LDAP, JNDI, prototype pollution,
   file upload, open redirect, HTTP smuggling, and scanner/bot fingerprints.
 - **Three operating modes** — `active` (block), `detection` (log would-block),

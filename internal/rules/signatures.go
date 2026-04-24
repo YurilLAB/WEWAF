@@ -184,6 +184,53 @@ func DefaultRules() []core.Rule {
 
 		// === Header Manipulation ===
 		{ID: "HEADER-001", Name: "IP Header Spoofing", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Private IP in forwarding header", Targets: []string{"headers"}, Pattern: `(?i)(X-Forwarded-For|X-Real-IP|True-Client-IP)\s*:\s*.*(?:127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})`},
+
+		// === Insecure Deserialization ===
+		{ID: "DESER-001", Name: "Java Serialized Object", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Java serialized object payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(rO0AB|ACED00)`},
+		{ID: "DESER-002", Name: "PHP Serialized Object", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "PHP serialized object payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(O:\d+:"|a:\d+:\{|s:\d+":)`},
+		{ID: "DESER-003", Name: "NET Serialized Object", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: ".NET serialized object payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)AAEAAAD`},
+
+		// === Server-Side Template Injection ===
+		{ID: "SSTI-001", Name: "SSTI Jinja2 Twig", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Jinja2 or Twig template injection", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\{\{\s*(?:7\*7|config|self|_self|lipsum|joiner|namespace|cycler)\s*\}\}`},
+		{ID: "SSTI-002", Name: "SSTI Velocity Freemarker", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Velocity or Freemarker template injection", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(\$class|\$runtime\.exec|<#assign|\$\{\.new|\$\{.*\.getRuntime\(\))`},
+
+		// === WebShell Uploads ===
+		{ID: "SHELL-001", Name: "PHP WebShell Eval", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "PHP eval web shell payload", Targets: []string{"body", "headers"}, Pattern: `(?i)(eval\s*\(\s*\$_POST|assert\s*\(\s*\$_REQUEST|<\?php\s+@?eval\s*\(|<\?=\s*@?\$_POST|system\s*\(\s*\$_GET)`},
+		{ID: "SHELL-002", Name: "PHP WebShell Disguised", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Disguised PHP web shell upload", Targets: []string{"body", "headers"}, Pattern: `(?i)(GIF89a<\?php|shell_exec\s*\(|passthru\s*\(\s*\$_GET|exec\s*\(\s*\$_POST)`},
+
+		// === Log Injection ===
+		{ID: "LOG-001", Name: "Log Injection Newline", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Newline injection in log field", Targets: []string{"headers"}, Pattern: `(?i)(\x0a|\x0d|%0a|%0d)`},
+
+		// === Padding Oracle / Crypto ===
+		{ID: "CRYPTO-001", Name: "Padding Oracle Pattern", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Repeated base64 blocks suggesting padding oracle", Targets: []string{"args", "body"}, Pattern: `(?i)(?:[A-Za-z0-9+/]{40,}=?\s*){3,}`},
+
+		// === Mass Assignment ===
+		{ID: "MASS-001", Name: "Mass Assignment Privilege", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Mass assignment privilege escalation", Targets: []string{"args", "body"}, Pattern: `(?i)["']?(admin|role|is_admin|isAdmin|superuser|is_superuser|privilege)\s*["']?\s*[:=]\s*["']?(true|1|admin|root)["']?`},
+
+		// === Content-Type Confusion ===
+		{ID: "CT-001", Name: "Content-Type Confusion JSON XML", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "application/json request with XML-like body", Targets: []string{"body", "headers"}, Pattern: `(?i)Content-Type\s*:\s*application/json[\s\S]{0,300}<\?xml`},
+
+		// === API Key / Secret Leakage ===
+		{ID: "LEAK-001", Name: "API Key Secret Leak", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "Potential API key or secret in payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(api[_-]?key\s*[:=]\s*['"]?[a-z0-9]{16,}|aws_secret|private[_-]?key|secret[_-]?key)`},
+
+		// === DNS Rebinding ===
+		{ID: "DNS-001", Name: "DNS Rebinding Host", Phase: core.PhaseRequestHeaders, Score: 50, Action: core.ActionLog, Description: "IP-as-domain in Host header suggesting DNS rebinding", Targets: []string{"headers"}, Pattern: `(?i)Host\s*:\s*\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`},
+
+		// === Credential Stuffing ===
+		{ID: "STUFF-001", Name: "Credential Stuffing Pattern", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Bulk credential stuffing pattern", Targets: []string{"args", "body"}, Pattern: `(?i)((?:username|email|user)\s*[:=]\s*[^&\s]{3,50}&(?:password|pass|pwd)\s*[:=]\s*[^&\s]{3,50})`},
+		{ID: "STUFF-002", Name: "Credential Stuffing Tool", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Credential stuffing tool signature", Targets: []string{"headers"}, Pattern: `(?i)(sentry\s*mba|open\s*bullet|snipr|storm|blackbullet|silverbullet)`},
+
+		// === Additional Bot / Scrapers ===
+		{ID: "BOT-001", Name: "Automated Client UA", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Automated HTTP client User-Agent", Targets: []string{"headers"}, Pattern: `(?i)(python-requests|scrapy|libwww-perl|java\/|httpclient|http-client|axios|okhttp)`},
+
+		// === Business Logic Abuse ===
+		{ID: "BL-001", Name: "Business Logic Negative Value", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Negative price or quantity manipulation", Targets: []string{"args", "body"}, Pattern: `(?i)(price|amount|quantity|cost|total|value|coupon|discount)\s*[:=]\s*-\d+`},
+
+		// === Insecure Direct Object Reference ===
+		{ID: "IDOR-001", Name: "IDOR Sequential Enumeration", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "Sequential ID enumeration in parameters", Targets: []string{"args", "uri"}, Pattern: `(?i)[?&](?:id|user_id|account_id|order_id|doc_id)\s*[:=]\s*\d{1,6}\b`},
+
+		// === Clickjacking / UI Redress ===
+		{ID: "CLICK-001", Name: "Clickjacking Frame Options Bypass", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Clickjacking frame options bypass attempt", Targets: []string{"headers"}, Pattern: `(?i)(X-Frame-Options|Content-Security-Policy|frame-ancestors)`},
 	}
 }
 

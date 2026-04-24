@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -42,6 +43,8 @@ type seekableBody struct {
 }
 
 func (s *seekableBody) Close() error { return nil }
+
+var credLeakRE = regexp.MustCompile(`(?i)(api_key|password|secret)=([^&\s"']+)`)
 
 // NewWAFProxy creates a proxy that inspects traffic before forwarding.
 func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metrics, bf *bruteforce.Detector) (*WAFProxy, error) {
@@ -75,6 +78,7 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 
 // ServeHTTP implements http.Handler.
 func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	defer func() {
 		if rec := recover(); rec != nil {
 			wp.eng.LogError("proxy: panic in ServeHTTP: %v", rec)
@@ -82,10 +86,26 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			}
 		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			wp.eng.LogError("proxy: slow request detected (%v) %s %s", elapsed, r.Method, r.URL.Path)
+		}
 	}()
 
 	if r == nil {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// Reject requests with extremely large headers (>64KB total).
+	var totalHeaderSize int
+	for k, v := range r.Header {
+		totalHeaderSize += len(k) + 2
+		for _, val := range v {
+			totalHeaderSize += len(val)
+		}
+	}
+	if totalHeaderSize > 64*1024 {
+		http.Error(w, "Request Header Fields Too Large", http.StatusRequestHeaderFieldsTooLarge)
 		return
 	}
 
@@ -246,6 +266,11 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 		return wp.replaceWithSynthetic(res, intr)
 	}
 
+	// Redact leaked credentials from the response body before forwarding.
+	inspectBody = credLeakRE.ReplaceAll(inspectBody, []byte("${1}=[REDACTED]"))
+	res.Header.Del("Content-Length")
+	res.ContentLength = -1
+
 	// Reconstruct full body: inspected prefix + remainder of original stream.
 	res.Body = io.NopCloser(io.MultiReader(bytes.NewReader(inspectBody), res.Body))
 
@@ -333,6 +358,14 @@ func (wp *WAFProxy) writeBlock(w http.ResponseWriter, intr *core.Interruption, t
 
 // errorHandler handles backend connection errors.
 func (wp *WAFProxy) errorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			wp.eng.LogError("proxy: panic in errorHandler: %v", rec)
+			if w != nil {
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}
+	}()
 	var logMsg string
 	switch {
 	case errors.Is(err, syscall.ECONNREFUSED):
@@ -442,6 +475,7 @@ func isLoginRequest(r *http.Request) bool {
 	loginPaths := []string{
 		"/login", "/auth", "/signin", "/wp-login.php", "/admin/login",
 		"/api/login", "/api/auth", "/oauth/token", "/v1/login",
+		"/api/v1/login", "/api/v2/login", "/authenticate", "/session", "/token",
 		"/register", "/signup",
 	}
 	for _, lp := range loginPaths {

@@ -56,6 +56,9 @@ func (s *Semaphore) Acquire(ctx context.Context) error {
 		log.Println("warning: Semaphore.Acquire called on nil semaphore")
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case s.ch <- struct{}{}:
 		return nil
@@ -86,6 +89,8 @@ type rateBucket struct {
 	tokens float64
 	last   time.Time
 }
+
+const maxBuckets = 1_000_000
 
 // RateLimiter implements a per-IP token-bucket rate limiter.
 type RateLimiter struct {
@@ -127,6 +132,17 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	now := time.Now()
 	b, ok := rl.buckets[ip]
 	if !ok {
+		if len(rl.buckets) >= maxBuckets {
+			var oldestIP string
+			var oldestTime time.Time
+			for k, v := range rl.buckets {
+				if oldestTime.IsZero() || v.last.Before(oldestTime) {
+					oldestIP = k
+					oldestTime = v.last
+				}
+			}
+			delete(rl.buckets, oldestIP)
+		}
 		b = &rateBucket{tokens: rl.burst - 1, last: now}
 		rl.buckets[ip] = b
 		return true
@@ -178,6 +194,13 @@ func (rl *RateLimiter) janitor() {
 
 // Stats returns current resource usage.
 func Stats() map[string]interface{} {
+	result := map[string]interface{}{
+		"goroutines":     0,
+		"cpu_cores":      0,
+		"memory_used_mb": "0.00",
+		"memory_sys_mb":  "0.00",
+		"gc_count":       0,
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("panic recovered in Stats: %v", r)
@@ -185,11 +208,10 @@ func Stats() map[string]interface{} {
 	}()
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	return map[string]interface{}{
-		"goroutines":     runtime.NumGoroutine(),
-		"cpu_cores":      runtime.GOMAXPROCS(0),
-		"memory_used_mb": fmt.Sprintf("%.2f", float64(m.Alloc)/(1024*1024)),
-		"memory_sys_mb":  fmt.Sprintf("%.2f", float64(m.Sys)/(1024*1024)),
-		"gc_count":       m.NumGC,
-	}
+	result["goroutines"] = runtime.NumGoroutine()
+	result["cpu_cores"] = runtime.GOMAXPROCS(0)
+	result["memory_used_mb"] = fmt.Sprintf("%.2f", float64(m.Alloc)/(1024*1024))
+	result["memory_sys_mb"] = fmt.Sprintf("%.2f", float64(m.Sys)/(1024*1024))
+	result["gc_count"] = m.NumGC
+	return result
 }

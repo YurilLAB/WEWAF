@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -121,6 +122,9 @@ func (e *Engine) ProcessResponseBody(tx *core.Transaction, body []byte) *core.In
 	if tx == nil {
 		return nil
 	}
+	if e == nil || e.cfg == nil {
+		return nil
+	}
 	if len(body) == 0 {
 		return nil
 	}
@@ -236,60 +240,120 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 
 // evaluateSpecialRules handles logic that cannot be expressed cleanly with regex.
 func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, targets map[string]string) []core.Match {
+	const maxSpecialMatches = 50
 	var matches []core.Match
-	if phase != core.PhaseRequestHeaders {
-		return matches
-	}
-	if tx.Request == nil {
-		return matches
-	}
-
-	// HTTP Smuggling: Transfer-Encoding + Content-Length
-	te := tx.Request.Header.Get("Transfer-Encoding")
-	cl := tx.Request.Header.Get("Content-Length")
-	if te != "" && cl != "" {
-		matches = append(matches, core.Match{
-			RuleID:    "SMUG-001",
-			RuleName:  "HTTP Smuggling TE.CL",
-			Phase:     phase,
-			Target:    "headers",
-			Value:     fmt.Sprintf("TE=%s CL=%s", trunc(te, 32), trunc(cl, 32)),
-			Score:     80,
-			Action:    core.ActionBlock,
-			Message:   "Transfer-Encoding and Content-Length both present",
-			Timestamp: time.Now().UTC(),
-		})
+	addMatch := func(m core.Match) {
+		if len(matches) >= maxSpecialMatches {
+			return
+		}
+		matches = append(matches, m)
 	}
 
-	// HTTP Smuggling: duplicate Content-Length values
-	if clValues, ok := tx.Request.Header["Content-Length"]; ok && len(clValues) > 1 {
-		matches = append(matches, core.Match{
-			RuleID:    "SMUG-002",
-			RuleName:  "HTTP Smuggling Double CL",
-			Phase:     phase,
-			Target:    "headers",
-			Value:     strings.Join(clValues, ", "),
-			Score:     70,
-			Action:    core.ActionBlock,
-			Message:   "Duplicate Content-Length headers detected",
-			Timestamp: time.Now().UTC(),
-		})
-	}
+	switch phase {
+	case core.PhaseRequestHeaders:
+		if tx.Request == nil {
+			return matches
+		}
 
-	// Empty / missing User-Agent
-	ua := tx.Request.UserAgent()
-	if ua == "" {
-		matches = append(matches, core.Match{
-			RuleID:    "SCAN-002",
-			RuleName:  "Empty User-Agent",
-			Phase:     phase,
-			Target:    "headers",
-			Value:     "",
-			Score:     20,
-			Action:    core.ActionLog,
-			Message:   "Missing or empty User-Agent header",
-			Timestamp: time.Now().UTC(),
-		})
+		// HTTP Smuggling: Transfer-Encoding + Content-Length
+		te := tx.Request.Header.Get("Transfer-Encoding")
+		cl := tx.Request.Header.Get("Content-Length")
+		if te != "" && cl != "" {
+			addMatch(core.Match{
+				RuleID:    "SMUG-001",
+				RuleName:  "HTTP Smuggling TE.CL",
+				Phase:     phase,
+				Target:    "headers",
+				Value:     fmt.Sprintf("TE=%s CL=%s", trunc(te, 32), trunc(cl, 32)),
+				Score:     80,
+				Action:    core.ActionBlock,
+				Message:   "Transfer-Encoding and Content-Length both present",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
+		// HTTP Smuggling: duplicate Content-Length values
+		if clValues, ok := tx.Request.Header["Content-Length"]; ok && len(clValues) > 1 {
+			addMatch(core.Match{
+				RuleID:    "SMUG-002",
+				RuleName:  "HTTP Smuggling Double CL",
+				Phase:     phase,
+				Target:    "headers",
+				Value:     strings.Join(clValues, ", "),
+				Score:     70,
+				Action:    core.ActionBlock,
+				Message:   "Duplicate Content-Length headers detected",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
+		// Empty / missing User-Agent
+		ua := tx.Request.UserAgent()
+		if ua == "" {
+			addMatch(core.Match{
+				RuleID:    "SCAN-002",
+				RuleName:  "Empty User-Agent",
+				Phase:     phase,
+				Target:    "headers",
+				Value:     "",
+				Score:     20,
+				Action:    core.ActionLog,
+				Message:   "Missing or empty User-Agent header",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
+	case core.PhaseResponseBody:
+		body := targets["response_body"]
+		if body == "" {
+			return matches
+		}
+		lowerBody := strings.ToLower(body)
+
+		// AWS access key pattern
+		if strings.Contains(body, "AKIA") {
+			addMatch(core.Match{
+				RuleID:    "LEAK-001",
+				RuleName:  "Leaked AWS Access Key",
+				Phase:     phase,
+				Target:    "response_body",
+				Value:     "AWS access key pattern detected",
+				Score:     20,
+				Action:    core.ActionLog,
+				Message:   "Potential AWS access key leaked in response",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
+		// GitHub token pattern
+		if strings.Contains(body, "ghp_") || strings.Contains(body, "gho_") {
+			addMatch(core.Match{
+				RuleID:    "LEAK-002",
+				RuleName:  "Leaked GitHub Token",
+				Phase:     phase,
+				Target:    "response_body",
+				Value:     "GitHub token pattern detected",
+				Score:     20,
+				Action:    core.ActionLog,
+				Message:   "Potential GitHub token leaked in response",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
+		// Generic credential patterns
+		if strings.Contains(lowerBody, "api_key=") || strings.Contains(lowerBody, "password=") || strings.Contains(lowerBody, "secret=") {
+			addMatch(core.Match{
+				RuleID:    "LEAK-003",
+				RuleName:  "Leaked Credentials in Response",
+				Phase:     phase,
+				Target:    "response_body",
+				Value:     "credential pattern detected",
+				Score:     20,
+				Action:    core.ActionLog,
+				Message:   "Potential credentials leaked in response",
+				Timestamp: time.Now().UTC(),
+			})
+		}
 	}
 
 	return matches
@@ -387,6 +451,11 @@ func (e *Engine) readBodyString(r *http.Request) (string, error) {
 	limited := io.LimitReader(r.Body, maxBody)
 	body, err := io.ReadAll(limited)
 	if err != nil {
+		if errors.Is(err, http.ErrBodyReadAfterClose) {
+			r.Body = io.NopCloser(bytes.NewReader(nil))
+			r.ContentLength = 0
+			return "", nil
+		}
 		_ = r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(nil))
 		r.ContentLength = 0
