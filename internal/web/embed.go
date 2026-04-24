@@ -369,11 +369,31 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			ShaperEnabled          *bool    `json:"shaper_enabled"`
 			ShaperMaxRPS           int      `json:"shaper_max_rps"`
 			ShaperBurst            int      `json:"shaper_burst"`
+			// Newly surfaced fields — all nullable so the UI can leave them alone.
+			DecompressInspect   *bool `json:"decompress_inspect"`
+			DecompressRatioCap  int   `json:"decompress_ratio_cap"`
+			BanBackoffEnabled   *bool `json:"ban_backoff_enabled"`
+			BanBackoffMultiplier int  `json:"ban_backoff_multiplier"`
+			BanBackoffWindowSec int   `json:"ban_backoff_window_sec"`
+			MaxBanDurationSec   int   `json:"max_ban_duration_sec"`
+			PerRuleCounters     *bool `json:"per_rule_counters"`
+			BlockThreshold      int   `json:"block_threshold"`
+			RateLimitRPS        int   `json:"rate_limit_rps"`
+			RateLimitBurst      int   `json:"rate_limit_burst"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+		// Bounded reader so a malicious request can't OOM us with a 1 GB JSON.
+		// 64 KiB is generous — every legitimate config payload is under 8 KiB.
+		limited := http.MaxBytesReader(w, r.Body, 64*1024)
+		if err := json.NewDecoder(limited).Decode(&payload); err != nil {
+			http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Serialise the mutation batch so a concurrent Snapshot() reader
+		// doesn't observe half-applied state. Mode still goes through its
+		// atomic setter separately. We unlock explicitly before calling
+		// SnapshotToFile at the end (which internally takes the RLock) —
+		// RWMutex is not reentrant.
+		s.cfg.Lock()
 		if payload.Mode != "" {
 			if payload.Mode != "active" && payload.Mode != "detection" && payload.Mode != "learning" {
 				http.Error(w, "Invalid mode", http.StatusBadRequest)
@@ -442,12 +462,65 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if payload.ShaperBurst > 0 {
 			s.cfg.ShaperBurst = payload.ShaperBurst
 		}
+		if payload.DecompressInspect != nil {
+			s.cfg.DecompressInspect = *payload.DecompressInspect
+		}
+		if payload.DecompressRatioCap > 0 {
+			// Clamp to a sane range so a typo doesn't disable the defence
+			// (cap=1 would reject all real compression) or make it useless
+			// (cap=1 000 000 would pass a real bomb).
+			rc := payload.DecompressRatioCap
+			if rc < 10 {
+				rc = 10
+			}
+			if rc > 10000 {
+				rc = 10000
+			}
+			s.cfg.DecompressRatioCap = rc
+		}
+		if payload.BanBackoffEnabled != nil {
+			s.cfg.BanBackoffEnabled = *payload.BanBackoffEnabled
+		}
+		if payload.BanBackoffMultiplier > 0 {
+			s.cfg.BanBackoffMultiplier = payload.BanBackoffMultiplier
+		}
+		if payload.BanBackoffWindowSec > 0 {
+			s.cfg.BanBackoffWindowSec = payload.BanBackoffWindowSec
+		}
+		if payload.MaxBanDurationSec > 0 {
+			s.cfg.MaxBanDurationSec = payload.MaxBanDurationSec
+		}
+		if payload.PerRuleCounters != nil {
+			s.cfg.PerRuleCounters = *payload.PerRuleCounters
+		}
+		if payload.BlockThreshold > 0 {
+			s.cfg.BlockThreshold = payload.BlockThreshold
+		}
+		if payload.RateLimitRPS > 0 {
+			s.cfg.RateLimitRPS = payload.RateLimitRPS
+		}
+		if payload.RateLimitBurst > 0 {
+			s.cfg.RateLimitBurst = payload.RateLimitBurst
+		}
+		// Push updated ban-list backoff to the live object so changes take
+		// effect without a restart. Capture values under the write lock so
+		// the ConfigureBackoff call outside the lock sees a consistent set.
+		backoffEnabled := s.cfg.BanBackoffEnabled
+		backoffMult := s.cfg.BanBackoffMultiplier
+		backoffWindow := time.Duration(s.cfg.BanBackoffWindowSec) * time.Second
+		backoffMax := time.Duration(s.cfg.MaxBanDurationSec) * time.Second
+		rotateHours := s.cfg.HistoryRotateHours
+		s.cfg.Unlock()
+
+		if s.banList != nil {
+			s.banList.ConfigureBackoff(backoffEnabled, backoffMult, backoffWindow, backoffMax)
+		}
 		// Persist a config snapshot after any successful change so operators
 		// have a rollback target.
 		if path, err := s.cfg.SnapshotToFile("config_backup", 10); err == nil {
 			log.Printf("config snapshot saved: %s", path)
 		}
-		writeJSON(w, map[string]interface{}{"status": "ok", "mode": s.cfg.ModeSnapshot(), "history_rotate_hours": s.cfg.HistoryRotateHours})
+		writeJSON(w, map[string]interface{}{"status": "ok", "mode": s.cfg.ModeSnapshot(), "history_rotate_hours": rotateHours})
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}

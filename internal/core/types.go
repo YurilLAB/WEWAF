@@ -326,10 +326,18 @@ func (bl *BanList) StartCleanup(interval time.Duration) func() {
 
 // ConfigureBackoff enables exponential-backoff bans. A multiplier of 2 and
 // window of 24 h means a repeat ban within 24 hours doubles the duration, up
-// to maxDuration. Passing multiplier <= 1 or enabled=false disables backoff.
+// to maxDuration. Passing enabled=false disables backoff. A multiplier < 2
+// is silently clamped to 2 so an invalid API value doesn't let an offender
+// rebuild state (previous behaviour was to silently disable backoff).
 func (bl *BanList) ConfigureBackoff(enabled bool, multiplier int, window, maxDuration time.Duration) {
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
+	if multiplier < 2 {
+		multiplier = 2
+	}
+	if multiplier > 16 {
+		multiplier = 16
+	}
 	bl.backoffEnabled = enabled
 	bl.backoffMultiplier = multiplier
 	bl.backoffWindow = window
@@ -351,12 +359,31 @@ func (bl *BanList) Ban(ip, reason string, duration time.Duration) {
 		}
 		h, ok := bl.history[ip]
 		if ok && (bl.backoffWindow <= 0 || now.Sub(h.lastBanned) <= bl.backoffWindow) {
+			// Cap offenses at 10 — at multiplier=2 that's already 512× base,
+			// well past any realistic maxDuration, so further loop iterations
+			// only add work under the write lock. 10 keeps the exponent loop
+			// at most 9 multiplications, unnoticeable.
 			offenses = h.offenses + 1
+			if offenses > 10 {
+				offenses = 10
+			}
 		}
-		// Apply multiplier^(offenses-1) — cheap loop beats math.Pow for small N.
+		// Apply multiplier^(offenses-1). Use overflow-safe math: once the
+		// scaled value would exceed maxDuration (or time.Duration's limit),
+		// clamp and stop. time.Duration is int64 nanoseconds, so max is
+		// ~292 years — saturating there is the correct behaviour.
 		scaled := duration
 		for i := 1; i < offenses && scaled > 0; i++ {
-			scaled = scaled * time.Duration(bl.backoffMultiplier)
+			multiplier := time.Duration(bl.backoffMultiplier)
+			// Overflow check: scaled*multiplier > maxInt64 iff scaled > maxInt64/multiplier.
+			if multiplier > 0 && scaled > time.Duration(1<<62)/multiplier {
+				scaled = bl.maxDuration
+				if scaled <= 0 {
+					scaled = time.Duration(1 << 62)
+				}
+				break
+			}
+			scaled = scaled * multiplier
 			if bl.maxDuration > 0 && scaled > bl.maxDuration {
 				scaled = bl.maxDuration
 				break

@@ -27,6 +27,25 @@ export default function SettingsPage() {
   const [engineSaved, setEngineSaved] = useState(false);
   const [engineSaving, setEngineSaving] = useState(false);
 
+  // Advanced hardening controls introduced alongside transport timeouts,
+  // expo-ban, decompression, and per-rule counters. Each one is read from
+  // /api/config at mount and round-trips through the same POST /api/config.
+  const [advForm, setAdvForm] = useState({
+    decompress_inspect: true,
+    decompress_ratio_cap: 100,
+    ban_backoff_enabled: true,
+    ban_backoff_multiplier: 2,
+    ban_backoff_window_sec: 86400,
+    max_ban_duration_sec: 7 * 24 * 3600,
+    per_rule_counters: true,
+    block_threshold: 100,
+    rate_limit_rps: 100,
+    rate_limit_burst: 150,
+  });
+  const [advSaved, setAdvSaved] = useState(false);
+  const [advSaving, setAdvSaving] = useState(false);
+  const [advError, setAdvError] = useState<string | null>(null);
+
   useEffect(() => {
     api.getConfig().then((cfg) => {
       if (!cfg) return;
@@ -44,6 +63,25 @@ export default function SettingsPage() {
         shaper_enabled: typeof se === 'boolean' ? se : prev.shaper_enabled,
         shaper_max_rps: typeof smr === 'number' && smr > 0 ? smr : prev.shaper_max_rps,
         shaper_burst: typeof sb === 'number' && sb > 0 ? sb : prev.shaper_burst,
+      }));
+
+      // Seed the advanced-hardening form from the same config response.
+      const c = cfg as Record<string, unknown>;
+      const readBool = (k: string, fallback: boolean) =>
+        typeof c[k] === 'boolean' ? (c[k] as boolean) : fallback;
+      const readNum = (k: string, fallback: number) =>
+        typeof c[k] === 'number' && (c[k] as number) > 0 ? (c[k] as number) : fallback;
+      setAdvForm((prev) => ({
+        decompress_inspect: readBool('decompress_inspect', prev.decompress_inspect),
+        decompress_ratio_cap: readNum('decompress_ratio_cap', prev.decompress_ratio_cap),
+        ban_backoff_enabled: readBool('ban_backoff_enabled', prev.ban_backoff_enabled),
+        ban_backoff_multiplier: readNum('ban_backoff_multiplier', prev.ban_backoff_multiplier),
+        ban_backoff_window_sec: readNum('ban_backoff_window_sec', prev.ban_backoff_window_sec),
+        max_ban_duration_sec: readNum('max_ban_duration_sec', prev.max_ban_duration_sec),
+        per_rule_counters: readBool('per_rule_counters', prev.per_rule_counters),
+        block_threshold: readNum('block_threshold', prev.block_threshold),
+        rate_limit_rps: readNum('rate_limit_rps', prev.rate_limit_rps),
+        rate_limit_burst: readNum('rate_limit_burst', prev.rate_limit_burst),
       }));
       const updates: Partial<WAFSettings> = {};
       if (cfg.history_rotate_hours) updates.historyRotateHours = cfg.history_rotate_hours;
@@ -132,19 +170,64 @@ export default function SettingsPage() {
 
   const saveEngine = async () => {
     setEngineSaving(true);
-    const res = await api.updateConfig({
-      // These pass through the admin /api/config POST accept list.
-      paranoia_level: engineForm.paranoia_level,
-      crs_enabled: engineForm.crs_enabled,
-      failsafe_mode: engineForm.failsafe_mode,
-      shaper_enabled: engineForm.shaper_enabled,
-      shaper_max_rps: engineForm.shaper_max_rps,
-      shaper_burst: engineForm.shaper_burst,
-    } as Parameters<typeof api.updateConfig>[0]);
-    setEngineSaving(false);
-    if (res) {
-      setEngineSaved(true);
-      setTimeout(() => setEngineSaved(false), 1500);
+    try {
+      const res = await api.updateConfig({
+        // These pass through the admin /api/config POST accept list.
+        paranoia_level: engineForm.paranoia_level,
+        crs_enabled: engineForm.crs_enabled,
+        failsafe_mode: engineForm.failsafe_mode,
+        shaper_enabled: engineForm.shaper_enabled,
+        shaper_max_rps: engineForm.shaper_max_rps,
+        shaper_burst: engineForm.shaper_burst,
+      } as Parameters<typeof api.updateConfig>[0]);
+      if (res) {
+        setEngineSaved(true);
+        setTimeout(() => setEngineSaved(false), 1500);
+      }
+    } finally {
+      setEngineSaving(false);
+    }
+  };
+
+  const saveAdvanced = async () => {
+    setAdvSaving(true);
+    setAdvError(null);
+    // Client-side sanity before hitting the backend — the backend clamps
+    // again defensively, but surfacing an obvious nonsense value here is
+    // faster than a round-trip.
+    if (advForm.decompress_ratio_cap < 10 || advForm.decompress_ratio_cap > 10000) {
+      setAdvError('Decompression ratio cap must be between 10 and 10000.');
+      setAdvSaving(false);
+      return;
+    }
+    if (advForm.ban_backoff_multiplier < 1 || advForm.ban_backoff_multiplier > 16) {
+      setAdvError('Ban backoff multiplier must be between 1 and 16.');
+      setAdvSaving(false);
+      return;
+    }
+    try {
+      const res = await api.updateConfig({
+        decompress_inspect: advForm.decompress_inspect,
+        decompress_ratio_cap: advForm.decompress_ratio_cap,
+        ban_backoff_enabled: advForm.ban_backoff_enabled,
+        ban_backoff_multiplier: advForm.ban_backoff_multiplier,
+        ban_backoff_window_sec: advForm.ban_backoff_window_sec,
+        max_ban_duration_sec: advForm.max_ban_duration_sec,
+        per_rule_counters: advForm.per_rule_counters,
+        block_threshold: advForm.block_threshold,
+        rate_limit_rps: advForm.rate_limit_rps,
+        rate_limit_burst: advForm.rate_limit_burst,
+      } as Parameters<typeof api.updateConfig>[0]);
+      if (res) {
+        setAdvSaved(true);
+        setTimeout(() => setAdvSaved(false), 1500);
+      } else {
+        setAdvError('Save failed — check /api/errors or the daemon log.');
+      }
+    } catch (err) {
+      setAdvError(err instanceof Error ? err.message : 'Save failed.');
+    } finally {
+      setAdvSaving(false);
     }
   };
 
@@ -287,6 +370,159 @@ export default function SettingsPage() {
               className="flex items-center gap-1.5 px-4 py-2 rounded-md bg-waf-orange text-white text-sm font-medium hover:bg-orange-600 transition-colors disabled:opacity-50">
               <Save className="w-4 h-4" /> {engineSaved ? 'Saved' : 'Save engine settings'}
             </button>
+          </div>
+        </div>
+      </motion.div>
+
+      {/* Advanced hardening: decompression, expo-ban, per-rule counters, thresholds. */}
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
+        <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2">
+          <Gauge className="w-4 h-4 text-waf-orange" /> Advanced Hardening
+        </h3>
+        <div className="space-y-4">
+          <label className="flex items-start gap-2 cursor-pointer p-3 rounded-lg bg-waf-elevated border border-waf-border">
+            <input
+              type="checkbox"
+              checked={advForm.decompress_inspect}
+              onChange={(e) => setAdvForm((f) => ({ ...f, decompress_inspect: e.target.checked }))}
+              className="mt-0.5 accent-waf-orange"
+            />
+            <div>
+              <div className="text-sm text-waf-text font-medium">Decompression inspection</div>
+              <p className="text-[11px] text-waf-dim mt-0.5">
+                Decompress gzip / brotli request bodies into a ratio-capped buffer so a
+                zip bomb can't sail past <code>max_body_bytes</code>. Rejects payloads
+                whose decompressed size exceeds the ratio cap.
+              </p>
+            </div>
+          </label>
+
+          <div>
+            <label className="text-xs text-waf-muted mb-1 block">
+              Decompression ratio cap — decompressed ÷ compressed
+            </label>
+            <input
+              type="number"
+              min={10}
+              max={10000}
+              value={advForm.decompress_ratio_cap}
+              disabled={!advForm.decompress_inspect}
+              onChange={(e) => setAdvForm((f) => ({ ...f, decompress_ratio_cap: Math.max(10, Math.min(10000, Number(e.target.value) || 100)) }))}
+              className="w-32 bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange disabled:opacity-50"
+            />
+            <p className="text-[10px] text-waf-dim mt-1">
+              100 is the safe default — real traffic tops out around 10-20×. Lower for stricter,
+              higher only if you have legitimate highly-compressible payloads.
+            </p>
+          </div>
+
+          <label className="flex items-start gap-2 cursor-pointer p-3 rounded-lg bg-waf-elevated border border-waf-border">
+            <input
+              type="checkbox"
+              checked={advForm.ban_backoff_enabled}
+              onChange={(e) => setAdvForm((f) => ({ ...f, ban_backoff_enabled: e.target.checked }))}
+              className="mt-0.5 accent-waf-orange"
+            />
+            <div>
+              <div className="text-sm text-waf-text font-medium">Exponential-backoff bans</div>
+              <p className="text-[11px] text-waf-dim mt-0.5">
+                Repeat offenders inside the backoff window get longer bans (multiplied each time).
+                Capped at Max ban duration so it can't run away.
+              </p>
+            </div>
+          </label>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <label className="text-xs text-waf-muted mb-1 block">Multiplier</label>
+              <input
+                type="number" min={1} max={16}
+                value={advForm.ban_backoff_multiplier}
+                disabled={!advForm.ban_backoff_enabled}
+                onChange={(e) => setAdvForm((f) => ({ ...f, ban_backoff_multiplier: Math.max(1, Math.min(16, Number(e.target.value) || 2)) }))}
+                className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange disabled:opacity-50"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-waf-muted mb-1 block">Window (seconds)</label>
+              <input
+                type="number" min={60}
+                value={advForm.ban_backoff_window_sec}
+                disabled={!advForm.ban_backoff_enabled}
+                onChange={(e) => setAdvForm((f) => ({ ...f, ban_backoff_window_sec: Math.max(60, Number(e.target.value) || 86400) }))}
+                className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange disabled:opacity-50"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-waf-muted mb-1 block">Max ban (seconds)</label>
+              <input
+                type="number" min={60}
+                value={advForm.max_ban_duration_sec}
+                disabled={!advForm.ban_backoff_enabled}
+                onChange={(e) => setAdvForm((f) => ({ ...f, max_ban_duration_sec: Math.max(60, Number(e.target.value) || 604800) }))}
+                className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange disabled:opacity-50"
+              />
+            </div>
+          </div>
+
+          <label className="flex items-start gap-2 cursor-pointer p-3 rounded-lg bg-waf-elevated border border-waf-border">
+            <input
+              type="checkbox"
+              checked={advForm.per_rule_counters}
+              onChange={(e) => setAdvForm((f) => ({ ...f, per_rule_counters: e.target.checked }))}
+              className="mt-0.5 accent-waf-orange"
+            />
+            <div>
+              <div className="text-sm text-waf-text font-medium">Per-rule match counters</div>
+              <p className="text-[11px] text-waf-dim mt-0.5">
+                Count matches per rule ID. Visible under /api/rules/counters, in the Rules page's
+                "Noisiest rules" widget, and in Prometheus as <code>wewaf_rule_matches_total</code>.
+              </p>
+            </div>
+          </label>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <label className="text-xs text-waf-muted mb-1 block">Block threshold (score)</label>
+              <input
+                type="number" min={10} max={1000}
+                value={advForm.block_threshold}
+                onChange={(e) => setAdvForm((f) => ({ ...f, block_threshold: Math.max(10, Math.min(1000, Number(e.target.value) || 100)) }))}
+                className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-waf-muted mb-1 block">Rate limit RPS</label>
+              <input
+                type="number" min={1}
+                value={advForm.rate_limit_rps}
+                onChange={(e) => setAdvForm((f) => ({ ...f, rate_limit_rps: Math.max(1, Number(e.target.value) || 100) }))}
+                className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-waf-muted mb-1 block">Rate limit burst</label>
+              <input
+                type="number" min={1}
+                value={advForm.rate_limit_burst}
+                onChange={(e) => setAdvForm((f) => ({ ...f, rate_limit_burst: Math.max(1, Number(e.target.value) || 150) }))}
+                className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange"
+              />
+            </div>
+          </div>
+
+          {advError && (
+            <div className="p-2.5 rounded bg-red-500/10 border border-red-500/30 text-xs text-red-400">{advError}</div>
+          )}
+
+          <div className="flex items-center gap-3">
+            <button onClick={saveAdvanced} disabled={advSaving}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-md bg-waf-orange text-white text-sm font-medium hover:bg-orange-600 transition-colors disabled:opacity-50">
+              <Save className="w-4 h-4" /> {advSaved ? 'Saved' : 'Save advanced settings'}
+            </button>
+            <p className="text-[10px] text-waf-dim">
+              Prometheus scrape target: <code>http://&lt;admin&gt;/metrics</code>
+            </p>
           </div>
         </div>
       </motion.div>

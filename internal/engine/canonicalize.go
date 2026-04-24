@@ -116,39 +116,36 @@ func isASCII(s string) bool {
 // homoglyphMap is a conservative subset of the Unicode confusables that are
 // commonly used to bypass WAF string matching. We keep it small and ASCII-
 // only on the right side so mapped strings remain regex-compatible.
+//
+// Fullwidth punctuation (／ ＼ ＜ ＞ etc.) is NOT in this map because NFKC
+// normalisation — applied earlier in Canonicalize — already collapses
+// them to ASCII. Only code points NFKC leaves alone belong here.
 var homoglyphMap = map[rune]rune{
 	// Cyrillic lookalikes
-	'а': 'a', // а
-	'е': 'e', // е
-	'о': 'o', // о
-	'р': 'p', // р
-	'с': 'c', // с
-	'у': 'y', // у
-	'х': 'x', // х
-	'Ѕ': 'S', // Ѕ
-	'І': 'I', // І
-	'Ј': 'J', // Ј
+	'а': 'a',
+	'е': 'e',
+	'о': 'o',
+	'р': 'p',
+	'с': 'c',
+	'у': 'y',
+	'х': 'x',
+	'Ѕ': 'S',
+	'І': 'I',
+	'Ј': 'J',
 	// Greek lookalikes
-	'Α': 'A', // Α
-	'Β': 'B', // Β
-	'Ε': 'E', // Ε
-	'Ζ': 'Z', // Ζ
-	'Η': 'H', // Η
-	'Κ': 'K', // Κ
-	'Μ': 'M', // Μ
-	'Ν': 'N', // Ν
-	'Ο': 'O', // Ο
-	'Ρ': 'P', // Ρ
-	'Τ': 'T', // Τ
-	'Χ': 'X', // Χ
-	'ο': 'o', // ο
-	// Fullwidth punctuation frequently smuggled into URLs
-	'／': '/', // ／
-	'＼': '\\',
-	'＜': '<', // ＜
-	'＞': '>', // ＞
-	'＇': '\'',
-	'＂': '"',
+	'Α': 'A',
+	'Β': 'B',
+	'Ε': 'E',
+	'Ζ': 'Z',
+	'Η': 'H',
+	'Κ': 'K',
+	'Μ': 'M',
+	'Ν': 'N',
+	'Ο': 'O',
+	'Ρ': 'P',
+	'Τ': 'T',
+	'Χ': 'X',
+	'ο': 'o',
 }
 
 // HasObfuscatedTransferEncoding returns true if a Transfer-Encoding header
@@ -174,8 +171,11 @@ func HasObfuscatedTransferEncoding(values []string) bool {
 		}
 		// Any unrecognised encoding on a request path smells suspicious.
 		switch v {
-		case "gzip, chunked", "chunked, gzip", "deflate, chunked", "chunked, deflate":
-			// Legitimate combinations.
+		case "gzip, chunked", "chunked, gzip",
+			"deflate, chunked", "chunked, deflate",
+			"identity, chunked", "chunked, identity",
+			"br, chunked", "chunked, br":
+			// Legitimate combinations per RFC 9112 §7.1.
 		default:
 			if strings.Contains(v, "chunked") {
 				return true

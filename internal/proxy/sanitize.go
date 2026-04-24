@@ -21,7 +21,20 @@ import (
 // ratioCap: max allowed (decompressed / compressed) ratio. 100 is a
 // conservative default — real gzip compression ratios top out around 10-20.
 // maxBytes: absolute decompressed-size cap.
+//
+// This function is defensive: any panic from a malformed stream is caught
+// and converted to a reject reason, so a hostile payload can't crash the
+// proxy. Integer overflow on the limit calculation is also guarded.
 func maybeDecompressBody(headers map[string][]string, body []byte, ratioCap int, maxBytes int64) (decoded []byte, rejectReason string) {
+	defer func() {
+		if r := recover(); r != nil {
+			// Brotli/gzip readers occasionally panic on crafted input. Treat
+			// this as a bomb rather than letting the daemon crash.
+			decoded = nil
+			rejectReason = fmt.Sprintf("decompress panic: %v", r)
+		}
+	}()
+
 	if len(body) == 0 {
 		return nil, ""
 	}
@@ -35,9 +48,24 @@ func maybeDecompressBody(headers map[string][]string, body []byte, ratioCap int,
 	if maxBytes <= 0 {
 		maxBytes = 64 * 1024 * 1024
 	}
-	limit := int64(len(body)) * int64(ratioCap)
-	if limit > maxBytes {
+	// Overflow-safe limit: len(body) * ratioCap can overflow int64 for a
+	// 100 MB body and cap=100, but only if someone set maxBytes absurdly
+	// high. Saturate at maxBytes / math.MaxInt64 instead of wrapping.
+	var limit int64
+	bodyLen := int64(len(body))
+	if bodyLen > 0 && int64(ratioCap) > maxBytes/bodyLen {
 		limit = maxBytes
+	} else {
+		limit = bodyLen * int64(ratioCap)
+		if limit > maxBytes {
+			limit = maxBytes
+		}
+	}
+	if limit < 1024 {
+		// A cap under 1 KiB is useless and likely a misconfiguration. Raise
+		// to a floor so legitimate small payloads still decode. 1 KiB is
+		// well under anything real and well over anything empty.
+		limit = 1024
 	}
 
 	var r io.ReadCloser
@@ -50,23 +78,29 @@ func maybeDecompressBody(headers map[string][]string, body []byte, ratioCap int,
 		}
 	case enc == "br":
 		r = io.NopCloser(brotli.NewReader(bytes.NewReader(body)))
+	case enc == "deflate":
+		// RFC 7230 says deflate may be raw deflate or zlib-wrapped; most
+		// servers emit zlib. Leave unhandled rather than guess wrong — the
+		// caller will simply inspect the compressed bytes.
+		return nil, ""
 	default:
-		// Unknown encoding — leave to caller.
+		// Multi-value (e.g. "gzip, br") or unknown encoding — let the caller
+		// fall back to raw body rather than risk a wrong decode.
 		return nil, ""
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
-	buf := make([]byte, 0, minInt64(limit, 1<<15))
 	// Read one byte past the limit so the caller can detect overflow.
-	n, err := io.ReadAll(io.LimitReader(r, limit+1))
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return nil, fmt.Sprintf("decompress: %v", err)
+	decompressed, readErr := io.ReadAll(io.LimitReader(r, limit+1))
+	// ErrUnexpectedEOF on a truncated stream is still useful — we got some
+	// prefix, hand it to the engine for inspection rather than bailing.
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return nil, fmt.Sprintf("decompress: %v", readErr)
 	}
-	if int64(len(n)) > limit {
+	if int64(len(decompressed)) > limit {
 		return nil, "decompression ratio exceeded"
 	}
-	buf = append(buf, n...)
-	return buf, ""
+	return decompressed, ""
 }
 
 func firstHeader(h map[string][]string, key string) string {
@@ -83,9 +117,3 @@ func firstHeader(h map[string][]string, key string) string {
 	return ""
 }
 
-func minInt64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
-}

@@ -484,8 +484,19 @@ export const api = {
     shaper_enabled?: boolean;
     shaper_max_rps?: number;
     shaper_burst?: number;
+    decompress_inspect?: boolean;
+    decompress_ratio_cap?: number;
+    ban_backoff_enabled?: boolean;
+    ban_backoff_multiplier?: number;
+    ban_backoff_window_sec?: number;
+    max_ban_duration_sec?: number;
+    per_rule_counters?: boolean;
+    block_threshold?: number;
+    rate_limit_rps?: number;
+    rate_limit_burst?: number;
   }) =>
     post<ConfigResponse & { status: string }>('/config', payload),
+  getRuleCounters: () => get<{ counters: Record<string, number> }>('/rules/counters'),
   getBlocks: () => get<BlocksResponse>('/blocks'),
   getTraffic: () => get<TrafficPoint[]>('/traffic'),
   getRules: () => get<RulesResponse>('/rules'),

@@ -64,17 +64,32 @@ func (d *Detector) Record(key string) int {
 	now := time.Now().UTC()
 	e, ok := d.entries[key]
 	if !ok {
-		// Bounded random-drop eviction: walking the full map under the write
-		// lock to find "oldest" was O(n) at 100 000 entries and caused self-
-		// DoS under rotating-IP login floods. Go's map iteration is randomised,
-		// so dropping the first few entries is an unbiased sample.
+		// Two-phase eviction: first drop entries whose latest attempt is
+		// outside the window (they were going to be swept anyway); if that
+		// didn't free enough, random-drop a larger sample. Scaling the
+		// budget to ~1% of capacity means 1000 drops per overflow, which
+		// covers sustained rotating-IP floods without stalling the lock
+		// (each delete is O(1) on Go's map).
 		if len(d.entries) >= maxEntries {
-			dropBudget := 64
-			for k := range d.entries {
-				delete(d.entries, k)
-				dropBudget--
-				if dropBudget <= 0 {
+			cutoff := now.Add(-d.window)
+			scanBudget := 256
+			for k, e := range d.entries {
+				if len(e.attempts) == 0 || e.attempts[len(e.attempts)-1].Before(cutoff) {
+					delete(d.entries, k)
+				}
+				scanBudget--
+				if scanBudget <= 0 {
 					break
+				}
+			}
+			if len(d.entries) >= maxEntries {
+				dropBudget := maxEntries / 100 // 1%
+				for k := range d.entries {
+					delete(d.entries, k)
+					dropBudget--
+					if dropBudget <= 0 {
+						break
+					}
 				}
 			}
 		}

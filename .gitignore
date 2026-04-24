@@ -10,6 +10,14 @@
 
 # Runtime artefacts — rotating history DBs and local log file.
 /history/
+/history_*/
+/config_backup/
 *.log
 *.bak
+config.smoke.json
+
+# Tests are kept local only (not shipped in the branch).
+*_test.go
+/tests/
+
 

@@ -92,20 +92,21 @@ func (s *seekableBody) Close() error { return nil }
 // body so Phase-4 can hand the full stream back to the proxy. The underlying
 // io.NopCloser+io.MultiReader idiom dropped the upstream Close, leaking the
 // backend connection whenever a client disconnected before reading the tail.
-// Close here propagates to the original body exactly once.
+// Close here propagates to the original body exactly once — `closed` is an
+// atomic.Bool so a handler that calls Close from a goroutine different from
+// the reader can't double-close.
 type multiReadCloser struct {
 	reader io.Reader
 	closer io.Closer
-	closed bool
+	closed atomic.Bool
 }
 
 func (m *multiReadCloser) Read(p []byte) (int, error) { return m.reader.Read(p) }
 
 func (m *multiReadCloser) Close() error {
-	if m.closed {
+	if !m.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	m.closed = true
 	if m.closer == nil {
 		return nil
 	}
@@ -292,11 +293,13 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	semaStart := time.Now()
 	if err := wp.sema.Acquire(r.Context()); err != nil {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	defer wp.sema.Release()
+	semaWait := time.Since(semaStart)
 
 	clientIP := getClientIP(r, wp.cfg.TrustXFF)
 
@@ -411,7 +414,16 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// hid it from the detector because the read itself completed fast
 		// once we called io.ReadAll. The detector gates on SlowMinAge (10 s)
 		// to avoid flagging legitimate slow clients with tiny payloads.
-		if wp.ddos.RecordSlowRead(len(body), time.Since(start)) {
+		//
+		// We subtract `semaWait` so a congested WAF parking this request in
+		// the semaphore queue doesn't make its own backlog look like a
+		// Slowloris: the detector would otherwise flag legitimate small
+		// POSTs during a concurrency-limit spike.
+		slowAge := time.Since(start) - semaWait
+		if slowAge < 0 {
+			slowAge = 0
+		}
+		if wp.ddos.RecordSlowRead(len(body), slowAge) {
 			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-SLOW-READ",
 				"slow body read", 0)
 			http.Error(w, "Request Timeout", http.StatusRequestTimeout)

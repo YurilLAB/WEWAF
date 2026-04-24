@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"sync/atomic"
 )
 
@@ -135,7 +136,19 @@ type Config struct {
 	MaxBanDurationSec       int  `json:"max_ban_duration_sec"`
 
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
+	// mu protects runtime mutation of any non-atomic field (admin API POST
+	// /api/config edits, config watcher hot-reloads). Snapshot() takes an
+	// RLock to produce a torn-read-free copy.
+	mu sync.RWMutex
 }
+
+// Lock / Unlock are exposed for callers that need to mutate multiple fields
+// atomically (the admin API handler, the hot-reload watcher). Snapshot uses
+// RLock internally. Most readers should prefer Snapshot().
+func (c *Config) Lock()    { c.mu.Lock() }
+func (c *Config) Unlock()  { c.mu.Unlock() }
+func (c *Config) RLock()   { c.mu.RLock() }
+func (c *Config) RUnlock() { c.mu.RUnlock() }
 
 // Default returns a safe baseline configuration.
 func Default() *Config {
@@ -386,8 +399,11 @@ func (c *Config) Validate() error {
 }
 
 // Snapshot returns a pointer to a shallow copy for safe read-only access.
-// Do not modify the returned value.
+// Do not modify the returned value. Takes an RLock so concurrent writers
+// (admin API, hot-reload) can't produce a torn read of int64 / slice fields.
 func (c *Config) Snapshot() *Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	cp := &Config{
 		ListenAddr:               c.ListenAddr,
 		AdminAddr:                c.AdminAddr,

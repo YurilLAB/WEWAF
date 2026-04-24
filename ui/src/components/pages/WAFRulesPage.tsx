@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Shield, Search, FileText } from 'lucide-react';
+import { Shield, Search, FileText, TrendingUp } from 'lucide-react';
 import { api } from '../../services/api';
 import type { CompiledRule } from '../../services/api';
 
@@ -71,18 +71,42 @@ export default function WAFRulesPage() {
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState<Category>('All');
   const [loading, setLoading] = useState(true);
+  const [counters, setCounters] = useState<Record<string, number>>({});
 
   useEffect(() => {
+    let cancelled = false;
     setLoading(true);
     api.getRules().then((data) => {
-      if (data?.rules) {
-        setRules(data.rules);
-      } else {
-        setRules([]);
-      }
+      if (cancelled) return;
+      setRules(data?.rules ?? []);
+      setLoading(false);
+    }).catch(() => {
+      if (cancelled) return;
+      setRules([]);
       setLoading(false);
     });
+    // Kick off an initial counter fetch and then refresh every 10 s.
+    const loadCounters = () => {
+      api.getRuleCounters().then((resp) => {
+        if (cancelled) return;
+        setCounters(resp?.counters ?? {});
+      }).catch(() => {
+        // Degrade silently — the hits column will just be missing.
+      });
+    };
+    loadCounters();
+    const interval = window.setInterval(loadCounters, 10000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
   }, []);
+
+  const topNoisy = useMemo(() => {
+    const entries = Object.entries(counters);
+    entries.sort((a, b) => b[1] - a[1]);
+    return entries.slice(0, 5);
+  }, [counters]);
 
   const filtered = useMemo(() => {
     return rules.filter((rule) => {
@@ -139,6 +163,24 @@ export default function WAFRulesPage() {
 
       <p className="text-waf-dim text-xs lg:text-sm">Browse and filter WAF detection rules served by the backend.</p>
 
+      {topNoisy.length > 0 && (
+        <div className="bg-waf-panel border border-waf-border rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <TrendingUp className="w-4 h-4 text-waf-orange" />
+            <h3 className="text-sm font-semibold text-waf-text">Noisiest rules (live)</h3>
+            <span className="text-[10px] text-waf-dim ml-auto">updates every 10s</span>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+            {topNoisy.map(([id, n]) => (
+              <div key={id} className="bg-waf-elevated rounded-lg px-3 py-2">
+                <p className="text-[10px] text-waf-dim font-mono truncate">{id}</p>
+                <p className="text-lg font-bold text-waf-orange tabular-nums">{n.toLocaleString()}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row gap-3">
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-waf-dim" />
@@ -192,6 +234,7 @@ export default function WAFRulesPage() {
                   <th className="px-4 py-3 hidden md:table-cell">Phase</th>
                   <th className="px-4 py-3">Action</th>
                   <th className="px-4 py-3 hidden sm:table-cell">Score</th>
+                  <th className="px-4 py-3 hidden sm:table-cell">Hits</th>
                   <th className="px-4 py-3 hidden lg:table-cell">Description</th>
                 </tr>
               </thead>
@@ -218,6 +261,14 @@ export default function WAFRulesPage() {
                       </span>
                     </td>
                     <td className="px-4 py-3 text-xs text-waf-dim hidden sm:table-cell">{rule.score}</td>
+                    <td className="px-4 py-3 text-xs hidden sm:table-cell tabular-nums">
+                      {(() => {
+                        const n = counters[rule.id] ?? 0;
+                        if (n === 0) return <span className="text-waf-dim">—</span>;
+                        const cls = n > 100 ? 'text-waf-orange font-semibold' : 'text-waf-muted';
+                        return <span className={cls}>{n.toLocaleString()}</span>;
+                      })()}
+                    </td>
                     <td className="px-4 py-3 text-xs text-waf-dim hidden lg:table-cell max-w-xs truncate">{rule.description}</td>
                   </motion.tr>
                 ))}

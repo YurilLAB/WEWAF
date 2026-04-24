@@ -311,17 +311,12 @@ func main() {
 			ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout:       120 * time.Second,
 		}
-		go func() {
-			defer func() {
-				if rec := recover(); rec != nil {
-					log.Printf("egress server panic: %v", rec)
-				}
-			}()
+		core.SafeGo("egress-server", func() {
 			log.Printf("egress proxy listening on http://%s", cfg.EgressAddr)
 			if err := egressServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 				log.Printf("egress server error: %v", err)
 			}
-		}()
+		})
 	}
 
 	stopSampler := startTrafficSampler(metrics)
@@ -331,24 +326,14 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				log.Printf("admin server panic: %v", rec)
-			}
-		}()
+	core.SafeGo("admin-server", func() {
 		log.Printf("admin dashboard listening on http://%s", cfg.AdminAddr)
 		if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("admin server error: %v", err)
 		}
-	}()
+	})
 
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				log.Printf("proxy server panic: %v", rec)
-			}
-		}()
+	core.SafeGo("proxy-server", func() {
 		log.Printf("WAF proxy listening on http://%s -> %s", cfg.ListenAddr, cfg.BackendURL)
 		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("proxy server error: %v", err)
@@ -359,15 +344,10 @@ func main() {
 			default:
 			}
 		}
-	}()
+	})
 
 	if cfg.MeshEnabled {
-		go func() {
-			defer func() {
-				if rec := recover(); rec != nil {
-					log.Printf("mesh gossip panic: %v", rec)
-				}
-			}()
+		core.SafeGo("mesh-gossip", func() {
 			interval := time.Duration(cfg.MeshGossipIntervalSec) * time.Second
 			if interval <= 0 {
 				interval = 60 * time.Second
@@ -474,7 +454,7 @@ func main() {
 					return
 				}
 			}
-		}()
+		})
 	}
 
 	<-sigCh
