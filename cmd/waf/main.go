@@ -150,14 +150,17 @@ func main() {
 	defer stopBanCleanup()
 
 	admin := web.NewServer(web.Deps{
-		Config:     cfg,
-		Metrics:    metrics,
-		RulesFn:    rulesFn,
-		BanList:    banList,
-		Host:       hostCollector,
-		Connection: connMgr,
-		SSL:        sslMgr,
-		History:    historyStore,
+		Config:      cfg,
+		Metrics:     metrics,
+		RulesFn:     rulesFn,
+		BanList:     banList,
+		Host:        hostCollector,
+		Connection:  connMgr,
+		SSL:         sslMgr,
+		History:     historyStore,
+		MeshEnabled: cfg.MeshEnabled,
+		MeshPeers:   cfg.MeshPeers,
+		MeshAPIKey:  cfg.MeshAPIKey,
 	})
 	adminMux := http.NewServeMux()
 	admin.RegisterRoutes(adminMux)
@@ -173,6 +176,28 @@ func main() {
 		Handler:      wp,
 		ReadTimeout:  time.Duration(cfg.ReadTimeoutSec) * time.Second,
 		WriteTimeout: time.Duration(cfg.WriteTimeoutSec) * time.Second,
+	}
+
+	var egressServer *http.Server
+	if cfg.EgressEnabled {
+		ep := proxy.NewEgressProxy(cfg, eng, metrics, banList)
+		egressServer = &http.Server{
+			Addr:         cfg.EgressAddr,
+			Handler:      ep,
+			ReadTimeout:  time.Duration(cfg.ReadTimeoutSec) * time.Second,
+			WriteTimeout: time.Duration(cfg.WriteTimeoutSec) * time.Second,
+		}
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("egress server panic: %v", rec)
+				}
+			}()
+			log.Printf("egress proxy listening on http://%s", cfg.EgressAddr)
+			if err := egressServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("egress server error: %v", err)
+			}
+		}()
 	}
 
 	stopSampler := startTrafficSampler(metrics)
@@ -216,6 +241,11 @@ func main() {
 	}
 	if err := proxyServer.Shutdown(shutdownCtx); err != nil {
 		log.Printf("proxy server shutdown error: %v", err)
+	}
+	if egressServer != nil {
+		if err := egressServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("egress server shutdown error: %v", err)
+		}
 	}
 	stopSampler()
 	log.Println("WEWaf stopped")

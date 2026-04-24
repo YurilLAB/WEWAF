@@ -48,6 +48,23 @@ type Config struct {
 	HistoryBufferSize   int    `json:"history_buffer_size"`   // default 4096
 	HistoryFlushSeconds int    `json:"history_flush_seconds"` // default 2
 
+	// Egress proxy settings
+	EgressEnabled         bool     `json:"egress_enabled"`
+	EgressAddr            string   `json:"egress_addr"`
+	EgressAllowlist       []string `json:"egress_allowlist"`
+	EgressBlockPrivateIPs bool     `json:"egress_block_private_ips"`
+	EgressMaxBodyBytes    int64    `json:"egress_max_body_bytes"`
+
+	// Distributed threat mesh
+	MeshEnabled           bool     `json:"mesh_enabled"`
+	MeshPeers             []string `json:"mesh_peers"`
+	MeshGossipIntervalSec int      `json:"mesh_gossip_interval_sec"`
+	MeshAPIKey            string   `json:"mesh_api_key"`
+	MeshSyncTimeoutSec    int      `json:"mesh_sync_timeout_sec"`
+
+	// Response hardening
+	SecurityHeadersEnabled bool `json:"security_headers_enabled"`
+
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 }
 
@@ -80,6 +97,16 @@ func Default() *Config {
 		HistoryRotateHours:       168, // 7 days
 		HistoryBufferSize:        4096,
 		HistoryFlushSeconds:      2,
+		EgressEnabled:            false,
+		EgressAddr:               ":8081",
+		EgressAllowlist:          []string{},
+		EgressBlockPrivateIPs:    true,
+		EgressMaxBodyBytes:       10 * 1024 * 1024,
+		MeshEnabled:              false,
+		MeshPeers:                []string{},
+		MeshGossipIntervalSec:    60,
+		MeshSyncTimeoutSec:       10,
+		SecurityHeadersEnabled:   true,
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -149,6 +176,18 @@ func (c *Config) Validate() error {
 	if c.HistoryFlushSeconds <= 0 {
 		c.HistoryFlushSeconds = 2
 	}
+	if c.EgressAddr == "" {
+		c.EgressAddr = ":8081"
+	}
+	if c.EgressMaxBodyBytes <= 0 {
+		c.EgressMaxBodyBytes = 10 * 1024 * 1024
+	}
+	if c.MeshGossipIntervalSec <= 0 {
+		c.MeshGossipIntervalSec = 60
+	}
+	if c.MeshSyncTimeoutSec <= 0 {
+		c.MeshSyncTimeoutSec = 10
+	}
 	return nil
 }
 
@@ -182,8 +221,21 @@ func (c *Config) Snapshot() *Config {
 		HistoryRotateHours:       c.HistoryRotateHours,
 		HistoryBufferSize:        c.HistoryBufferSize,
 		HistoryFlushSeconds:      c.HistoryFlushSeconds,
+		EgressEnabled:            c.EgressEnabled,
+		EgressAddr:               c.EgressAddr,
+		EgressAllowlist:          make([]string, len(c.EgressAllowlist)),
+		EgressBlockPrivateIPs:    c.EgressBlockPrivateIPs,
+		EgressMaxBodyBytes:       c.EgressMaxBodyBytes,
+		MeshEnabled:              c.MeshEnabled,
+		MeshPeers:                make([]string, len(c.MeshPeers)),
+		MeshGossipIntervalSec:    c.MeshGossipIntervalSec,
+		MeshAPIKey:               c.MeshAPIKey,
+		MeshSyncTimeoutSec:       c.MeshSyncTimeoutSec,
+		SecurityHeadersEnabled:   c.SecurityHeadersEnabled,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
+	copy(cp.EgressAllowlist, c.EgressAllowlist)
+	copy(cp.MeshPeers, c.MeshPeers)
 	cp.modeAtomic = atomic.Value{}
 	cp.modeAtomic.Store(cp.Mode)
 	return cp

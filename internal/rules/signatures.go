@@ -231,6 +231,12 @@ func DefaultRules() []core.Rule {
 
 		// === Clickjacking / UI Redress ===
 		{ID: "CLICK-001", Name: "Clickjacking Frame Options Bypass", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Clickjacking frame options bypass attempt", Targets: []string{"headers"}, Pattern: `(?i)(X-Frame-Options|Content-Security-Policy|frame-ancestors)`},
+
+		// Egress / Outbound SSRF protection
+		{ID: "EGRESS-001", Name: "SSRF Private IP", Phase: core.PhaseEgressRequest, Score: 100, Action: core.ActionBlock, Description: "Outbound request to private IP range", Targets: []string{"url"}, Pattern: `(?i)(https?://)(127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+|169\.254\.\d+\.\d+|0\.0\.0\.0|localhost|\[::1\]|::1)`},
+		{ID: "EGRESS-002", Name: "SSRF Metadata Endpoint", Phase: core.PhaseEgressRequest, Score: 100, Action: core.ActionBlock, Description: "Outbound request to cloud metadata endpoint", Targets: []string{"url"}, Pattern: `(?i)(169\.254\.169\.254|metadata\.google\.internal|instance-data|metadata\.svc|alibaba\.ecs\.meta)`},
+		{ID: "EGRESS-003", Name: "Suspicious Outbound TLD", Phase: core.PhaseEgressRequest, Score: 50, Action: core.ActionBlock, Description: "Outbound request to suspicious TLD", Targets: []string{"url"}, Pattern: `(?i)\.(tk|ml|ga|cf|top|xyz|bid|loan|men|date|wang|party|review|country|stream|gdn|mom|xin|kim)\b`},
+		{ID: "EGRESS-004", Name: "Data Exfiltration Large Body", Phase: core.PhaseEgressRequest, Score: 30, Action: core.ActionLog, Description: "Outbound request body unusually large", Targets: []string{"body"}, Pattern: `.{50000}`},
 	}
 }
 

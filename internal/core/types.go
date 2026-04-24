@@ -18,6 +18,7 @@ const (
 	PhaseResponseHeaders              // backend response headers
 	PhaseResponseBody                 // backend response body (optional)
 	PhaseLogging                      // after response sent
+	PhaseEgressRequest                // outbound request from backend
 )
 
 func (p Phase) String() string {
@@ -32,6 +33,8 @@ func (p Phase) String() string {
 		return "response_body"
 	case PhaseLogging:
 		return "logging"
+	case PhaseEgressRequest:
+		return "egress_request"
 	default:
 		return "unknown"
 	}

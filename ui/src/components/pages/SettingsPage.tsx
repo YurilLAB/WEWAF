@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Cpu, HardDrive, Bell, Shield, Save, RotateCcw, Database } from 'lucide-react';
-import { useWAF } from '../../store/wafStore';
+import { Cpu, HardDrive, Bell, Shield, Save, RotateCcw, Database, ArrowLeftRight, Network, Lock } from 'lucide-react';
+import { useWAF, type WAFSettings } from '../../store/wafStore';
 import { api } from '../../services/api';
 
 export default function SettingsPage() {
@@ -13,9 +13,38 @@ export default function SettingsPage() {
 
   useEffect(() => {
     api.getConfig().then((cfg) => {
-      if (cfg && cfg.history_rotate_hours) {
-        setForm((prev) => ({ ...prev, historyRotateHours: cfg.history_rotate_hours }));
-        dispatch({ type: 'UPDATE_SETTINGS', payload: { historyRotateHours: cfg.history_rotate_hours } });
+      if (!cfg) return;
+      const updates: Partial<WAFSettings> = {};
+      if (cfg.history_rotate_hours) updates.historyRotateHours = cfg.history_rotate_hours;
+      if (typeof cfg.egress_enabled === 'boolean') updates.egressEnabled = cfg.egress_enabled;
+      if (typeof cfg.egress_addr === 'string') updates.egressAddr = cfg.egress_addr;
+      if (Array.isArray(cfg.egress_allowlist)) updates.egressAllowlist = cfg.egress_allowlist.join(', ');
+      if (typeof cfg.egress_block_private_ips === 'boolean') updates.egressBlockPrivateIPs = cfg.egress_block_private_ips;
+      if (typeof cfg.mesh_enabled === 'boolean') updates.meshEnabled = cfg.mesh_enabled;
+      if (Array.isArray(cfg.mesh_peers)) updates.meshPeers = cfg.mesh_peers.join(', ');
+      if (typeof cfg.mesh_gossip_interval_sec === 'number') updates.meshGossipIntervalSec = cfg.mesh_gossip_interval_sec;
+      if (typeof cfg.mesh_sync_timeout_sec === 'number') updates.meshSyncTimeoutSec = cfg.mesh_sync_timeout_sec;
+      if (typeof cfg.mesh_api_key === 'string') updates.meshAPIKey = cfg.mesh_api_key;
+      if (typeof cfg.security_headers_enabled === 'boolean') updates.securityHeadersEnabled = cfg.security_headers_enabled;
+      if (Object.keys(updates).length > 0) {
+        setForm((prev) => ({ ...prev, ...updates }));
+        dispatch({ type: 'UPDATE_SETTINGS', payload: updates });
+      }
+    });
+  }, [dispatch]);
+
+  useEffect(() => {
+    api.getMeshStatus().then((status) => {
+      if (status) {
+        dispatch({
+          type: 'SET_MESH_STATUS',
+          payload: {
+            enabled: status.enabled,
+            peers: status.peers || [],
+            lastSync: status.last_sync || '',
+            peerCount: status.peer_count || 0,
+          },
+        });
       }
     });
   }, [dispatch]);
@@ -26,14 +55,26 @@ export default function SettingsPage() {
     dispatch({ type: 'SET_SETTINGS', payload: { ...form } });
     // Sync history rotation to backend
     try {
-      const res = await api.updateConfig({ history_rotate_hours: form.historyRotateHours });
-      if (res && res.history_rotate_hours) {
-        dispatch({ type: 'UPDATE_SETTINGS', payload: { historyRotateHours: res.history_rotate_hours } });
+      const res = await api.updateConfig({
+        history_rotate_hours: form.historyRotateHours,
+        egress_enabled: form.egressEnabled,
+        egress_addr: form.egressAddr,
+        egress_allowlist: form.egressAllowlist.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
+        egress_block_private_ips: form.egressBlockPrivateIPs,
+        mesh_enabled: form.meshEnabled,
+        mesh_peers: form.meshPeers.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
+        mesh_gossip_interval_sec: form.meshGossipIntervalSec,
+        mesh_sync_timeout_sec: form.meshSyncTimeoutSec,
+        mesh_api_key: form.meshAPIKey,
+        security_headers_enabled: form.securityHeadersEnabled,
+      });
+      if (res) {
+        dispatch({ type: 'UPDATE_SETTINGS', payload: { ...form } });
       }
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch {
-      setBackendError('Failed to sync rotation setting to backend.');
+      setBackendError('Failed to sync settings to backend.');
     }
   };
 
@@ -199,6 +240,81 @@ export default function SettingsPage() {
             </p>
           </div>
         </div>
+      </motion.div>
+
+      {/* Egress Proxy */}
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.28 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
+        <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2"><ArrowLeftRight className="w-4 h-4 text-waf-orange" /> Egress Proxy</h3>
+        <div className="space-y-4">
+          <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+            <input type="checkbox" checked={form.egressEnabled} onChange={(e) => setForm({ ...form, egressEnabled: e.target.checked })} className="rounded border-waf-border" />
+            Enable egress proxy (inspect outbound traffic from backend)
+          </label>
+          {form.egressEnabled && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="space-y-4 pt-2">
+              <div>
+                <label className="text-xs text-waf-muted mb-1 block">Listen Address</label>
+                <input type="text" value={form.egressAddr} onChange={(e) => setForm({ ...form, egressAddr: e.target.value })} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" placeholder=":8081" />
+                <p className="text-waf-dim text-[10px] mt-1">Backend app should route outbound HTTP through this address.</p>
+              </div>
+              <div>
+                <label className="text-xs text-waf-muted mb-1 block">Allowlist (comma or newline separated)</label>
+                <textarea value={form.egressAllowlist} onChange={(e) => setForm({ ...form, egressAllowlist: e.target.value })} rows={3} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" placeholder="api.stripe.com, api.sendgrid.com" />
+                <p className="text-waf-dim text-[10px] mt-1">If non-empty, only these destinations are allowed. All others are blocked.</p>
+              </div>
+              <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+                <input type="checkbox" checked={form.egressBlockPrivateIPs} onChange={(e) => setForm({ ...form, egressBlockPrivateIPs: e.target.checked })} className="rounded border-waf-border" />
+                Block requests to private IPs / localhost (SSRF protection)
+              </label>
+            </motion.div>
+          )}
+        </div>
+      </motion.div>
+
+      {/* Threat Mesh */}
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.29 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
+        <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2"><Network className="w-4 h-4 text-waf-orange" /> Threat Mesh</h3>
+        <div className="space-y-4">
+          <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+            <input type="checkbox" checked={form.meshEnabled} onChange={(e) => setForm({ ...form, meshEnabled: e.target.checked })} className="rounded border-waf-border" />
+            Enable distributed threat mesh (share bans with peer WAF nodes)
+          </label>
+          {form.meshEnabled && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="space-y-4 pt-2">
+              <div>
+                <label className="text-xs text-waf-muted mb-1 block">Peer URLs (comma or newline separated)</label>
+                <textarea value={form.meshPeers} onChange={(e) => setForm({ ...form, meshPeers: e.target.value })} rows={3} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" placeholder="http://waf-node-2:8443, http://waf-node-3:8443" />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Gossip Interval (sec)</label>
+                  <input type="number" min={10} max={3600} value={form.meshGossipIntervalSec} onChange={(e) => setForm({ ...form, meshGossipIntervalSec: parseInt(e.target.value) || 60 })} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Sync Timeout (sec)</label>
+                  <input type="number" min={1} max={60} value={form.meshSyncTimeoutSec || 10} onChange={(e) => setForm({ ...form, meshSyncTimeoutSec: parseInt(e.target.value) || 10 })} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+              </div>
+              <div>
+                <label className="text-xs text-waf-muted mb-1 block">Mesh API Key</label>
+                <input type="password" value={form.meshAPIKey} onChange={(e) => setForm({ ...form, meshAPIKey: e.target.value })} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" placeholder="shared secret between peers" />
+              </div>
+              <div className="flex items-center gap-2 text-xs text-waf-dim">
+                <Network className="w-3 h-3" />
+                <span>Peers: {state.meshStatus.peerCount} | Last sync: {state.meshStatus.lastSync ? new Date(state.meshStatus.lastSync).toLocaleString() : 'Never'}</span>
+              </div>
+            </motion.div>
+          )}
+        </div>
+      </motion.div>
+
+      {/* Response Hardening */}
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.295 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
+        <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2"><Lock className="w-4 h-4 text-waf-orange" /> Response Hardening</h3>
+        <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+          <input type="checkbox" checked={form.securityHeadersEnabled} onChange={(e) => setForm({ ...form, securityHeadersEnabled: e.target.checked })} className="rounded border-waf-border" />
+          Inject security headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy) and strip Server/X-Powered-By
+        </label>
       </motion.div>
 
       {/* Alerts */}

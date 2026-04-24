@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"strconv"
@@ -36,6 +37,12 @@ type Server struct {
 	connection *connection.Manager
 	ssl        *ssl.Manager
 	history    *history.Store
+
+	meshEnabled  bool
+	meshPeers    []string
+	meshAPIKey   string
+	meshLastSync time.Time
+	meshMu       sync.RWMutex
 }
 
 // Deps wires optional subsystems into the admin server.
@@ -48,6 +55,10 @@ type Deps struct {
 	Connection *connection.Manager
 	SSL        *ssl.Manager
 	History    *history.Store
+
+	MeshEnabled bool
+	MeshPeers   []string
+	MeshAPIKey  string
 }
 
 // NewServer creates the admin web server.
@@ -61,6 +72,10 @@ func NewServer(d Deps) *Server {
 		connection: d.Connection,
 		ssl:        d.SSL,
 		history:    d.History,
+
+		meshEnabled: d.MeshEnabled,
+		meshPeers:   d.MeshPeers,
+		meshAPIKey:  d.MeshAPIKey,
 	}
 }
 
@@ -103,6 +118,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Rate-limit + resource configuration.
 	api.HandleFunc("/api/ratelimit/config", s.handleRateLimitConfig)
+
+	// Distributed threat mesh
+	api.HandleFunc("/api/mesh/status", s.handleMeshStatus)
+	api.HandleFunc("/api/mesh/sync", s.handleMeshSync)
 
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
@@ -212,8 +231,18 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, s.cfg.Snapshot())
 	case http.MethodPost:
 		var payload struct {
-			Mode               string `json:"mode"`
-			HistoryRotateHours int    `json:"history_rotate_hours"`
+			Mode                   string   `json:"mode"`
+			HistoryRotateHours     int      `json:"history_rotate_hours"`
+			EgressEnabled          *bool    `json:"egress_enabled"`
+			EgressAddr             string   `json:"egress_addr"`
+			EgressAllowlist        []string `json:"egress_allowlist"`
+			EgressBlockPrivateIPs  *bool    `json:"egress_block_private_ips"`
+			MeshEnabled            *bool    `json:"mesh_enabled"`
+			MeshPeers              []string `json:"mesh_peers"`
+			MeshGossipIntervalSec  int      `json:"mesh_gossip_interval_sec"`
+			MeshAPIKey             string   `json:"mesh_api_key"`
+			MeshSyncTimeoutSec     int      `json:"mesh_sync_timeout_sec"`
+			SecurityHeadersEnabled *bool    `json:"security_headers_enabled"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -231,6 +260,39 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			if s.history != nil {
 				s.history.SetRotation(time.Duration(payload.HistoryRotateHours) * time.Hour)
 			}
+		}
+		if payload.EgressEnabled != nil {
+			s.cfg.EgressEnabled = *payload.EgressEnabled
+		}
+		if payload.EgressAddr != "" {
+			s.cfg.EgressAddr = payload.EgressAddr
+		}
+		if payload.EgressAllowlist != nil {
+			s.cfg.EgressAllowlist = payload.EgressAllowlist
+		}
+		if payload.EgressBlockPrivateIPs != nil {
+			s.cfg.EgressBlockPrivateIPs = *payload.EgressBlockPrivateIPs
+		}
+		if payload.MeshEnabled != nil {
+			s.cfg.MeshEnabled = *payload.MeshEnabled
+			s.meshEnabled = *payload.MeshEnabled
+		}
+		if payload.MeshPeers != nil {
+			s.cfg.MeshPeers = payload.MeshPeers
+			s.meshPeers = payload.MeshPeers
+		}
+		if payload.MeshGossipIntervalSec > 0 {
+			s.cfg.MeshGossipIntervalSec = payload.MeshGossipIntervalSec
+		}
+		if payload.MeshSyncTimeoutSec > 0 {
+			s.cfg.MeshSyncTimeoutSec = payload.MeshSyncTimeoutSec
+		}
+		if payload.MeshAPIKey != "" {
+			s.cfg.MeshAPIKey = payload.MeshAPIKey
+			s.meshAPIKey = payload.MeshAPIKey
+		}
+		if payload.SecurityHeadersEnabled != nil {
+			s.cfg.SecurityHeadersEnabled = *payload.SecurityHeadersEnabled
 		}
 		writeJSON(w, map[string]interface{}{"status": "ok", "mode": s.cfg.ModeSnapshot(), "history_rotate_hours": s.cfg.HistoryRotateHours})
 	default:
@@ -671,6 +733,67 @@ func clampInt(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+func (s *Server) handleMeshStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.meshMu.RLock()
+	lastSync := s.meshLastSync
+	s.meshMu.RUnlock()
+	writeJSON(w, map[string]interface{}{
+		"enabled":    s.meshEnabled,
+		"peers":      s.meshPeers,
+		"last_sync":  lastSync,
+		"peer_count": len(s.meshPeers),
+	})
+}
+
+func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	// Simple shared-secret auth between peers.
+	if s.meshAPIKey != "" && r.Header.Get("X-Mesh-Key") != s.meshAPIKey {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	var payload struct {
+		Bans []core.BanEntry `json:"bans"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	// Merge incoming bans into local ban list.
+	if s.banList != nil {
+		for _, b := range payload.Bans {
+			if b.IP == "" || stdnet.ParseIP(b.IP) == nil {
+				continue
+			}
+			duration := time.Until(b.ExpiresAt)
+			if duration <= 0 {
+				continue
+			}
+			s.banList.Ban(b.IP, b.Reason, duration)
+		}
+	}
+	s.meshMu.Lock()
+	s.meshLastSync = time.Now().UTC()
+	s.meshMu.Unlock()
+
+	// Return our own active bans.
+	var bans []core.BanEntry
+	if s.banList != nil {
+		bans = s.banList.List()
+	}
+	writeJSON(w, map[string]interface{}{
+		"status": "synced",
+		"bans":   bans,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

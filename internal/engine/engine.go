@@ -141,6 +141,14 @@ func (e *Engine) ProcessResponseBody(tx *core.Transaction, body []byte) *core.In
 	return e.evaluatePhase(tx, core.PhaseResponseBody, targets)
 }
 
+// EvaluateEgress runs the rule set against an outbound (egress) request.
+func (e *Engine) EvaluateEgress(tx *core.Transaction, targets map[string]string) *core.Interruption {
+	if e == nil || tx == nil {
+		return nil
+	}
+	return e.evaluatePhase(tx, core.PhaseEgressRequest, targets)
+}
+
 // LogError proxies an error to the engine logger.
 func (e *Engine) LogError(format string, args ...interface{}) {
 	e.logger.Errorf(format, args...)

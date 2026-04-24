@@ -232,6 +232,21 @@ export interface SSLConfig {
   hsts_max_age: number;
 }
 
+export interface MeshStatusResponse {
+  enabled: boolean;
+  peers: string[];
+  last_sync: string;
+  peer_count: number;
+}
+
+export interface EgressConfigResponse {
+  egress_enabled: boolean;
+  egress_addr: string;
+  egress_allowlist: string[];
+  egress_block_private_ips: boolean;
+  security_headers_enabled: boolean;
+}
+
 // =====================
 // API Functions (all return null on error - no throws)
 // =====================
@@ -243,7 +258,20 @@ export const api = {
   getConfig: () => get<ConfigResponse>('/config'),
   setMode: (mode: 'active' | 'detection' | 'learning') =>
     post<ConfigResponse & { status: string }>('/config', { mode }),
-  updateConfig: (payload: { mode?: string; history_rotate_hours?: number }) =>
+  updateConfig: (payload: {
+    mode?: string;
+    history_rotate_hours?: number;
+    egress_enabled?: boolean;
+    egress_addr?: string;
+    egress_allowlist?: string[];
+    egress_block_private_ips?: boolean;
+    mesh_enabled?: boolean;
+    mesh_peers?: string[];
+    mesh_gossip_interval_sec?: number;
+    mesh_sync_timeout_sec?: number;
+    mesh_api_key?: string;
+    security_headers_enabled?: boolean;
+  }) =>
     post<ConfigResponse & { status: string }>('/config', payload),
   getBlocks: () => get<BlocksResponse>('/blocks'),
   getTraffic: () => get<TrafficPoint[]>('/traffic'),
@@ -274,6 +302,15 @@ export const api = {
   deleteCertificate: (id: string) => del(`/ssl/certificates/${id}`),
   getSSLConfig: () => get<SSLConfig>('/ssl/config'),
   setSSLConfig: (config: Partial<SSLConfig>) => put<SSLConfig>('/ssl/config', config),
+
+  getEgressConfig: () => get<EgressConfigResponse>('/config'),
+  getMeshStatus: () => get<MeshStatusResponse>('/mesh/status'),
+  syncMeshPeer: (peerUrl: string, apiKey: string) =>
+    fetch(`${peerUrl}/api/mesh/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Mesh-Key': apiKey },
+      body: JSON.stringify({}),
+    }).then(r => r.ok ? r.json() : null).catch(() => null),
 };
 
 // Polling helper for real-time data

@@ -274,6 +274,16 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	// Reconstruct full body: inspected prefix + remainder of original stream.
 	res.Body = io.NopCloser(io.MultiReader(bytes.NewReader(inspectBody), res.Body))
 
+	// Inject security headers and strip identifying ones.
+	if wp.cfg.SecurityHeadersEnabled {
+		res.Header.Set("X-Content-Type-Options", "nosniff")
+		res.Header.Set("X-Frame-Options", "DENY")
+		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		res.Header.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+	}
+	res.Header.Del("Server")
+	res.Header.Del("X-Powered-By")
+
 	return nil
 }
 
@@ -484,4 +494,163 @@ func isLoginRequest(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// EgressProxy intercepts outbound HTTP requests from the backend app.
+type EgressProxy struct {
+	cfg     *config.Config
+	eng     *engine.Engine
+	metrics *telemetry.Metrics
+	banList *core.BanList
+	client  *http.Client
+}
+
+// NewEgressProxy creates an egress inspection proxy.
+func NewEgressProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metrics, banList *core.BanList) *EgressProxy {
+	return &EgressProxy{
+		cfg:     cfg,
+		eng:     eng,
+		metrics: metrics,
+		banList: banList,
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+			},
+		},
+	}
+}
+
+func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	defer func() {
+		if rec := recover(); rec != nil {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			if ep.eng != nil {
+				ep.eng.LogError("egress: slow outbound request detected (%v) %s %s", elapsed, r.Method, r.URL.String())
+			}
+		}
+	}()
+
+	if r == nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	// Determine the target URL.
+	var targetURL string
+	if r.Method == http.MethodConnect {
+		targetURL = "https://" + r.Host
+	} else {
+		if r.URL.IsAbs() {
+			targetURL = r.URL.String()
+		} else {
+			targetURL = "http://" + r.Host + r.URL.RequestURI()
+		}
+	}
+
+	// Parse for inspection.
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	// Check allowlist.
+	if len(ep.cfg.EgressAllowlist) > 0 {
+		allowed := false
+		hostLower := strings.ToLower(parsed.Host)
+		for _, a := range ep.cfg.EgressAllowlist {
+			if strings.Contains(hostLower, strings.ToLower(a)) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			http.Error(w, "Forbidden: destination not in egress allowlist", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Block private IPs.
+	if ep.cfg.EgressBlockPrivateIPs {
+		if isPrivateHost(parsed.Hostname()) {
+			http.Error(w, "Forbidden: private IP destination blocked", http.StatusForbidden)
+			return
+		}
+	}
+
+	// Buffer body for inspection.
+	var body []byte
+	if r.Body != nil {
+		limit := ep.cfg.EgressMaxBodyBytes
+		if limit <= 0 {
+			limit = 10 * 1024 * 1024
+		}
+		limited := io.LimitReader(r.Body, limit)
+		body, _ = io.ReadAll(limited)
+		_ = r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+	}
+
+	// Create a synthetic transaction for egress inspection.
+	tx := core.NewTransaction(w, r, false)
+	tx.SetMetadata("body", body)
+
+	targets := map[string]string{
+		"url":    targetURL,
+		"method": r.Method,
+		"body":   string(body),
+	}
+	for k, v := range r.Header {
+		targets["headers."+k] = strings.Join(v, ", ")
+	}
+
+	if intr := ep.eng.EvaluateEgress(tx, targets); intr != nil {
+		http.Error(w, "Forbidden: egress policy violation", http.StatusForbidden)
+		return
+	}
+
+	// Forward the request.
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	for k, v := range r.Header {
+		outReq.Header[k] = v
+	}
+	if host := parsed.Host; host != "" {
+		outReq.Host = host
+	}
+
+	resp, err := ep.client.Do(outReq)
+	if err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+func isPrivateHost(host string) bool {
+	host = strings.Trim(host, "[]")
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
+	}
+	lower := strings.ToLower(host)
+	return lower == "localhost" || strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal")
 }
