@@ -332,7 +332,15 @@ type parseErr struct{}
 
 func (*parseErr) Error() string { return "invalid integer" }
 
+// matches returns true if the policy's path selector applies to `path`.
+// A policy with NO path selector (all three fields empty) used to match
+// every request, which turned a careless operator's first "save" click
+// into a deny-all outage. Empty-selector policies no longer match anything
+// — operators have to be explicit about scope.
 func (p *Policy) matches(path string) bool {
+	if p.PathExact == "" && p.PathPrefix == "" && p.pathRe == nil {
+		return false
+	}
 	if p.PathExact != "" && path == p.PathExact {
 		return true
 	}
@@ -342,7 +350,7 @@ func (p *Policy) matches(path string) bool {
 	if p.pathRe != nil && p.pathRe.MatchString(path) {
 		return true
 	}
-	return p.PathExact == "" && p.PathPrefix == "" && p.pathRe == nil
+	return false
 }
 
 func anyCIDRContains(nets []*net.IPNet, ip net.IP) bool {

@@ -72,7 +72,11 @@ func DefaultRules() []core.Rule {
 		{ID: "XXE-003", Name: "XXE External Entity", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "External entity SYSTEM/PUBLIC reference", Targets: []string{"body"}, Pattern: `(?i)\b(SYSTEM|PUBLIC)\s+["']`},
 
 		// === LDAP Injection ===
-		{ID: "LDAP-001", Name: "LDAP Meta Characters", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "LDAP special characters in query", Targets: []string{"args", "body"}, Pattern: `(?i)[\*\|&!\x00]`},
+		// LDAP filter syntax requires parenthesised expressions with
+		// attribute=value. The old `[*|&!\x00]` pattern matched any form
+		// post with ampersands. Tightened to require an LDAP-ish filter
+		// shape: (attr=*) or (|(...) or similar.
+		{ID: "LDAP-001", Name: "LDAP Filter Injection", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "LDAP filter syntax in user input", Targets: []string{"args", "body"}, Pattern: `\(\s*[|&!]\s*\(|\(\s*(?:cn|uid|sn|objectClass|userPassword|mail|member|sAMAccountName)\s*=\s*[*]`},
 
 		// === CRLF Injection ===
 		{ID: "CRLF-001", Name: "CRLF Injection", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "CRLF line injection sequence", Targets: []string{"args", "headers", "uri"}, Pattern: `(?i)(%0[dD]%0[aA]|%0[aA]%0[dD]|\r\n)`},
@@ -122,7 +126,10 @@ func DefaultRules() []core.Rule {
 		{ID: "TRAV-001", Name: "Traversal Null Byte", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Null byte in path", Targets: []string{"args", "uri"}, Pattern: `\x00`},
 		{ID: "TRAV-002", Name: "Traversal Dot-Dot-Slash", Phase: core.PhaseRequestHeaders, Score: 75, Action: core.ActionBlock, Description: "Directory traversal sequence", Targets: []string{"args", "uri"}, Pattern: `(?i)(?:(?:\.|%2e|%252e|%c0%ae|%e0%80%ae|%f0%80%80%ae){2}(?:/|\\|%2f|%5c|%252f|%255c|%c0%af|%c1%9c|%e0%80%af|%f0%80%80%af))`},
 		{ID: "TRAV-003", Name: "Traversal PHP Wrapper", Phase: core.PhaseRequestBody, Score: 75, Action: core.ActionBlock, Description: "PHP/file wrapper in parameter", Targets: []string{"args", "body"}, Pattern: `(?i)(file|php|expect|data|input|zip|compress)://`},
-		{ID: "TRAV-004", Name: "Traversal Sensitive File", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Sensitive system file requested", Targets: []string{"args", "uri"}, Pattern: `(?i)(/etc/passwd|boot\.ini|win\.ini|web\.config|\.htaccess|\.env|\.git/)`},
+		// Word boundary on .env so "/static/my.environment.notes.txt" no
+		// longer matches. Similarly anchor .htaccess to either end-of-path
+		// or a slash so we don't false-positive on unrelated text.
+		{ID: "TRAV-004", Name: "Traversal Sensitive File", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Sensitive system file requested", Targets: []string{"args", "uri"}, Pattern: `(?i)(/etc/passwd\b|\bboot\.ini\b|\bwin\.ini\b|\bweb\.config\b|\.htaccess(?:$|/)|\.env(?:$|[/?])|\.git/)`},
 
 		// === JWT / Token Attacks ===
 		{ID: "JWT-001", Name: "JWT Alg None", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "JWT algorithm none attack", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)"alg"\s*:\s*["']?\s*none\s*["']?`},
@@ -241,7 +248,11 @@ func DefaultRules() []core.Rule {
 		// === Bot / Scanner Detection ===
 		{ID: "BOT-002", Name: "Headless Chrome Puppeteer", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "Headless Chrome or Puppeteer User-Agent detected", Targets: []string{"headers"}, Pattern: `(?i)(HeadlessChrome|Puppeteer|PhantomJS)`},
 		{ID: "BOT-003", Name: "Selenium WebDriver", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "Selenium WebDriver signature in headers", Targets: []string{"headers"}, Pattern: `(?i)(Selenium|WebDriver|SeleniumIDE|SeleniumHQ|selenium-wire)`},
-		{ID: "BOT-004", Name: "cURL Client", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "cURL command-line tool detected", Targets: []string{"headers"}, Pattern: `(?i)\bcurl\b`},
+		// Only trigger on the canonical `curl/X.Y.Z` UA form so headers that
+		// mention curl in other contexts (service names, scripts, etc.)
+		// don't constantly fire. curl is a legitimate ops / CI tool, so
+		// this stays at ActionLog and a modest score.
+		{ID: "BOT-004", Name: "cURL User-Agent", Phase: core.PhaseRequestHeaders, Score: 25, Action: core.ActionLog, Description: "curl command-line tool User-Agent", Targets: []string{"headers.User-Agent"}, Pattern: `(?i)^curl/\d`},
 		{ID: "BOT-005", Name: "Wget Client", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Wget command-line tool detected", Targets: []string{"headers"}, Pattern: `(?i)\bwget\b`},
 		{ID: "SCAN-005", Name: "Nmap Scanner", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Nmap scanning tool detected", Targets: []string{"headers"}, Pattern: `(?i)\bnmap\b`},
 		{ID: "SCAN-006", Name: "Nikto Scanner", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Nikto vulnerability scanner detected", Targets: []string{"headers"}, Pattern: `(?i)\bnikto\b`},
@@ -364,7 +375,11 @@ func DefaultRules() []core.Rule {
 		{ID: "RCE-013", Name: "Python one-liner revshell", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Python socket-based reverse shell one-liner", Targets: []string{"args", "body"}, Pattern: `(?i)python.{0,20}-c.{0,50}(?:socket|subprocess).{0,100}(?:connect|dup2)`},
 
 		// --- Request shape anomalies ---
-		{ID: "ANOM-001", Name: "Method with body anomaly", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "GET/HEAD/DELETE with non-zero Content-Length", Targets: []string{"method", "headers.Content-Length"}, Pattern: `^(?:GET|HEAD|DELETE|OPTIONS)$`},
+		// ANOM-001 (GET with body) was removed in 2026-04 — as a pure regex
+		// against the method target it fired on every GET request and flooded
+		// the log. The CRS equivalent uses SecLang chaining across method +
+		// Content-Length headers, which needs engine-level support we don't
+		// have; if the structural check ever lands it should come back.
 		{ID: "ANOM-002", Name: "Long URL", Phase: core.PhaseRequestHeaders, Score: 25, Action: core.ActionLog, Description: "URL longer than 2000 chars — likely fuzzing", Targets: []string{"uri"}, Pattern: `.{1000}.{1000}`},
 		{ID: "ANOM-003", Name: "Null byte in URL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Null byte in URL — parser confusion", Targets: []string{"uri", "path", "args"}, Pattern: `\x00|%00|\\x00|\\u0000`},
 
@@ -445,6 +460,103 @@ func DefaultRules() []core.Rule {
 
 		// Mass-assignment / hidden-field tampering (low severity, log)
 		{ID: "MASSASSIGN-001", Name: "Role/admin mass-assignment", Phase: core.PhaseRequestBody, Category: "app", Score: 50, Action: core.ActionLog, Description: "Suspicious role / is_admin / permission field in body", Targets: []string{"body"}, Pattern: `(?i)(?:^|[&{,"])["']?(?:is_admin|isAdmin|role|role_id|permissions|privilege|superuser|is_staff)["']?\s*[=:]\s*["']?(?:true|1|admin|root|superuser)`},
+
+		// ============================================================
+		// 2025 / 2026 exploits — research-backed
+		// ============================================================
+
+		// CVE-2025-55182 "React2Shell" — React Server Components / Next.js
+		// prototype-pollution RCE through Flight-protocol deserialization.
+		// Exploits pollute Object.prototype.then via "$1:__proto__:then" and
+		// gain Function constructor access through "$1:constructor:constructor".
+		// Trend Micro, Akamai, and Datadog Security Labs document the
+		// payloads; the signature here catches the characteristic
+		// "$N:__proto__:" and "$N:constructor:constructor" tokens in bodies.
+		{ID: "CVE-2025-55182", Name: "React2Shell RSC RCE", Phase: core.PhaseRequestBody, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "React Server Components prototype-pollution RCE (React2Shell)", Targets: []string{"body", "args"}, Pattern: `\$[0-9a-zA-Z]+:(?:__proto__|constructor):(?:then|constructor)\b`},
+		{ID: "CVE-2025-66478", Name: "Next.js RSC RCE (companion)", Phase: core.PhaseRequestBody, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "Next.js RSC deserialization gadget (CVE-2025-66478)", Targets: []string{"body"}, Pattern: `(?i)"\$\d+"\s*:\s*"(?:__proto__|prototype|constructor)"`},
+
+		// CVE-2025-3248 — Langflow /api/v1/validate/code unauthenticated
+		// Python RCE via exec() on user-supplied AST. Detects the vulnerable
+		// path, and the decorator-based / default-argument payload shapes
+		// documented by Zscaler ThreatLabz and Trend Micro.
+		{ID: "CVE-2025-3248", Name: "Langflow validate/code RCE", Phase: core.PhaseRequestHeaders, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "Langflow /api/v1/validate/code endpoint abuse (CVE-2025-3248)", Targets: []string{"uri", "path"}, Pattern: `(?i)/api/v1/validate/code\b`},
+		{ID: "CVE-2025-3248-B", Name: "Langflow exec payload", Phase: core.PhaseRequestBody, Category: "cve.2025", Score: 90, Action: core.ActionBlock, Description: "Python exec()/subprocess gadget in validate/code body", Targets: []string{"body"}, Pattern: `(?i)@\s*(?:exec|eval|compile|subprocess\.(?:check_output|run|Popen|call))\s*\(|def\s+\w+\s*\([^)]*=\s*(?:exec|eval|subprocess\.|__import__)\s*\(`},
+
+		// CVE-2026-39987 — Marimo /terminal/ws pre-auth websocket RCE.
+		// Exploited within 10 hours of disclosure per CISA KEV.
+		{ID: "CVE-2026-39987", Name: "Marimo /terminal/ws pre-auth RCE", Phase: core.PhaseRequestHeaders, Category: "cve.2026", Score: 100, Action: core.ActionBlock, Description: "Marimo terminal websocket without auth (CVE-2026-39987)", Targets: []string{"uri", "path"}, Pattern: `(?i)/terminal/ws(?:\?|/|$)`},
+
+		// CVE-2026-21858 — n8n form-upload content-type bypass + LFI → RCE.
+		{ID: "CVE-2026-21858", Name: "n8n form upload file-read", Phase: core.PhaseRequestHeaders, Category: "cve.2026", Score: 90, Action: core.ActionBlock, Description: "n8n /form upload content-type manipulation (CVE-2026-21858)", Targets: []string{"uri", "path"}, Pattern: `(?i)/webhook/.+/form-trigger|/form/.+/submit`},
+
+		// CVE-2026-21643 — FortiClient EMS pre-auth SQLi via Site header on
+		// /api/v1/init_consts. A single HTTP request is sufficient.
+		{ID: "CVE-2026-21643", Name: "FortiClient EMS init_consts SQLi", Phase: core.PhaseRequestHeaders, Category: "cve.2026", Score: 100, Action: core.ActionBlock, Description: "FortiClient EMS /api/v1/init_consts Site-header SQLi (CVE-2026-21643)", Targets: []string{"uri", "path"}, Pattern: `(?i)/api/v1/init_consts\b`},
+
+		// CVE-2026-20122 / CVE-2026-20128 / CVE-2026-20133 — Cisco Catalyst
+		// SD-WAN Manager (vManage) API abuse, actively exploited per CISA.
+		{ID: "CVE-2026-20122", Name: "Cisco vManage SD-WAN API probe", Phase: core.PhaseRequestHeaders, Category: "cve.2026", Score: 70, Action: core.ActionLog, Description: "Cisco Catalyst SD-WAN Manager dataservice/fileUpload endpoint (CVE-2026-20122)", Targets: []string{"uri", "path"}, Pattern: `(?i)/dataservice/(?:fileUpload|system/device|cluster/[^/]+/restart)`},
+
+		// CVE-2025-54068 — Livewire v3 ≤3.6.3 hydration RCE. Detection
+		// signature: the update-payload snapshot with object-type properties
+		// that trigger unsafe hydration.
+		{ID: "CVE-2025-54068", Name: "Livewire v3 hydration RCE", Phase: core.PhaseRequestBody, Category: "cve.2025", Score: 90, Action: core.ActionBlock, Description: "Livewire v3 component update with object-type hydration gadget (CVE-2025-54068)", Targets: []string{"body"}, Pattern: `(?i)"snapshot"\s*:\s*"(?:[^"]|\\")*\\"s\\":\\"(?:IntBackedEnum|StringBackedEnum|Stringable|Collection|SupportCollection|Enumerable)`},
+
+		// CVE-2025-31161 — CrushFTP S3-auth-header pre-auth admin bypass on
+		// /WebInterface/function/. AWS4-HMAC-SHA256 Credential=crushadmin/.
+		{ID: "CVE-2025-31161", Name: "CrushFTP auth bypass", Phase: core.PhaseRequestHeaders, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "CrushFTP S3 AWS4-HMAC Credential=crushadmin auth bypass (CVE-2025-31161)", Targets: []string{"headers.authorization", "headers"}, Pattern: `(?i)AWS4-HMAC-SHA256[^\n]*Credential\s*=\s*crushadmin/`},
+
+		// CVE-2024-24919 — Check Point Quantum Gateway /clients/MyCRL
+		// arbitrary file read via CSHELL/../../.. traversal.
+		{ID: "CVE-2024-24919", Name: "Check Point Quantum Gateway file read", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "Check Point /clients/MyCRL CSHELL/ traversal (CVE-2024-24919)", Targets: []string{"uri", "path", "body"}, Pattern: `(?i)(?:/clients/MyCRL\b|aCSHELL/\.\.|CSHELL/\.\.)`},
+
+		// CVE-2024-50623 / CVE-2024-55956 — Cleo Harmony/VLTrader/LexiCom
+		// /Synchronization endpoint arbitrary file write → autorun RCE.
+		{ID: "CVE-2024-50623", Name: "Cleo Harmony /Synchronization abuse", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "Cleo MFT /Synchronization arbitrary file write (CVE-2024-50623 / 55956)", Targets: []string{"uri", "path"}, Pattern: `(?i)/Synchronization(?:\?|/|$)`},
+		{ID: "CVE-2024-50623-B", Name: "Cleo VLSync header", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 80, Action: core.ActionBlock, Description: "Cleo VLSync command header probe", Targets: []string{"headers.vlsync", "headers"}, Pattern: `(?i)VLSync:\s*(?:ADD|DELETE|REPLACE)\b`},
+
+		// Chrome zero-day (CVE-2026-5281) exploits are binary-level; not
+		// directly WAF-addressable, but the associated exploit-kit JS that
+		// gets delivered often carries the marker.
+		{ID: "CVE-2026-5281-KIT", Name: "Chrome UAF exploit-kit marker", Phase: core.PhaseRequestBody, Category: "cve.2026", Score: 60, Action: core.ActionLog, Description: "Exploit-kit JS referencing Chrome UAF gadgets", Targets: []string{"body"}, Pattern: `(?i)(?:WebGPU|Dawn|ANGLE)Pipeline[^"']{0,40}(?:\.destroy|setBindGroup)\s*\([^)]{0,100}(?:0xffffffff|0x7fffffff|-1\s*\/\s*0)`},
+
+		// === Extended scanner user-agent list from OWASP CRS ===
+		// OWASP CRS maintains scanner UAs in scanners-user-agents.data.
+		// Adding the high-confidence ones we didn't already have.
+		{ID: "SCAN-020", Name: "Arachni / Commix / WhatWaf scanners", Phase: core.PhaseRequestHeaders, Category: "scanner", Score: 50, Action: core.ActionBlock, Description: "OWASP-CRS-aligned scanner UA list (batch 1)", Targets: []string{"headers.user-agent"}, Pattern: `(?i)\b(?:arachni|commix|whatwaf|jbrofuzz|jorgee|fimap|havij|morfeus|webbandit|webshag|wfuzz|whatweb|wprecon|wpscan|feroxbuster|l9explore|l9tcpid|wapiti|vega|appspider|ironwasp|skipfish|qualysguard|n-stalker|cmsmap|sqlninja|xsstrike|xsser|joomscan|droopescan|Ghauri|zmeu|WPProbe|SSTIMap|tplmap|DotDotPwn|shortscan|Kadimus|LFISuite|LFImap|graphw00f|graphql-cop|jSQL|noseyparker|TruffleHog|TInjA|Mozilla/4\.0 \(Hydra\)|Mozilla/5\.g|Panoptic|AppScan|Detectify|BFAC|bewica-security-scan|betabot|hexometer|libwhisker|netlab360|securityagent|sitelockspider|sysscan|TsunamiSecurityScanner|w3af\.org|gobuster|dirbuster|fuzz faster)\b`},
+
+		// === Restricted file-path list from OWASP CRS (restricted-files.data) ===
+		// The upstream CRS file is 400+ entries; these are the highest-value
+		// paths that frequently appear in scanner probes and opportunistic
+		// exploitation. Matched against the canonicalized path.
+		{ID: "SCAN-RESTRICTED-001", Name: "Restricted dotfile access", Phase: core.PhaseRequestHeaders, Category: "scanner", Score: 70, Action: core.ActionBlock, Description: "OWASP-CRS: dotfile / secrets-file probe", Targets: []string{"uri", "path"}, Pattern: `(?i)/\.(?:env(?:rc)?|git/(?:config|HEAD|index)|aws/credentials|ssh/(?:id_rsa|authorized_keys)|bash_history|zsh_history|mysql_history|psql_history|npmrc|pypirc|netrc|pgpass|docker/config\.json|kube/config|htpasswd|htaccess|DS_Store|terraform/terraform\.tfstate|git-credentials|gitconfig|gitlab-ci\.yml|travis\.yml|travis\.yaml|ws_ftp\.ini|vscode/settings\.json)\b`},
+		{ID: "SCAN-RESTRICTED-002", Name: "Restricted config file probe", Phase: core.PhaseRequestHeaders, Category: "scanner", Score: 60, Action: core.ActionBlock, Description: "OWASP-CRS: config/database/secrets file probe", Targets: []string{"uri", "path"}, Pattern: `(?i)/(?:wp-config\.(?:php|bak|old|save)|database\.ya?ml|config/(?:parameters|secrets|database)\.ya?ml|app/etc/(?:env|local)\.(?:php|xml)|sites/default/settings\.(?:php|local\.php)|web\.config|credentials\.json|secrets\.(?:json|ya?ml)|php\.ini|user_secrets\.ya?ml|gitlab\.rb|initial_root_password|composer\.lock|package-lock\.json|yarn\.lock|pm2\.log)\b`},
+		{ID: "SCAN-RESTRICTED-003", Name: "Proc/sys sensitive read", Phase: core.PhaseRequestHeaders, Category: "scanner", Score: 80, Action: core.ActionBlock, Description: "OWASP-CRS: /proc or /sys leak probe", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)/proc/(?:self/(?:environ|cmdline|maps|status|fd/)|[0-9]+/(?:environ|cmdline)|meminfo|version|kallsyms|kcore|mounts)|/sys/(?:class|devices|firmware|kernel|module)\b`},
+		{ID: "SCAN-RESTRICTED-004", Name: "Java WEB-INF / META-INF", Phase: core.PhaseRequestHeaders, Category: "scanner", Score: 70, Action: core.ActionBlock, Description: "Java webapp internal-path probe", Targets: []string{"uri", "path"}, Pattern: `(?i)/(?:WEB-INF|META-INF)/`},
+
+		// === Extended OWASP CRS coverage ===
+		// REQUEST-911 method enforcement — common CRS pattern. Rather than
+		// hard-block, log uncommon methods (PATCH/DELETE on unfiltered paths).
+		{ID: "CRS-911100", Name: "CRS-aligned unusual method", Phase: core.PhaseRequestHeaders, Category: "crs.method", Paranoia: 2, Score: 20, Action: core.ActionLog, Description: "CRS-aligned: uncommon HTTP verb (SEARCH/TRACE/PROPFIND/etc)", Targets: []string{"method"}, Pattern: `^(?:TRACE|TRACK|DEBUG|SEARCH|PROPFIND|PROPPATCH|MKCOL|COPY|MOVE|LOCK|UNLOCK|REPORT|MKACTIVITY|VERSION-CONTROL|CHECKOUT|MERGE|BASELINE-CONTROL)$`},
+
+		// REQUEST-920 — header anomalies that don't require chain joins.
+		{ID: "CRS-920450", Name: "CRS Oversized Content-Length", Phase: core.PhaseRequestHeaders, Category: "crs.protocol", Paranoia: 2, Score: 30, Action: core.ActionLog, Description: "Content-Length greater than a sensible digit count", Targets: []string{"headers.content-length"}, Pattern: `^\d{10,}$`},
+		{ID: "CRS-920500", Name: "CRS Range header with too many bytes", Phase: core.PhaseRequestHeaders, Category: "crs.protocol", Paranoia: 2, Score: 40, Action: core.ActionBlock, Description: "Range header with too many ranges (amplification abuse)", Targets: []string{"headers.range"}, Pattern: `(?i)bytes=(?:[0-9,\-]+,){6,}`},
+
+		// REQUEST-941 XSS — additional high-value patterns from OWASP CRS.
+		{ID: "CRS-941260", Name: "CRS XSS attribute payload", Phase: core.PhaseRequestBody, Category: "crs.xss", Paranoia: 1, Score: 70, Action: core.ActionBlock, Description: "CRS-aligned: srcdoc attribute injection", Targets: []string{"args", "body"}, Pattern: `(?i)<iframe[^>]+srcdoc\s*=\s*["'][^"']*<(?:script|iframe|img|svg|body)`},
+		{ID: "CRS-941270", Name: "CRS XSS formaction hijack", Phase: core.PhaseRequestBody, Category: "crs.xss", Paranoia: 1, Score: 70, Action: core.ActionBlock, Description: "formaction attribute with javascript: / data: URL", Targets: []string{"args", "body"}, Pattern: `(?i)formaction\s*=\s*["']?\s*(?:javascript|data|vbscript):`},
+
+		// REQUEST-942 SQLi — additional operators seen in 2025 campaigns.
+		{ID: "CRS-942540", Name: "CRS SQL EXTRACTVALUE/XMLTYPE", Phase: core.PhaseRequestBody, Category: "crs.sqli", Paranoia: 1, Score: 80, Action: core.ActionBlock, Description: "Error-based SQLi via EXTRACTVALUE / XMLTYPE / UPDATEXML / XMLTYPE.GETSTRINGVAL", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:extractvalue|updatexml|xmltype|xmltype\.(?:getstringval|getclobval))\s*\(`},
+		{ID: "CRS-942550", Name: "CRS SQL JSON extraction abuse", Phase: core.PhaseRequestBody, Category: "crs.sqli", Paranoia: 2, Score: 50, Action: core.ActionBlock, Description: "JSON SQL function abuse (json_extract/json_value/json_query)", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:json_extract|json_value|json_query|json_table|json_keys|openjson)\s*\([^)]*(?:\$|'|"|--)`},
+
+		// Supply-chain / dependency abuse — prototype pollution via body JSON.
+		{ID: "PROTO-POLL-001", Name: "Prototype pollution payload", Phase: core.PhaseRequestBody, Category: "app", Score: 70, Action: core.ActionBlock, Description: "JSON body with __proto__ / constructor.prototype polluter", Targets: []string{"body"}, Pattern: `(?i)"(?:__proto__|prototype|constructor)"\s*:\s*\{`},
+
+		// Credential exfil via common header exfil paths (Metadata-Flavor was
+		// already there — add broader cloud metadata UA indicators).
+		{ID: "CLOUDMETA-002", Name: "Cloud metadata UA exfil", Phase: core.PhaseRequestHeaders, Category: "cloud", Score: 50, Action: core.ActionLog, Description: "User-Agent matching known cloud metadata fetcher libraries", Targets: []string{"headers.user-agent"}, Pattern: `(?i)\b(?:ec2-metadata|gce-metadata|azure-instance-metadata|imds)\b`},
 	}
 }
 

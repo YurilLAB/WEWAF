@@ -114,6 +114,12 @@ func (m *Manager) Stop() {
 
 func (m *Manager) loop(ctx context.Context) {
 	defer func() { _ = recover() }()
+	// One reusable timer so we don't leak one per iteration via time.After.
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
 	for {
 		m.mu.RLock()
 		interval := time.Duration(m.cfg.PollIntervalSec) * time.Second
@@ -122,12 +128,25 @@ func (m *Manager) loop(ctx context.Context) {
 			interval = 10 * time.Second
 		}
 		m.Probe(ctx)
+		timer.Reset(interval)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
 		case <-m.stopCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
-		case <-time.After(interval):
+		case <-timer.C:
 		}
 	}
 }
@@ -141,10 +160,13 @@ func (m *Manager) Probe(ctx context.Context) Status {
 	}
 	defer m.probing.Store(false)
 
+	// Capture backend + client atomically so a concurrent UpdateConfig
+	// swapping m.client doesn't race against the read below.
 	m.mu.RLock()
 	backend := m.cfg.BackendURL
 	timeout := time.Duration(m.cfg.TimeoutMs) * time.Millisecond
 	prevConnected := m.status.Connected
+	client := m.client
 	m.mu.RUnlock()
 
 	if timeout <= 0 {
@@ -155,10 +177,10 @@ func (m *Manager) Probe(ctx context.Context) Status {
 
 	started := time.Now()
 	ok := false
-	if backend != "" {
+	if backend != "" && client != nil {
 		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, backend, nil)
 		if err == nil {
-			resp, err := m.client.Do(req)
+			resp, err := client.Do(req)
 			if err == nil {
 				resp.Body.Close()
 				// Any response — even a 5xx — means the backend is reachable.

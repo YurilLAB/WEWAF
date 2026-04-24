@@ -843,8 +843,14 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			limit = 10 * 1024 * 1024
 		}
 		limited := io.LimitReader(r.Body, limit)
-		body, _ = io.ReadAll(limited)
+		var readErr error
+		body, readErr = io.ReadAll(limited)
 		_ = r.Body.Close()
+		if readErr != nil {
+			// Don't forward a truncated body as if it were complete.
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.ContentLength = int64(len(body))
 	}
@@ -901,7 +907,15 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	// Cap the forwarded response size at the configured egress body limit so
+	// a huge / slow upstream can't stream megabytes through a rule that was
+	// only supposed to relay API results. Without this the request-side
+	// EgressMaxBodyBytes check gives a false sense of bounds.
+	respLimit := ep.cfg.EgressMaxBodyBytes
+	if respLimit <= 0 {
+		respLimit = 10 * 1024 * 1024
+	}
+	_, _ = io.Copy(w, io.LimitReader(resp.Body, respLimit))
 }
 
 func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {

@@ -45,12 +45,13 @@ type Breaker struct {
 	// openTimeout is how long the breaker stays open before entering half-open.
 	openTimeout time.Duration
 
-	state        atomic.Int32 // BreakerState
-	failures     atomic.Int32
-	successes    atomic.Uint64
-	totalFails   atomic.Uint64
-	shortCircuit atomic.Uint64
-	openedAt     atomic.Int64 // unix ns
+	state         atomic.Int32 // BreakerState
+	failures      atomic.Int32
+	successes     atomic.Uint64
+	totalFails    atomic.Uint64
+	shortCircuit  atomic.Uint64
+	openedAt      atomic.Int64 // unix ns
+	probeInFlight atomic.Bool  // half-open gate: only one probe at a time
 
 	mu sync.Mutex
 }
@@ -89,6 +90,7 @@ func (b *Breaker) Allow() bool {
 			// Re-read under lock to avoid double-transition races.
 			if BreakerState(b.state.Load()) == BreakerOpen && time.Since(opened) >= b.openTimeout {
 				b.state.Store(int32(BreakerHalfOpen))
+				b.probeInFlight.Store(true) // claim the probe slot
 				b.mu.Unlock()
 				return true
 			}
@@ -97,10 +99,15 @@ func (b *Breaker) Allow() bool {
 		b.shortCircuit.Add(1)
 		return false
 	case BreakerHalfOpen:
-		// Only the first concurrent caller should pass through; other
-		// in-flights will short-circuit until the probe resolves.
-		// Race is acceptable — worst case we send 2 probes instead of 1.
-		return true
+		// Only one probe at a time in half-open. Concurrent callers short-
+		// circuit until the in-flight probe resolves via RecordSuccess /
+		// RecordFailure, at which point the state transitions out of
+		// half-open (closed on success, open on failure).
+		if b.probeInFlight.CompareAndSwap(false, true) {
+			return true
+		}
+		b.shortCircuit.Add(1)
+		return false
 	}
 	return true
 }
@@ -121,6 +128,9 @@ func (b *Breaker) RecordSuccess() {
 		}
 		b.mu.Unlock()
 	}
+	// Release the probe slot after every resolution — closed-state
+	// successes don't care, but we want the flag reset for the next cycle.
+	b.probeInFlight.Store(false)
 }
 
 // RecordFailure bumps the failure count. If the threshold is reached, the
@@ -152,6 +162,7 @@ func (b *Breaker) RecordFailure() {
 			b.mu.Unlock()
 		}
 	}
+	b.probeInFlight.Store(false)
 }
 
 // State returns the current breaker state.

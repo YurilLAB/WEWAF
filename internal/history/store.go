@@ -121,10 +121,11 @@ type Store struct {
 	currentPath string
 	startedAt   time.Time
 
-	eventsCh chan event
-	stopOnce sync.Once
-	stopCh   chan struct{}
-	doneCh   chan struct{}
+	eventsCh  chan event
+	stopOnce  sync.Once
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	startedRun atomic.Bool // true after Start has launched the writer goroutine
 
 	droppedEvents atomic.Uint64
 	writtenEvents atomic.Uint64
@@ -183,6 +184,9 @@ func Open(opts Options) (*Store, error) {
 
 // Start launches the background writer + rotation loops. Safe to call once.
 func (s *Store) Start(ctx context.Context) {
+	if !s.startedRun.CompareAndSwap(false, true) {
+		return
+	}
 	go s.writerLoop(ctx)
 }
 
@@ -206,12 +210,16 @@ func (s *Store) SetRotation(d time.Duration) {
 	s.mu.Unlock()
 }
 
-// Close stops the writer and closes the active DB. Safe to call multiple times.
+// Close stops the writer and closes the active DB. Safe to call multiple
+// times and safe to call before Start (won't block waiting for a writer
+// loop that never ran).
 func (s *Store) Close() error {
 	var err error
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
-		<-s.doneCh
+		if s.startedRun.Load() {
+			<-s.doneCh
+		}
 		s.mu.Lock()
 		if s.db != nil {
 			s.finaliseMetadataLocked()
@@ -393,10 +401,13 @@ func (s *Store) writeBatch(batch []event) error {
 // -------- rotation --------
 
 func (s *Store) maybeRotate() {
+	// Read startedAt AND rotation under the same RLock — SetRotation writes
+	// s.rotation under mu.Lock, so a bare read here would race.
 	s.mu.RLock()
 	started := s.startedAt
+	rotation := s.rotation
 	s.mu.RUnlock()
-	if time.Since(started) < s.rotation {
+	if time.Since(started) < rotation {
 		return
 	}
 	if err := s.rotate(); err != nil {

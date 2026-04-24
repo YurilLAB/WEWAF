@@ -256,22 +256,20 @@ func (d *Detector) checkPerIP(ip string) Verdict {
 	d.ipMu.Lock()
 	defer d.ipMu.Unlock()
 
-	// Lazy eviction — only runs when we're near cap.
+	// Eviction when we're at cap. The previous implementation scanned the
+	// entire map to find the oldest entry — O(n) under a mutex on the hot
+	// path, which turned a traffic spike that filled the map into a
+	// self-DoS. Instead, opportunistically drop a handful of random
+	// entries. Go's map iteration is randomised so this spreads pressure
+	// across the keyspace without ever walking the whole map.
 	if len(d.ipHits) >= d.cfg.MaxPerIPEntries {
-		var oldestIP string
-		var oldestTS int64 = now + 1
-		for k, hits := range d.ipHits {
-			if len(hits) == 0 {
-				oldestIP = k
+		dropBudget := 64
+		for k := range d.ipHits {
+			delete(d.ipHits, k)
+			dropBudget--
+			if dropBudget <= 0 {
 				break
 			}
-			if hits[len(hits)-1] < oldestTS {
-				oldestTS = hits[len(hits)-1]
-				oldestIP = k
-			}
-		}
-		if oldestIP != "" {
-			delete(d.ipHits, oldestIP)
 		}
 	}
 
@@ -373,6 +371,13 @@ func (d *Detector) advanceVolume() {
 
 	now := time.Now().UTC()
 	elapsed := int(now.Sub(d.volLast).Seconds())
+	// Guard against the monotonic clock jumping backwards (NTP slews,
+	// suspended VMs resuming, etc). Without this a negative `elapsed`
+	// bypasses the ring shift and stale buckets keep accumulating.
+	if elapsed < 0 {
+		d.volLast = now
+		elapsed = 0
+	}
 	if elapsed > 0 {
 		steps := elapsed
 		if steps > len(d.volRing) {

@@ -235,28 +235,38 @@ func main() {
 
 	adminMux := http.NewServeMux()
 	admin.RegisterRoutes(adminMux)
+	// ReadHeaderTimeout closes a Slowloris gap that ReadTimeout alone leaves
+	// open when the client dribbles headers. IdleTimeout prevents kept-alive
+	// idle connections from piling up — the admin server in particular has
+	// the long-lived SSE /events/stream route, so we use a generous one.
 	adminServer := &http.Server{
-		Addr:         cfg.AdminAddr,
-		Handler:      adminMux,
-		ReadTimeout:  time.Duration(cfg.ReadTimeoutSec) * time.Second,
-		WriteTimeout: time.Duration(cfg.WriteTimeoutSec) * time.Second,
+		Addr:              cfg.AdminAddr,
+		Handler:           adminMux,
+		ReadTimeout:       time.Duration(cfg.ReadTimeoutSec) * time.Second,
+		WriteTimeout:      time.Duration(cfg.WriteTimeoutSec) * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	proxyServer := &http.Server{
-		Addr:         cfg.ListenAddr,
-		Handler:      wp,
-		ReadTimeout:  time.Duration(cfg.ReadTimeoutSec) * time.Second,
-		WriteTimeout: time.Duration(cfg.WriteTimeoutSec) * time.Second,
+		Addr:              cfg.ListenAddr,
+		Handler:           wp,
+		ReadTimeout:       time.Duration(cfg.ReadTimeoutSec) * time.Second,
+		WriteTimeout:      time.Duration(cfg.WriteTimeoutSec) * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	var egressServer *http.Server
 	if cfg.EgressEnabled {
 		ep := proxy.NewEgressProxy(cfg, eng, metrics, banList)
 		egressServer = &http.Server{
-			Addr:         cfg.EgressAddr,
-			Handler:      ep,
-			ReadTimeout:  time.Duration(cfg.ReadTimeoutSec) * time.Second,
-			WriteTimeout: time.Duration(cfg.WriteTimeoutSec) * time.Second,
+			Addr:              cfg.EgressAddr,
+			Handler:           ep,
+			ReadTimeout:       time.Duration(cfg.ReadTimeoutSec) * time.Second,
+			WriteTimeout:      time.Duration(cfg.WriteTimeoutSec) * time.Second,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
 		}
 		go func() {
 			defer func() {
@@ -299,7 +309,12 @@ func main() {
 		log.Printf("WAF proxy listening on http://%s -> %s", cfg.ListenAddr, cfg.BackendURL)
 		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("proxy server error: %v", err)
-			sigCh <- os.Interrupt
+			// Non-blocking — if the main loop is already shutting down on a
+			// real signal, an unconditional send would leak this goroutine.
+			select {
+			case sigCh <- os.Interrupt:
+			default:
+			}
 		}
 	}()
 
@@ -310,7 +325,11 @@ func main() {
 					log.Printf("mesh gossip panic: %v", rec)
 				}
 			}()
-			ticker := time.NewTicker(time.Duration(cfg.MeshGossipIntervalSec) * time.Second)
+			interval := time.Duration(cfg.MeshGossipIntervalSec) * time.Second
+			if interval <= 0 {
+				interval = 60 * time.Second
+			}
+			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
 				select {

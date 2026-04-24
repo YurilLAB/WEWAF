@@ -241,7 +241,12 @@ func (c *Checker) CheckTraffic(ctx context.Context) CheckResult {
 	started := time.Now()
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+adminAddr+"/api/health", nil)
+	req, reqErr := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+adminAddr+"/api/health", nil)
+	if reqErr != nil {
+		res.Status = StatusFail
+		res.Message = fmt.Sprintf("malformed admin_addr %q: %v", adminAddr, reqErr)
+		return res
+	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	latency := time.Since(started).Milliseconds()

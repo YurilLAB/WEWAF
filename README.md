@@ -173,11 +173,21 @@ before exiting.
 
 ## The rule engine
 
-WEWAF ships with **325 compiled signatures** across two layered rule packs:
-the native WEWAF pack (~220 rules focused on high-value exploit classes and
+WEWAF ships with **349 compiled signatures** across two layered rule packs:
+the native WEWAF pack (~243 rules focused on high-value exploit classes and
 recent CVEs), and a curated port of the **OWASP Core Rule Set** v4
 (~106 rules across protocol enforcement, LFI, RFI, RCE, PHP injection, XSS,
 SQLi, Java, and data-leakage categories).
+
+**Every rule change is regression-locked against a false-positive test
+suite.** `internal/rules/falsepositive_test.go` runs the full compiled rule
+pack at PL4 (widest set) against 25 inputs representing realistic traffic
+that past WAFs have historically false-positive'd on — search queries
+containing shell-command words, comments mentioning `javascript:`, form
+posts with ampersands, URLs with dotfile-lookalikes, blog prose about
+SQL-adjacent topics — and asserts no rule fires. Another 16 malicious
+cases cover the major CVEs and confirm detection still works. New rules
+that break the FP suite don't land.
 
 Every rule has a **paranoia level** (1–4) matching the CRS convention —
 PL1 rules are the base set with the lowest false-positive risk, PL4 adds
@@ -193,14 +203,24 @@ open redirect, HTTP smuggling, and scanner/bot fingerprints.
 Beyond those classics, WEWAF ships with signatures for specific high-value
 exploits and modern attack classes:
 
-- **2024 / 2025 CVEs**: Next.js middleware bypass (CVE-2025-29927), PHP-CGI
-  argv injection (CVE-2024-4577), PAN-OS GlobalProtect (CVE-2024-3400),
-  Ivanti Connect Secure (CVE-2024-21887), FortiOS SSL-VPN (CVE-2024-21762),
-  TeamCity auth bypass (CVE-2024-27198), GitLab password-reset takeover
-  (CVE-2023-7028), CitrixBleed (CVE-2023-4966), Confluence template RCE
-  (CVE-2023-22527), XWiki SolrSearch (CVE-2025-24893), ScreenConnect
-  (CVE-2024-1709), Veeam Backup (CVE-2024-40711), GeoServer OGC
-  (CVE-2024-36401), CUPS IPP (CVE-2024-47176).
+- **2024 / 2025 / 2026 CVEs**: Next.js middleware bypass (CVE-2025-29927),
+  PHP-CGI argv injection (CVE-2024-4577), PAN-OS GlobalProtect
+  (CVE-2024-3400), Ivanti Connect Secure (CVE-2024-21887), FortiOS SSL-VPN
+  (CVE-2024-21762), TeamCity auth bypass (CVE-2024-27198), GitLab
+  password-reset takeover (CVE-2023-7028), CitrixBleed (CVE-2023-4966),
+  Confluence template RCE (CVE-2023-22527), XWiki SolrSearch
+  (CVE-2025-24893), ScreenConnect (CVE-2024-1709), Veeam Backup
+  (CVE-2024-40711), GeoServer OGC (CVE-2024-36401), CUPS IPP
+  (CVE-2024-47176), **React2Shell / React Server Components
+  prototype-pollution RCE (CVE-2025-55182, CVE-2025-66478)**,
+  **Langflow unauthenticated Python RCE (CVE-2025-3248)**, **Marimo
+  pre-auth WebSocket RCE (CVE-2026-39987)**, **n8n form-trigger file read
+  (CVE-2026-21858)**, **FortiClient EMS Site-header SQLi
+  (CVE-2026-21643)**, **Cisco Catalyst SD-WAN vManage (CVE-2026-20122)**,
+  **Livewire v3 hydration RCE (CVE-2025-54068)**, **CrushFTP S3 auth
+  bypass (CVE-2025-31161)**, **Check Point Quantum Gateway file read
+  (CVE-2024-24919)**, **Cleo Harmony/VLTrader/LexiCom RCE
+  (CVE-2024-50623 / CVE-2024-55956)**.
 - **Log4Shell** (CVE-2021-44228) with obfuscation-aware patterns that
   unfold `${lower:j}${::-ndi}` style tricks.
 - **Spring4Shell** (CVE-2022-22965), **Confluence OGNL** (CVE-2022-26134),
