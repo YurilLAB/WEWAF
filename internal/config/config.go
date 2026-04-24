@@ -77,10 +77,29 @@ type Config struct {
 	BreakerOpenTimeoutSec      int `json:"breaker_open_timeout_sec"`
 
 	// DDoS detection
-	DDoSVolumetricBaseline int     `json:"ddos_volumetric_baseline"` // requests/sec considered normal
-	DDoSVolumetricSpike    float64 `json:"ddos_volumetric_spike"`    // multiplier that flips "under attack"
-	DDoSConnRateThreshold  int     `json:"ddos_conn_rate_threshold"` // per-IP conns in 10s to mitigate
-	DDoSSlowReadBPS        int     `json:"ddos_slow_read_bps"`       // bytes/sec below which a slow read is flagged
+	DDoSVolumetricBaseline      int     `json:"ddos_volumetric_baseline"`       // initial "normal" RPS guess, replaced by adaptive EMA after warmup
+	DDoSVolumetricSpike         float64 `json:"ddos_volumetric_spike"`          // multiplier over baseline that counts as a spike
+	DDoSConnRateThreshold       int     `json:"ddos_conn_rate_threshold"`       // per-IP conns in 10s to mitigate (default 300 — CDN-friendly)
+	DDoSSlowReadBPS             int     `json:"ddos_slow_read_bps"`             // bytes/sec below which a slow read is flagged
+	DDoSWarmupSeconds           int     `json:"ddos_warmup_seconds"`            // before adaptive baseline takes over
+	DDoSMinAbsoluteRPS          int     `json:"ddos_min_absolute_rps"`          // floor: never flag under this RPS regardless of multiplier
+	DDoSSpikeWindowsRequired    int     `json:"ddos_spike_windows_required"`    // consecutive spike windows before declaring attack
+	DDoSCoolDownSeconds         int     `json:"ddos_cooldown_seconds"`          // after last spike before releasing attack state
+	DDoSBotnetUniqueIPThreshold int     `json:"ddos_botnet_unique_ip_threshold"` // unique IPs on sensitive path in 60s to flag
+
+	// Pre-WAF shaper — admission control that runs before rule evaluation.
+	ShaperEnabled bool `json:"shaper_enabled"`
+	ShaperMaxRPS  int  `json:"shaper_max_rps"`  // process-wide cap
+	ShaperBurst   int  `json:"shaper_burst"`    // token bucket burst size
+
+	// OWASP CRS-style paranoia level (1-4). Higher levels enable more
+	// aggressive rules with more false-positive risk. Levels should be
+	// raised gradually after running in detection mode.
+	ParanoiaLevel int `json:"paranoia_level"`
+
+	// CRSEnabled toggles the full OWASP CRS rule pack. Disable if you
+	// only want the native WEWAF signatures.
+	CRSEnabled bool `json:"crs_enabled"`
 
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 }
@@ -128,10 +147,25 @@ func Default() *Config {
 		FailsafeMode:               "closed",
 		BreakerConsecutiveFailures: 10,
 		BreakerOpenTimeoutSec:      30,
-		DDoSVolumetricBaseline:     500,
-		DDoSVolumetricSpike:        4.0,
-		DDoSConnRateThreshold:      100,
-		DDoSSlowReadBPS:            128,
+		// DDoS defaults are intentionally conservative — real attacks are
+		// sustained, so we require multiple consecutive spike windows and
+		// an absolute-rate floor to avoid flagging legitimate traffic spikes.
+		DDoSVolumetricBaseline:      100,
+		DDoSVolumetricSpike:         4.0,
+		DDoSConnRateThreshold:       300,
+		DDoSSlowReadBPS:             128,
+		DDoSWarmupSeconds:           300,
+		DDoSMinAbsoluteRPS:          100,
+		DDoSSpikeWindowsRequired:    3,
+		DDoSCoolDownSeconds:         60,
+		DDoSBotnetUniqueIPThreshold: 200,
+		// Shaper off by default — operators opt in once they've observed
+		// their traffic profile.
+		ShaperEnabled: false,
+		ShaperMaxRPS:  2000,
+		ShaperBurst:   4000,
+		ParanoiaLevel: 1,
+		CRSEnabled:    true,
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -234,6 +268,33 @@ func (c *Config) Validate() error {
 	if c.DDoSSlowReadBPS <= 0 {
 		c.DDoSSlowReadBPS = 128
 	}
+	if c.DDoSWarmupSeconds <= 0 {
+		c.DDoSWarmupSeconds = 300
+	}
+	if c.DDoSMinAbsoluteRPS <= 0 {
+		c.DDoSMinAbsoluteRPS = 100
+	}
+	if c.DDoSSpikeWindowsRequired <= 0 {
+		c.DDoSSpikeWindowsRequired = 3
+	}
+	if c.DDoSCoolDownSeconds <= 0 {
+		c.DDoSCoolDownSeconds = 60
+	}
+	if c.DDoSBotnetUniqueIPThreshold <= 0 {
+		c.DDoSBotnetUniqueIPThreshold = 200
+	}
+	if c.ShaperMaxRPS <= 0 {
+		c.ShaperMaxRPS = 2000
+	}
+	if c.ShaperBurst <= 0 {
+		c.ShaperBurst = c.ShaperMaxRPS * 2
+	}
+	if c.ParanoiaLevel <= 0 {
+		c.ParanoiaLevel = 1
+	}
+	if c.ParanoiaLevel > 4 {
+		c.ParanoiaLevel = 4
+	}
 	return nil
 }
 
@@ -278,6 +339,24 @@ func (c *Config) Snapshot() *Config {
 		MeshAPIKey:               c.MeshAPIKey,
 		MeshSyncTimeoutSec:       c.MeshSyncTimeoutSec,
 		SecurityHeadersEnabled:   c.SecurityHeadersEnabled,
+
+		FailsafeMode:                c.FailsafeMode,
+		BreakerConsecutiveFailures:  c.BreakerConsecutiveFailures,
+		BreakerOpenTimeoutSec:       c.BreakerOpenTimeoutSec,
+		DDoSVolumetricBaseline:      c.DDoSVolumetricBaseline,
+		DDoSVolumetricSpike:         c.DDoSVolumetricSpike,
+		DDoSConnRateThreshold:       c.DDoSConnRateThreshold,
+		DDoSSlowReadBPS:             c.DDoSSlowReadBPS,
+		DDoSWarmupSeconds:           c.DDoSWarmupSeconds,
+		DDoSMinAbsoluteRPS:          c.DDoSMinAbsoluteRPS,
+		DDoSSpikeWindowsRequired:    c.DDoSSpikeWindowsRequired,
+		DDoSCoolDownSeconds:         c.DDoSCoolDownSeconds,
+		DDoSBotnetUniqueIPThreshold: c.DDoSBotnetUniqueIPThreshold,
+		ShaperEnabled:               c.ShaperEnabled,
+		ShaperMaxRPS:                c.ShaperMaxRPS,
+		ShaperBurst:                 c.ShaperBurst,
+		ParanoiaLevel:               c.ParanoiaLevel,
+		CRSEnabled:                  c.CRSEnabled,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	copy(cp.EgressAllowlist, c.EgressAllowlist)

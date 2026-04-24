@@ -258,7 +258,7 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 				e.logger.Errorf("engine: panic during rule evaluation: %v", rec)
 			}
 		}()
-		matches, hardBlock = rs.Evaluate(phase, targets, cfgSnap.BlockThreshold)
+		matches, hardBlock = rs.EvaluateWithParanoia(phase, targets, cfgSnap.BlockThreshold, cfgSnap.ParanoiaLevel)
 	}()
 
 	for _, m := range matches {

@@ -86,6 +86,15 @@ type Rule struct {
 	Description string   `json:"description"`
 	Targets     []string `json:"targets"` // e.g. ["args", "headers", "body"]
 	Pattern     string   `json:"pattern"` // regex or literal; compiled by engine
+
+	// Paranoia is the CRS-style sensitivity band this rule belongs to.
+	// Rules with Paranoia > cfg.ParanoiaLevel are skipped at evaluation
+	// time. 0 or unset counts as level 1 so the base rule set ships on.
+	Paranoia int `json:"paranoia,omitempty"`
+
+	// Category is an optional grouping tag used for UI filtering and for
+	// the CRS category buckets (protocol-enforcement, xss, sqli, etc.).
+	Category string `json:"category,omitempty"`
 }
 
 // Match records a single rule hit.

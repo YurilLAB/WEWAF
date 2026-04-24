@@ -33,15 +33,44 @@ slash coalescing, and resolution of `./` and `../` segments. Pattern rules
 only need to match one representation; every common encoding bypass gets
 peeled off first.
 
-**A real DDoS detector, not just a rate limiter.** WEWAF watches a rolling
-60-second volumetric ring, a 10-second per-IP connection-rate map, and the
-byte-read rate of every in-flight request. When global RPS exceeds the
-configured baseline by the spike multiplier, every new request short-
-circuits to 503 until traffic cools down. Slow-read Slowloris attempts
-(below the configured bytes/sec floor for more than `SlowMinAge`) get
-terminated before they tie up a worker. Per-IP connection rate is checked
-independently of token-bucket RPS so a single attacker opening hundreds of
-sockets per second is caught even if each request finishes "politely".
+**A real DDoS detector tuned to not cry wolf.** The naive approach —
+"flag anything above baseline × 4" — false-positives on every Black Friday
+surge and every viral tweet. WEWAF's detector refuses to declare "under
+attack" unless three characteristics line up: the 10-second smoothed RPS
+exceeds an adaptive baseline (exponentially weighted over a 5-minute
+warmup, never polluted by attack traffic itself), it crosses an absolute
+configurable floor so a 20 RPS site isn't over-sensitive, AND the condition
+holds for multiple consecutive spike windows (default 3, roughly 30 seconds
+of sustained abnormality). Once tripped, it stays tripped for a cool-down
+period so a brief dip doesn't prematurely release the floodgates. That
+combination gives it a false-positive rate approaching zero on legitimate
+bursts while catching real sustained floods early.
+
+The detector also watches three independent signals that individual rule
+matches miss:
+
+- **Per-IP connection rate** — 10-second window, default 300 hits (30 qps
+  per client). CDN-friendly out of the box; office NAT and shared hosting
+  don't trigger.
+- **Slowloris / slow-read** — if a request reads its body below the
+  bytes/sec floor for more than the configured min age, it's terminated
+  before it ties up a worker.
+- **Botnet / distributed** — unique source IPs converging on the same
+  sensitive path (login, admin, api, wp-login, oauth, signup) within a
+  60-second window. Many distinct IPs each individually below the per-IP
+  rate is the classic botnet shape, and this is the signal that catches
+  it. Threshold defaults to 200 unique IPs in 60s on a sensitive path.
+
+**Pre-WAF admission shaper.** When the detector flips "under attack", the
+WAF's own resources become the bottleneck. WEWAF runs a global
+token-bucket admission controller at the very front of the request path,
+before any body buffering, rule matching, or telemetry work. In normal
+operation the bucket is set well above peak traffic so it's a no-op. When
+the DDoS detector fires, the shaper auto-tightens to 20% of the base rate;
+excess requests get a fast `429` with no inspection cost, so the WAF has
+enough CPU left to keep serving the requests it does admit. Without this,
+a sufficiently large flood wins by drowning the WAF in work even while
+every single request gets correctly classified as malicious.
 
 **Circuit breaker on the backend.** The proxy counts consecutive backend
 failures (including 5xx responses and connection errors). When the threshold
@@ -103,13 +132,15 @@ request path.
 ```
 ┌──────────────┐       ┌────────────────────────────────────────┐
 │  Client      │──────▶│  :8080  WAF Proxy                      │
-└──────────────┘       │  1. Global DDoS check (volumetric)     │
-                       │  2. Per-IP rate limit + conn-rate      │
-                       │  3. Zero-trust policy evaluation       │
-                       │  4. Circuit breaker gate               │
-                       │  5. Header + body rule evaluation      │
-                       │  6. Forward to backend                 │
-                       │  7. Response inspection + leak redact  │
+└──────────────┘       │  1. Pre-WAF shaper (admission control) │
+                       │  2. Concurrency semaphore              │
+                       │  3. DDoS detector (vol / conn / botnet)│
+                       │  4. Per-IP token-bucket rate limit     │
+                       │  5. Zero-trust policy evaluation       │
+                       │  6. Circuit breaker gate               │
+                       │  7. Canonicalize → rule evaluation     │
+                       │  8. Forward to backend                 │
+                       │  9. Response inspection + leak redact  │
                        └───────────────┬────────────────────────┘
                                        ▼
                        ┌────────────────────────┐     ┌───────────────┐
@@ -142,12 +173,34 @@ before exiting.
 
 ## The rule engine
 
-The built-in rule set is 196 signatures covering XSS, SQL injection, RCE,
-SSRF, XXE, path traversal, CRLF, NoSQLi, LDAP, JNDI, prototype pollution,
-file upload, open redirect, HTTP smuggling, and scanner/bot fingerprints.
+WEWAF ships with **325 compiled signatures** across two layered rule packs:
+the native WEWAF pack (~220 rules focused on high-value exploit classes and
+recent CVEs), and a curated port of the **OWASP Core Rule Set** v4
+(~106 rules across protocol enforcement, LFI, RFI, RCE, PHP injection, XSS,
+SQLi, Java, and data-leakage categories).
+
+Every rule has a **paranoia level** (1–4) matching the CRS convention —
+PL1 rules are the base set with the lowest false-positive risk, PL4 adds
+the most aggressive matches. The engine filters rules by the configured
+`paranoia_level` at evaluation time so operators can start at PL1 in
+detection mode, observe, and ratchet up gradually. OWASP CRS can be
+toggled off entirely via `crs_enabled=false` for operators who want only
+the native WEWAF signatures.
+
+The native WEWAF pack covers XSS, SQL injection, RCE, SSRF, XXE, path
+traversal, CRLF, NoSQLi, LDAP, JNDI, prototype pollution, file upload,
+open redirect, HTTP smuggling, and scanner/bot fingerprints.
 Beyond those classics, WEWAF ships with signatures for specific high-value
 exploits and modern attack classes:
 
+- **2024 / 2025 CVEs**: Next.js middleware bypass (CVE-2025-29927), PHP-CGI
+  argv injection (CVE-2024-4577), PAN-OS GlobalProtect (CVE-2024-3400),
+  Ivanti Connect Secure (CVE-2024-21887), FortiOS SSL-VPN (CVE-2024-21762),
+  TeamCity auth bypass (CVE-2024-27198), GitLab password-reset takeover
+  (CVE-2023-7028), CitrixBleed (CVE-2023-4966), Confluence template RCE
+  (CVE-2023-22527), XWiki SolrSearch (CVE-2025-24893), ScreenConnect
+  (CVE-2024-1709), Veeam Backup (CVE-2024-40711), GeoServer OGC
+  (CVE-2024-36401), CUPS IPP (CVE-2024-47176).
 - **Log4Shell** (CVE-2021-44228) with obfuscation-aware patterns that
   unfold `${lower:j}${::-ndi}` style tricks.
 - **Spring4Shell** (CVE-2022-22965), **Confluence OGNL** (CVE-2022-26134),
@@ -160,6 +213,12 @@ exploits and modern attack classes:
 - **Insecure deserialization** for Java (aced0005/rO0), PHP, Node
   `_$$ND_FUNC$$_`, Python pickle, Ruby Marshal, YAML tag injection.
 - **Server-Side Includes** and **Edge-Side Includes**.
+- **React SSR / Next.js** payload injection through
+  `dangerouslySetInnerHTML`, React Server Component gadget chains.
+- **Prompt injection + LangChain tool abuse**: classic "ignore all previous
+  instructions" markers, `PythonREPL` / `ShellTool` exploit patterns.
+- **Mass-assignment**: suspicious `is_admin` / `role` / `permissions`
+  fields in request bodies.
 - **Advanced scanner fingerprints**: Nuclei, Nikto, masscan, zmap,
   Acunetix, Netsparker, Qualys, Nessus, and known webshell filenames
   (c99, r57, wso, adminer, filesman, weevely).
@@ -242,10 +301,20 @@ typically matter:
 - **Security thresholds**: `block_threshold`, `rate_limit_rps`,
   `rate_limit_burst`, `brute_force_window_sec`, `brute_force_threshold`,
   `reputation_*`.
-- **DDoS**: `ddos_volumetric_baseline` (req/sec considered normal),
-  `ddos_volumetric_spike` (multiplier that flips "under attack"),
-  `ddos_conn_rate_threshold` (per-IP conns/10s to mitigate),
-  `ddos_slow_read_bps` (bytes/sec floor under which requests are killed).
+- **DDoS**: `ddos_volumetric_baseline` (initial RPS guess, replaced by the
+  adaptive EMA after `ddos_warmup_seconds`), `ddos_volumetric_spike`
+  (multiplier over baseline), `ddos_min_absolute_rps` (absolute floor —
+  never flag below this even if the multiplier says so),
+  `ddos_spike_windows_required` (consecutive spike windows before tripping,
+  default 3), `ddos_cooldown_seconds` (quiet period before releasing
+  attack state), `ddos_conn_rate_threshold` (per-IP conns/10s),
+  `ddos_botnet_unique_ip_threshold` (unique IPs on sensitive paths/60s to
+  flag), `ddos_slow_read_bps` (Slowloris floor).
+- **Shaper** (pre-WAF admission control): `shaper_enabled`, `shaper_max_rps`,
+  `shaper_burst`. Off by default — opt in once you've observed your
+  traffic profile.
+- **Rule engine**: `paranoia_level` (1–4, default 1), `crs_enabled`
+  (default true, load the OWASP CRS pack on top of the native signatures).
 - **Circuit breaker**: `breaker_consecutive_failures` (trip threshold,
   default 10), `breaker_open_timeout_sec` (cool-down, default 30).
 - **Failsafe**: `failsafe_mode` — `"closed"` (default, 503 on engine
@@ -277,8 +346,10 @@ important ones to know about beyond the obvious `/api/health`,
   blocks, ban status.
 - `/api/ip-auto-mitigate` (POST) — ban every IP whose block count in the
   last hour exceeds a threshold. Body: `{"threshold":10,"duration_sec":3600}`.
-- `/api/ddos/stats` — volumetric/conn-rate/slow-read counters +
-  `under_attack` flag.
+- `/api/ddos/stats` — volumetric / conn-rate / slow-read / botnet
+  counters + `under_attack` flag + adaptive baseline + spike streak.
+- `/api/shaper/stats` — pre-WAF admission controller: admitted, rejected,
+  current effective RPS, whether it's tightened under pressure.
 - `/api/breaker/stats` — circuit-breaker state, failure count,
   short-circuited request total.
 - `/api/zerotrust/policies` (GET/PUT) — inspect or replace the policy list.

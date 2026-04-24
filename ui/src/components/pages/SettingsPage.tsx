@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Cpu, HardDrive, Bell, Shield, Save, RotateCcw, Database, ArrowLeftRight, Network, Lock } from 'lucide-react';
+import { Cpu, HardDrive, Bell, Shield, Save, RotateCcw, Database, ArrowLeftRight, Network, Lock, Gauge, AlertTriangle } from 'lucide-react';
 import { useWAF, type WAFSettings } from '../../store/wafStore';
 import { api } from '../../services/api';
 
@@ -13,9 +13,38 @@ export default function SettingsPage() {
   const [meshTestStatus, setMeshTestStatus] = useState<{ text: string; ok: boolean | null }>({ text: '', ok: null });
   const [egressStats, setEgressStats] = useState({ blocked: 0, allowed: 0 });
 
+  // Rule-engine + safety knobs surfaced from /api/config. These aren't
+  // part of the WAFSettings store because they're purely backend concerns
+  // — we read and write them directly through the admin API.
+  const [engineForm, setEngineForm] = useState({
+    paranoia_level: 1,
+    crs_enabled: true,
+    failsafe_mode: 'closed' as 'closed' | 'open',
+    shaper_enabled: false,
+    shaper_max_rps: 2000,
+    shaper_burst: 4000,
+  });
+  const [engineSaved, setEngineSaved] = useState(false);
+  const [engineSaving, setEngineSaving] = useState(false);
+
   useEffect(() => {
     api.getConfig().then((cfg) => {
       if (!cfg) return;
+      // Seed the rule-engine/safety form from the live config.
+      const pl = (cfg as Record<string, unknown>).paranoia_level;
+      const crs = (cfg as Record<string, unknown>).crs_enabled;
+      const fsm = (cfg as Record<string, unknown>).failsafe_mode;
+      const se = (cfg as Record<string, unknown>).shaper_enabled;
+      const smr = (cfg as Record<string, unknown>).shaper_max_rps;
+      const sb = (cfg as Record<string, unknown>).shaper_burst;
+      setEngineForm((prev) => ({
+        paranoia_level: typeof pl === 'number' ? pl : prev.paranoia_level,
+        crs_enabled: typeof crs === 'boolean' ? crs : prev.crs_enabled,
+        failsafe_mode: fsm === 'open' || fsm === 'closed' ? fsm : prev.failsafe_mode,
+        shaper_enabled: typeof se === 'boolean' ? se : prev.shaper_enabled,
+        shaper_max_rps: typeof smr === 'number' && smr > 0 ? smr : prev.shaper_max_rps,
+        shaper_burst: typeof sb === 'number' && sb > 0 ? sb : prev.shaper_burst,
+      }));
       const updates: Partial<WAFSettings> = {};
       if (cfg.history_rotate_hours) updates.historyRotateHours = cfg.history_rotate_hours;
       if (typeof cfg.egress_enabled === 'boolean') updates.egressEnabled = cfg.egress_enabled;
@@ -101,6 +130,24 @@ export default function SettingsPage() {
     setMeshTestStatus({ text: '', ok: null });
   };
 
+  const saveEngine = async () => {
+    setEngineSaving(true);
+    const res = await api.updateConfig({
+      // These pass through the admin /api/config POST accept list.
+      paranoia_level: engineForm.paranoia_level,
+      crs_enabled: engineForm.crs_enabled,
+      failsafe_mode: engineForm.failsafe_mode,
+      shaper_enabled: engineForm.shaper_enabled,
+      shaper_max_rps: engineForm.shaper_max_rps,
+      shaper_burst: engineForm.shaper_burst,
+    } as Parameters<typeof api.updateConfig>[0]);
+    setEngineSaving(false);
+    if (res) {
+      setEngineSaved(true);
+      setTimeout(() => setEngineSaved(false), 1500);
+    }
+  };
+
   const handleTestPeer = async () => {
     const peers = form.meshPeers.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
     if (peers.length === 0) {
@@ -119,6 +166,130 @@ export default function SettingsPage() {
   return (
     <div className="space-y-4 lg:space-y-6 max-w-4xl">
       <p className="text-waf-dim text-xs lg:text-sm">Configure WAF settings including resource limits, logging, and alerting.</p>
+
+      {/* Rule engine + safety */}
+      <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
+        <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2">
+          <Gauge className="w-4 h-4 text-waf-orange" /> Rule Engine &amp; Safety
+        </h3>
+        <div className="space-y-4">
+          <div>
+            <label className="text-xs text-waf-muted mb-2 block">Paranoia Level</label>
+            <div className="flex gap-2">
+              {[1, 2, 3, 4].map((lvl) => (
+                <button
+                  key={lvl}
+                  onClick={() => setEngineForm((f) => ({ ...f, paranoia_level: lvl }))}
+                  className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
+                    engineForm.paranoia_level === lvl
+                      ? 'bg-waf-orange text-white'
+                      : 'bg-waf-elevated text-waf-muted hover:text-waf-text border border-waf-border'
+                  }`}
+                >
+                  PL{lvl}
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] text-waf-dim mt-1">
+              PL1 is the base rule set (lowest false-positive risk). Each level adds more
+              aggressive rules. Start at PL1 and ratchet up after running in detection mode.
+            </p>
+          </div>
+
+          <label className="flex items-start gap-2 cursor-pointer p-3 rounded-lg bg-waf-elevated border border-waf-border">
+            <input
+              type="checkbox" checked={engineForm.crs_enabled}
+              onChange={(e) => setEngineForm((f) => ({ ...f, crs_enabled: e.target.checked }))}
+              className="mt-0.5 accent-waf-orange"
+            />
+            <div>
+              <div className="text-xs text-waf-text font-medium">OWASP Core Rule Set</div>
+              <p className="text-[10px] text-waf-dim">
+                Load the full CRS pack alongside the native WEWAF signatures. Disable to run with
+                native rules only.
+              </p>
+            </div>
+          </label>
+
+          <div>
+            <label className="text-xs text-waf-muted mb-2 block flex items-center gap-1.5">
+              <AlertTriangle className="w-3.5 h-3.5 text-amber-400" /> Failsafe mode on engine panic
+            </label>
+            <div className="flex gap-2">
+              {(['closed', 'open'] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setEngineForm((f) => ({ ...f, failsafe_mode: m }))}
+                  className={`flex-1 px-3 py-2 rounded-lg text-xs font-medium transition-colors ${
+                    engineForm.failsafe_mode === m
+                      ? (m === 'closed' ? 'bg-emerald-500 text-white' : 'bg-amber-500 text-white')
+                      : 'bg-waf-elevated text-waf-muted hover:text-waf-text border border-waf-border'
+                  }`}
+                >
+                  {m === 'closed' ? 'Fail closed (503)' : 'Fail open (pass)'}
+                </button>
+              ))}
+            </div>
+            <p className="text-[10px] text-waf-dim mt-1">
+              Controls what happens if the engine panics: fail-closed returns 503 so the client
+              retries; fail-open forwards the request unfiltered with an <span className="font-mono">X-WAF-Failsafe</span> response header.
+            </p>
+          </div>
+
+          <div className="pt-3 border-t border-waf-border/50 space-y-3">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox" checked={engineForm.shaper_enabled}
+                onChange={(e) => setEngineForm((f) => ({ ...f, shaper_enabled: e.target.checked }))}
+                className="mt-0.5 accent-waf-orange"
+              />
+              <div>
+                <div className="text-xs text-waf-text font-medium">Pre-WAF traffic shaper</div>
+                <p className="text-[10px] text-waf-dim">
+                  Admission-control token bucket running before rule evaluation. When enabled,
+                  the shaper auto-tightens to 20% of its base rate while the DDoS detector
+                  reports under-attack, protecting the WAF's own resources under load.
+                </p>
+              </div>
+            </label>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-[10px] text-waf-muted mb-1 block">Max RPS</label>
+                <input
+                  type="number" min={10} max={100000}
+                  disabled={!engineForm.shaper_enabled}
+                  value={engineForm.shaper_max_rps}
+                  onChange={(e) => setEngineForm((f) => ({ ...f, shaper_max_rps: parseInt(e.target.value) || 2000 }))}
+                  className="w-full bg-waf-elevated border border-waf-border rounded-md px-2 py-1.5 text-xs text-waf-text font-mono focus:outline-none focus:border-waf-orange disabled:opacity-40"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] text-waf-muted mb-1 block">Burst</label>
+                <input
+                  type="number" min={10} max={200000}
+                  disabled={!engineForm.shaper_enabled}
+                  value={engineForm.shaper_burst}
+                  onChange={(e) => setEngineForm((f) => ({ ...f, shaper_burst: parseInt(e.target.value) || 4000 }))}
+                  className="w-full bg-waf-elevated border border-waf-border rounded-md px-2 py-1.5 text-xs text-waf-text font-mono focus:outline-none focus:border-waf-orange disabled:opacity-40"
+                />
+              </div>
+            </div>
+            <p className="text-[10px] text-waf-dim">
+              Set Max RPS above your traffic's realistic peak — the shaper's job is to cap
+              catastrophic floods, not to enforce QoS. Typical starting point: 2× observed
+              peak during the last seven days.
+            </p>
+          </div>
+
+          <div className="flex items-center gap-3">
+            <button onClick={saveEngine} disabled={engineSaving}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-md bg-waf-orange text-white text-sm font-medium hover:bg-orange-600 transition-colors disabled:opacity-50">
+              <Save className="w-4 h-4" /> {engineSaved ? 'Saved' : 'Save engine settings'}
+            </button>
+          </div>
+        </div>
+      </motion.div>
 
       {/* Resource Management */}
       <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">

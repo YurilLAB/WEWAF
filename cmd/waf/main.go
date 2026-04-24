@@ -26,6 +26,7 @@ import (
 	"wewaf/internal/rules"
 	"wewaf/internal/ssl"
 	"wewaf/internal/telemetry"
+	"wewaf/internal/watchdog"
 	"wewaf/internal/web"
 )
 
@@ -62,11 +63,16 @@ func main() {
 	log.Printf("resource limits applied: cpu=%d memory=%dMB", cfg.MaxCPUCores, cfg.MaxMemoryMB)
 
 	rawRules := rules.DefaultRules()
+	if cfg.CRSEnabled {
+		rawRules = append(rawRules, rules.CRSRules()...)
+		log.Printf("OWASP CRS rules merged: +%d rules", len(rules.CRSRules()))
+	}
 	rs, err := rules.NewRuleSet(rawRules)
 	if err != nil {
 		log.Fatalf("failed to compile rules: %v", err)
 	}
-	log.Printf("rules compiled: %d signatures loaded", rs.Count())
+	log.Printf("rules compiled: %d signatures loaded (paranoia_level=%d)",
+		rs.Count(), cfg.ParanoiaLevel)
 
 	eng, err := engine.NewEngine(cfg, rs, &simpleLogger{})
 	if err != nil {
@@ -138,6 +144,10 @@ func main() {
 		compiled := rs.RulesSnapshot()
 		out := make([]map[string]interface{}, 0, len(compiled))
 		for _, cr := range compiled {
+			pl := cr.Paranoia
+			if pl <= 0 {
+				pl = 1
+			}
 			out = append(out, map[string]interface{}{
 				"id":          cr.ID,
 				"name":        cr.Name,
@@ -145,6 +155,8 @@ func main() {
 				"action":      cr.Action.String(),
 				"score":       cr.Score,
 				"description": cr.Description,
+				"category":    cr.Category,
+				"paranoia":    pl,
 			})
 		}
 		return out
@@ -152,6 +164,15 @@ func main() {
 	banList := core.NewBanList()
 	stopBanCleanup := banList.StartCleanup(time.Minute)
 	defer stopBanCleanup()
+
+	// Backup the starting config so operators have a rollback target even
+	// if they haven't touched /api/config yet. Errors are logged but not
+	// fatal — a missing snapshot directory shouldn't take the daemon down.
+	if path, err := cfg.SnapshotToFile("config_backup", 10); err == nil {
+		log.Printf("config snapshot saved: %s", path)
+	} else {
+		log.Printf("config snapshot failed: %v", err)
+	}
 
 	admin := web.NewServer(web.Deps{
 		Config:      cfg,
@@ -167,6 +188,51 @@ func main() {
 		MeshPeers:   cfg.MeshPeers,
 		MeshAPIKey:  cfg.MeshAPIKey,
 	})
+
+	// Watchdog — rotates through lightweight checks on the critical paths
+	// and records failures into the Server's errors buffer.
+	wdog := watchdog.New(15 * time.Second)
+	wdog.OnFail(func(h watchdog.Health) {
+		admin.RecordError("watchdog:"+h.Subsystem, h.Message, "")
+	})
+	wdog.Register("history", func(ctx context.Context) watchdog.Health {
+		if historyStore == nil {
+			return watchdog.Health{Status: watchdog.StatusOK, Message: "disabled"}
+		}
+		stats := historyStore.StatsSnapshot()
+		if stats.CurrentPath == "" {
+			return watchdog.Health{Status: watchdog.StatusFail, Message: "no active database"}
+		}
+		// Queue > 90% full is degraded; keep the cutoff generous.
+		if stats.BufferedQueue > (cfg.HistoryBufferSize*9)/10 {
+			return watchdog.Health{Status: watchdog.StatusDegraded, Message: "writer queue near capacity"}
+		}
+		return watchdog.Health{Status: watchdog.StatusOK, Message: "ok"}
+	})
+	wdog.Register("connection", func(ctx context.Context) watchdog.Health {
+		if connMgr == nil {
+			return watchdog.Health{Status: watchdog.StatusOK, Message: "disabled"}
+		}
+		st := connMgr.StatusSnapshot()
+		if !st.Connected {
+			return watchdog.Health{Status: watchdog.StatusDegraded, Message: "backend unreachable"}
+		}
+		return watchdog.Health{Status: watchdog.StatusOK, Message: "reachable"}
+	})
+	wdog.Register("host", func(ctx context.Context) watchdog.Health {
+		if hostCollector == nil {
+			return watchdog.Health{Status: watchdog.StatusOK, Message: "disabled"}
+		}
+		res := hostCollector.ResourcesSnapshot()
+		if res.MemoryUsagePercent >= 95 {
+			return watchdog.Health{Status: watchdog.StatusDegraded, Message: "memory over 95%"}
+		}
+		return watchdog.Health{Status: watchdog.StatusOK, Message: "ok"}
+	})
+	admin.AttachWatchdog(wdog)
+	wdog.Start(rootCtx)
+	defer wdog.Stop()
+
 	adminMux := http.NewServeMux()
 	admin.RegisterRoutes(adminMux)
 	adminServer := &http.Server{

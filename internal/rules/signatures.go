@@ -374,6 +374,77 @@ func DefaultRules() []core.Rule {
 
 		// --- JSONP / callback abuse ---
 		{ID: "JSONP-001", Name: "Suspicious JSONP callback", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "JSONP callback param with JS payload", Targets: []string{"args"}, Pattern: `(?i)^(?:callback|jsonp|cb)=[^a-z0-9_$.]+`},
+
+		// ============================================================
+		// 2024 / 2025 CVEs and recent exploit classes
+		// ============================================================
+
+		// Next.js middleware bypass (CVE-2025-29927)
+		{ID: "CVE-2025-29927", Name: "Next.js middleware bypass", Phase: core.PhaseRequestHeaders, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "Next.js x-middleware-subrequest header forging (CVE-2025-29927)", Targets: []string{"headers.x-middleware-subrequest", "headers"}, Pattern: `(?i)middleware(?::middleware)*`},
+
+		// Next.js cache poisoning variants
+		{ID: "CVE-2024-34351", Name: "Next.js Server Action SSRF", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 80, Action: core.ActionBlock, Description: "Next.js Server Action host-header SSRF", Targets: []string{"headers.host", "headers.origin"}, Pattern: `(?i)^(?:127\.0\.0\.1|localhost|0\.0\.0\.0|169\.254\.|::1|metadata\.internal)`},
+
+		// PHP CGI argument injection (CVE-2024-4577)
+		{ID: "CVE-2024-4577", Name: "PHP CGI argument injection", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "PHP-CGI argv injection via soft-hyphen / %ad (CVE-2024-4577)", Targets: []string{"uri", "args"}, Pattern: `(?i)(?:%ad|\xad|%e2%80%90)-d\+|\?-d\+allow_url_include|\?-d\+auto_prepend_file`},
+
+		// Palo Alto PAN-OS GlobalProtect command injection (CVE-2024-3400)
+		{ID: "CVE-2024-3400", Name: "PAN-OS GlobalProtect command inject", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "PAN-OS GlobalProtect SESSID path traversal (CVE-2024-3400)", Targets: []string{"headers.cookie", "headers"}, Pattern: `(?i)SESSID=[^;]*(?:\.\.|%2e%2e|/\./)`},
+
+		// Ivanti Connect Secure auth bypass chain (CVE-2023-46805 + CVE-2024-21887)
+		{ID: "CVE-2024-21887", Name: "Ivanti Connect Secure RCE", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "Ivanti Connect Secure /api/v1/license/keys-status path (CVE-2024-21887)", Targets: []string{"uri", "path"}, Pattern: `(?i)/api/v1/(?:totp/user-backup-code|license/keys-status/[^/]*;|system/maintenance/archiving/cloud-server-test-connection)`},
+
+		// Fortinet FortiOS SSL-VPN out-of-bounds write (CVE-2024-21762)
+		{ID: "CVE-2024-21762", Name: "FortiOS SSL-VPN OOB write probe", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 80, Action: core.ActionBlock, Description: "Fortinet SSL-VPN /remote/hostcheck_validate probe", Targets: []string{"uri", "path"}, Pattern: `(?i)/remote/hostcheck_(?:validate|save)\b`},
+
+		// JetBrains TeamCity auth bypass (CVE-2024-27198)
+		{ID: "CVE-2024-27198", Name: "TeamCity auth bypass", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "TeamCity path-traversal auth bypass (CVE-2024-27198)", Targets: []string{"uri", "path"}, Pattern: `(?i)/(?:\.\.|%2e%2e)(?:/|%2f);(?:jsessionid|sid)=[^/]+/(?:app/rest|admin)`},
+
+		// GitLab account takeover (CVE-2023-7028)
+		{ID: "CVE-2023-7028", Name: "GitLab password reset takeover", Phase: core.PhaseRequestBody, Category: "cve.2023", Score: 80, Action: core.ActionBlock, Description: "GitLab password reset with array email param (CVE-2023-7028)", Targets: []string{"body", "args"}, Pattern: `(?i)user\[email\]\[\]=.+(?:&|$).*user\[email\]\[\]=`},
+
+		// Citrix NetScaler ADC memory disclosure (CVE-2023-4966, "CitrixBleed")
+		{ID: "CVE-2023-4966", Name: "CitrixBleed probe", Phase: core.PhaseRequestHeaders, Category: "cve.2023", Score: 90, Action: core.ActionBlock, Description: "Citrix NetScaler /oauth/idp/.well-known with oversized Host (CVE-2023-4966)", Targets: []string{"uri"}, Pattern: `(?i)/oauth/idp/\.well-known/openid-configuration`},
+
+		// Confluence template injection (CVE-2023-22527)
+		{ID: "CVE-2023-22527", Name: "Confluence OGNL template injection", Phase: core.PhaseRequestBody, Category: "cve.2023", Score: 100, Action: core.ActionBlock, Description: "Confluence template OGNL injection (CVE-2023-22527)", Targets: []string{"body", "args"}, Pattern: `(?i)\\u0027\s*\+\s*(?:#[^+]+\.getMethod|@java\.lang|\$\{.*@java)`},
+
+		// XWiki unauthenticated RCE (CVE-2025-24893)
+		{ID: "CVE-2025-24893", Name: "XWiki SolrSearch RCE", Phase: core.PhaseRequestHeaders, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "XWiki SolrSearch Groovy injection (CVE-2025-24893)", Targets: []string{"uri", "args"}, Pattern: `(?i)SolrSearch[^?]*\?[^=]*text=[^&]*\{\{async[^}]*\}\}`},
+
+		// Spring Cloud Function RCE (CVE-2022-22963) — still seen in scans
+		{ID: "CVE-2022-22963", Name: "Spring Cloud Function SpEL", Phase: core.PhaseRequestHeaders, Category: "cve.2022", Score: 100, Action: core.ActionBlock, Description: "spring.cloud.function.routing-expression header SpEL", Targets: []string{"headers"}, Pattern: `(?i)spring\.cloud\.function\.routing-expression\s*[:=]`},
+
+		// ConnectWise ScreenConnect auth bypass (CVE-2024-1709)
+		{ID: "CVE-2024-1709", Name: "ScreenConnect SetupWizard bypass", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "ConnectWise /SetupWizard.aspx path-normalization bypass", Targets: []string{"uri", "path"}, Pattern: `(?i)/SetupWizard\.aspx/[a-z]+`},
+
+		// Veeam Backup RCE (CVE-2024-40711)
+		{ID: "CVE-2024-40711", Name: "Veeam Backup RCE probe", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 80, Action: core.ActionBlock, Description: "Veeam backup /triggers SOAP endpoint probe", Targets: []string{"uri"}, Pattern: `(?i)/triggers/v2/.+\?credentialsId=`},
+
+		// Windows CUPS RCE (CVE-2024-47176 / 47076 / 47175 / 47177)
+		{ID: "CVE-2024-47176", Name: "CUPS IPP printer injection", Phase: core.PhaseRequestBody, Category: "cve.2024", Score: 90, Action: core.ActionBlock, Description: "CUPS ipp protocol FoomaticRIP injection", Targets: []string{"body"}, Pattern: `(?i)FoomaticRIPCommandLine:\s+`},
+
+		// GeoServer SQL injection (CVE-2023-35042) / RCE (CVE-2024-36401)
+		{ID: "CVE-2024-36401", Name: "GeoServer OGC eval", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "GeoServer OGC filter eval injection (CVE-2024-36401)", Targets: []string{"args", "body"}, Pattern: `(?i)exec\s*\(\s*java\.lang\.Runtime|Runtime\.getRuntime\(\)\.exec\(|SystemFunction`},
+
+		// HTTP/2 Rapid Reset — pattern-detected through header probing
+		{ID: "HTTP2-RESET-001", Name: "HTTP/2 Rapid Reset probe", Phase: core.PhaseRequestHeaders, Category: "cve.2023", Score: 60, Action: core.ActionLog, Description: "HTTP/2 Rapid Reset (CVE-2023-44487) — very high request rate from single source is caught by DDoS detector; this flags crafted high-concurrency probes", Targets: []string{"headers.user-agent"}, Pattern: `(?i)\brapid[-_]?reset|http2-reset-test`},
+
+		// Next.js / React SSR template injection pattern (operator called this
+		// "React2Shell" — covers SSR payload-as-template exploits including
+		// React renderToString XSS through user-controlled children)
+		{ID: "REACT2SHELL-001", Name: "React SSR payload injection", Phase: core.PhaseRequestBody, Category: "react", Score: 80, Action: core.ActionBlock, Description: "React SSR prop/children with script or dangerouslySetInnerHTML attempt", Targets: []string{"body", "args"}, Pattern: `(?i)dangerouslySetInnerHTML\s*[:=]\s*\{\s*__html\s*:\s*["'` + "`" + `]?\s*<script`},
+		{ID: "REACT2SHELL-002", Name: "React Server Component eval", Phase: core.PhaseRequestBody, Category: "react", Score: 80, Action: core.ActionBlock, Description: "RSC payload invoking require/eval through user input", Targets: []string{"body"}, Pattern: `(?i)"\$\$typeof":\s*Symbol\(react\.[^)]*\).{0,200}(?:require|eval|Function)\s*\(`},
+
+		// LangChain / LLM prompt injection markers — for ingress to AI gateways
+		{ID: "LLM-001", Name: "Prompt-injection marker", Phase: core.PhaseRequestBody, Category: "llm", Score: 40, Action: core.ActionLog, Description: "Classic prompt-injection prelude in user input", Targets: []string{"body", "args"}, Pattern: `(?i)(?:ignore\s+(?:all\s+)?previous\s+instructions|disregard\s+(?:the\s+)?system\s+prompt|you\s+are\s+now\s+in\s+(?:developer|DAN)\s+mode)`},
+		{ID: "LLM-002", Name: "LangChain tool bypass", Phase: core.PhaseRequestBody, Category: "llm", Score: 50, Action: core.ActionBlock, Description: "LangChain / LlamaIndex tool-use exploit patterns", Targets: []string{"body"}, Pattern: `(?i)(?:PythonREPL|PythonAstREPL|ShellTool|RequestsGet|shell\s*:\s*true)\s*\(\s*["'` + "`" + `]?\s*(?:import\s+os|subprocess|__import__|open\(|exec\()`},
+
+		// Hyper-v / Azure / AWS metadata abuse headers
+		{ID: "METAHEADER-001", Name: "GCP/Azure metadata header", Phase: core.PhaseRequestHeaders, Category: "cloud", Score: 60, Action: core.ActionBlock, Description: "Metadata-Flavor / X-Forwarded-Host pointing at metadata svc", Targets: []string{"headers.metadata-flavor", "headers.x-metadata", "headers.x-identity-full"}, Pattern: `(?i).+`},
+
+		// Mass-assignment / hidden-field tampering (low severity, log)
+		{ID: "MASSASSIGN-001", Name: "Role/admin mass-assignment", Phase: core.PhaseRequestBody, Category: "app", Score: 50, Action: core.ActionLog, Description: "Suspicious role / is_admin / permission field in body", Targets: []string{"body"}, Pattern: `(?i)(?:^|[&{,"])["']?(?:is_admin|isAdmin|role|role_id|permissions|privilege|superuser|is_staff)["']?\s*[=:]\s*["']?(?:true|1|admin|root|superuser)`},
 	}
 }
 
@@ -395,10 +466,30 @@ func (rs *RuleSet) RulesSnapshot() []CompiledRule {
 
 // Evaluate runs all rules for the given phase against the provided targets.
 // It returns matches and whether an immediate block/drop was triggered.
+// Rules with Paranoia > maxParanoia are skipped so operators can band their
+// rule set by false-positive tolerance.
 func (rs *RuleSet) Evaluate(phase core.Phase, targets map[string]string, maxScore int) (matches []core.Match, interrupted bool) {
+	return rs.EvaluateWithParanoia(phase, targets, maxScore, 4)
+}
+
+// EvaluateWithParanoia is Evaluate with an explicit paranoia ceiling.
+// Rules with Paranoia==0 are treated as level 1 and always run.
+func (rs *RuleSet) EvaluateWithParanoia(phase core.Phase, targets map[string]string, maxScore, maxParanoia int) (matches []core.Match, interrupted bool) {
+	if maxParanoia <= 0 {
+		maxParanoia = 1
+	}
 	rs.mu.RLock()
-	rules := make([]CompiledRule, len(rs.rules))
-	copy(rules, rs.rules)
+	rules := make([]CompiledRule, 0, len(rs.rules))
+	for _, r := range rs.rules {
+		pl := r.Paranoia
+		if pl <= 0 {
+			pl = 1
+		}
+		if pl > maxParanoia {
+			continue
+		}
+		rules = append(rules, r)
+	}
 	rs.mu.RUnlock()
 
 	for _, cr := range rules {

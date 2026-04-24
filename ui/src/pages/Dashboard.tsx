@@ -8,6 +8,7 @@ import WorldMap from '../components/WorldMap';
 import TrafficPanel from '../components/TrafficPanel';
 import NetworkGraph from '../components/NetworkGraph';
 import LiveEventsPanel from '../components/LiveEventsPanel';
+import EngineStatusPanel from '../components/EngineStatusPanel';
 import NextSteps from '../components/NextSteps';
 import PageErrorBoundary from '../components/PageErrorBoundary';
 import DomainsPage from '../components/pages/DomainsPage';
@@ -27,6 +28,7 @@ import DDoSPage from '../components/pages/DDoSPage';
 import IPReputationPage from '../components/pages/IPReputationPage';
 import BotManagementPage from '../components/pages/BotManagementPage';
 import IPIntelligencePage from '../components/pages/IPIntelligencePage';
+import ZeroTrustPage from '../components/pages/ZeroTrustPage';
 import SSLTLSPage from '../components/pages/SSLTLSPage';
 import ConnectionManagementPage from '../components/pages/ConnectionManagementPage';
 import SettingsPage from '../components/pages/SettingsPage';
@@ -51,11 +53,14 @@ export default function Dashboard() {
             <div className="xl:col-span-3"><PageErrorBoundary name="World Map"><WorldMap /></PageErrorBoundary></div>
             <div className="xl:col-span-2"><PageErrorBoundary name="Traffic Panel"><TrafficPanel /></PageErrorBoundary></div>
           </div>
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
-            <PageErrorBoundary name="Network Graph"><NetworkGraph /></PageErrorBoundary>
-            <PageErrorBoundary name="Live Events"><LiveEventsPanel /></PageErrorBoundary>
+          <div className="grid grid-cols-1 xl:grid-cols-3 gap-5">
+            <div className="xl:col-span-2"><PageErrorBoundary name="Network Graph"><NetworkGraph /></PageErrorBoundary></div>
+            <PageErrorBoundary name="Engine Status"><EngineStatusPanel /></PageErrorBoundary>
           </div>
-          <PageErrorBoundary name="Next Steps"><NextSteps /></PageErrorBoundary>
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-5">
+            <PageErrorBoundary name="Live Events"><LiveEventsPanel /></PageErrorBoundary>
+            <PageErrorBoundary name="Next Steps"><NextSteps /></PageErrorBoundary>
+          </div>
         </motion.div>
       ),
       domains: wrap('Domains', <DomainsPage />),
@@ -75,6 +80,7 @@ export default function Dashboard() {
       'ip-reputation': wrap('IP Reputation', <IPReputationPage />),
       'bot-management': wrap('Bot Management', <BotManagementPage />),
       'ip-intelligence': wrap('IP Intelligence', <IPIntelligencePage />),
+      'zero-trust-policies': wrap('Zero-Trust Policies', <ZeroTrustPage />),
       certificates: wrap('SSL / TLS', <SSLTLSPage initialTab="certificates" />),
       'ssl-settings': wrap('SSL Settings', <SSLTLSPage initialTab="settings" />),
       'tls-versions': wrap('TLS Versions', <SSLTLSPage initialTab="tls-versions" />),
@@ -103,6 +109,7 @@ export default function Dashboard() {
     activePage === 'ip-reputation' ? 'IP Reputation' :
     activePage === 'bot-management' ? 'Bot Management' :
     activePage === 'ip-intelligence' ? 'IP Intelligence' :
+    activePage === 'zero-trust-policies' ? 'Zero-Trust Policies' :
     activePage === 'ssl-settings' ? 'SSL Settings' :
     activePage === 'tls-versions' ? 'TLS Versions' :
     activePage === 'connection-status' ? 'Connection Status' :

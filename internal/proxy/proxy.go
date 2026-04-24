@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"wewaf/internal/ddos"
 	"wewaf/internal/engine"
 	"wewaf/internal/limits"
+	"wewaf/internal/shaper"
 	"wewaf/internal/telemetry"
 	"wewaf/internal/zerotrust"
 )
@@ -40,6 +42,15 @@ type WAFProxy struct {
 	ddos      *ddos.Detector
 	breaker   *limits.Breaker
 	zeroTrust *zerotrust.Engine
+	shaper    *shaper.Shaper
+}
+
+// ShaperStats returns the admission controller's counters.
+func (wp *WAFProxy) ShaperStats() map[string]interface{} {
+	if wp == nil || wp.shaper == nil {
+		return map[string]interface{}{}
+	}
+	return wp.shaper.StatsSnapshot()
 }
 
 // DDoSStats returns the detector's counters for the admin API.
@@ -97,16 +108,26 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 		rl:      rl,
 		backend: backend,
 		ddos: ddos.New(ddos.Config{
-			VolumetricBaseline: cfg.DDoSVolumetricBaseline,
-			VolumetricSpike:    cfg.DDoSVolumetricSpike,
-			ConnRateThreshold:  cfg.DDoSConnRateThreshold,
-			SlowMinBPS:         cfg.DDoSSlowReadBPS,
+			VolumetricBaseline:      cfg.DDoSVolumetricBaseline,
+			VolumetricSpike:         cfg.DDoSVolumetricSpike,
+			ConnRateThreshold:       cfg.DDoSConnRateThreshold,
+			SlowMinBPS:              cfg.DDoSSlowReadBPS,
+			WarmupSeconds:           cfg.DDoSWarmupSeconds,
+			MinAbsoluteRPS:          cfg.DDoSMinAbsoluteRPS,
+			SpikeWindowsRequired:    cfg.DDoSSpikeWindowsRequired,
+			CoolDownSeconds:         cfg.DDoSCoolDownSeconds,
+			BotnetUniqueIPThreshold: cfg.DDoSBotnetUniqueIPThreshold,
 		}),
 		breaker: limits.NewBreaker(
 			cfg.BreakerConsecutiveFailures,
 			time.Duration(cfg.BreakerOpenTimeoutSec)*time.Second,
 		),
 		zeroTrust: zerotrust.NewEngine(nil),
+		shaper: shaper.New(shaper.Config{
+			Enabled: cfg.ShaperEnabled,
+			MaxRPS:  cfg.ShaperMaxRPS,
+			Burst:   cfg.ShaperBurst,
+		}),
 	}
 
 	wp.proxy = httputil.NewSingleHostReverseProxy(backend)
@@ -119,6 +140,17 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 // ServeHTTP implements http.Handler.
 func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	// Attach a request ID to every response so operators can correlate UI
+	// events, logs, and error records. If the client already supplied one
+	// via X-Request-ID, reuse it so upstream trace IDs are preserved.
+	reqID := r.Header.Get("X-Request-ID")
+	if reqID == "" {
+		reqID = generateRequestID()
+	}
+	w.Header().Set("X-Request-ID", reqID)
+	r = r.WithContext(contextWithRequestID(r.Context(), reqID))
+
 	defer func() {
 		if rec := recover(); rec != nil {
 			wp.eng.LogError("proxy: panic in ServeHTTP: %v", rec)
@@ -135,7 +167,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if elapsed := time.Since(start); elapsed > 10*time.Second {
-			wp.eng.LogError("proxy: slow request detected (%v) %s %s", elapsed, r.Method, r.URL.Path)
+			wp.eng.LogError("proxy: slow request detected (%v) %s %s rid=%s", elapsed, r.Method, r.URL.Path, reqID)
 		}
 	}()
 
@@ -157,6 +189,25 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pre-WAF admission control: if the shaper is enabled and the global
+	// token bucket is empty, we early-reject with 429 before spending any
+	// effort on inspection. Under attack the detector tells the shaper to
+	// tighten the budget to 20% of base so the WAF keeps enough resources
+	// to serve the traffic it DOES admit. In normal operation the budget
+	// is well above real traffic so this is a no-op.
+	if wp.shaper != nil {
+		if wp.ddos != nil && wp.ddos.IsUnderAttack() {
+			wp.shaper.Tighten(0.2)
+		} else if wp.shaper != nil {
+			wp.shaper.Relax()
+		}
+		if !wp.shaper.Admit() {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
+	}
+
 	if err := wp.sema.Acquire(r.Context()); err != nil {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
@@ -166,17 +217,29 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	clientIP := getClientIP(r, wp.cfg.TrustXFF)
 
 	// DDoS detection: classify the request before we spend any effort on it.
-	// A volumetric verdict means the whole WAF is under attack and we
-	// should shed load; a connection-rate verdict is a single IP misbehaving.
-	switch wp.ddos.RecordRequest(clientIP) {
+	// The detector tracks three independent signals (volumetric, per-IP
+	// connection rate, distributed/botnet) and only flips "under attack"
+	// after several consecutive spike windows — so normal traffic bursts
+	// don't trigger false positives.
+	switch wp.ddos.RecordRequest(clientIP, r.URL.Path) {
 	case ddos.VerdictVolumetric:
 		w.Header().Set("Retry-After", "30")
-		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-VOLUMETRIC", "global RPS spike", 0)
+		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-VOLUMETRIC", "global RPS spike (sustained)", 0)
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	case ddos.VerdictConnRate:
 		w.Header().Set("Retry-After", "30")
 		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-CONN-RATE", "connection-rate flood", 0)
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	case ddos.VerdictBotnet:
+		// Distributed low-rate attack on a sensitive path. Many unique
+		// source IPs, each individually beneath the rate limit, all
+		// converging on /login-style endpoints. Challenge the request
+		// rather than hard-block since some IPs are likely legitimate.
+		w.Header().Set("Retry-After", "60")
+		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-BOTNET",
+			"distributed attack pattern on sensitive path", 80)
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 		return
 	}
@@ -189,16 +252,25 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Zero-trust policy evaluation — applies path-scoped IP/country/header
-	// rules before the request gets near the rule engine.
+	// rules before the request gets near the rule engine. Policies marked
+	// Simulate return DecisionSimulate; we log the would-block but let the
+	// request continue so operators can stage a policy before enforcing it.
 	if wp.zeroTrust != nil {
-		if decision, reason, policy := wp.zeroTrust.Evaluate(r, clientIP); decision == zerotrust.DecisionDeny {
-			polID := "-"
-			if policy != nil {
-				polID = policy.ID
-			}
+		decision, reason, policy := wp.zeroTrust.Evaluate(r, clientIP)
+		polID := "-"
+		if policy != nil {
+			polID = policy.ID
+		}
+		switch decision {
+		case zerotrust.DecisionDeny:
 			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "ZERO-TRUST:"+polID, reason, 100)
 			http.Error(w, "Forbidden: "+reason, http.StatusForbidden)
 			return
+		case zerotrust.DecisionSimulate:
+			// Would-block — emit as a log-only record so the dashboard's
+			// simulate stats accumulate without breaking production traffic.
+			wp.metrics.RecordBlockWithCategory(clientIP, r.Method, r.URL.Path,
+				"ZERO-TRUST-SIM:"+polID, "zero_trust_simulate", reason, 0)
 		}
 	}
 
@@ -529,6 +601,35 @@ func (wp *WAFProxy) errorHandler(w http.ResponseWriter, r *http.Request, err err
 type txKeyType struct{}
 
 var txKey = txKeyType{}
+
+// reqIDKey is a private context key for the per-request correlation ID.
+type reqIDKeyType struct{}
+
+var reqIDKey = reqIDKeyType{}
+
+func contextWithRequestID(parent context.Context, id string) context.Context {
+	return context.WithValue(parent, reqIDKey, id)
+}
+
+// RequestIDFromContext returns the request ID assigned at proxy entry, or
+// an empty string if none was set.
+func RequestIDFromContext(ctx context.Context) string {
+	if v := ctx.Value(reqIDKey); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// generateRequestID returns a short, unique-enough ID. We don't need
+// cryptographic randomness — just enough to correlate a request across logs
+// and the UI within one session.
+func generateRequestID() string {
+	return fmt.Sprintf("req-%d-%d", time.Now().UnixNano(), reqCounter.Add(1))
+}
+
+var reqCounter atomic.Uint64
 
 // WithTransaction returns a new request with the WAF transaction attached.
 func WithTransaction(req *http.Request, tx *core.Transaction) *http.Request {

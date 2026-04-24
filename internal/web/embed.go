@@ -21,8 +21,10 @@ import (
 	"wewaf/internal/host"
 	"wewaf/internal/limits"
 	"wewaf/internal/proxy"
+	"wewaf/internal/setup"
 	"wewaf/internal/ssl"
 	"wewaf/internal/telemetry"
+	"wewaf/internal/watchdog"
 	"wewaf/internal/zerotrust"
 )
 
@@ -40,12 +42,68 @@ type Server struct {
 	ssl        *ssl.Manager
 	history    *history.Store
 	proxy      *proxy.WAFProxy
+	checker    *setup.Checker
+	watchdog   *watchdog.Watchdog
 
 	meshEnabled  bool
 	meshPeers    []string
 	meshAPIKey   string
 	meshLastSync time.Time
 	meshMu       sync.RWMutex
+
+	// Recent engine errors ring buffer for the Errors page.
+	errMu     sync.Mutex
+	errBuf    []ErrorEvent
+	errBufCap int
+}
+
+// ErrorEvent is one recorded engine error surfaced to the UI.
+type ErrorEvent struct {
+	Timestamp time.Time `json:"timestamp"`
+	Source    string    `json:"source"`
+	Message   string    `json:"message"`
+	RequestID string    `json:"request_id,omitempty"`
+}
+
+// RecordError appends an error to the server's recent-errors ring.
+func (s *Server) RecordError(source, message, requestID string) {
+	if s == nil {
+		return
+	}
+	ev := ErrorEvent{
+		Timestamp: time.Now().UTC(),
+		Source:    source,
+		Message:   truncString(message, 1024),
+		RequestID: requestID,
+	}
+	cap := s.errBufCap
+	if cap <= 0 {
+		cap = 200
+	}
+	s.errMu.Lock()
+	s.errBuf = append(s.errBuf, ev)
+	if len(s.errBuf) > cap {
+		over := len(s.errBuf) - cap
+		copy(s.errBuf, s.errBuf[over:])
+		s.errBuf = s.errBuf[:cap]
+	}
+	s.errMu.Unlock()
+}
+
+func truncString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// AttachWatchdog wires the watchdog into the server so its snapshot is
+// served at /api/health/detail.
+func (s *Server) AttachWatchdog(w *watchdog.Watchdog) {
+	if s == nil {
+		return
+	}
+	s.watchdog = w
 }
 
 // Deps wires optional subsystems into the admin server.
@@ -67,6 +125,7 @@ type Deps struct {
 
 // NewServer creates the admin web server.
 func NewServer(d Deps) *Server {
+	checker := setup.New(d.Config, d.Connection, d.History, d.SSL, d.RulesFn)
 	return &Server{
 		cfg:        d.Config,
 		metrics:    d.Metrics,
@@ -77,6 +136,9 @@ func NewServer(d Deps) *Server {
 		ssl:        d.SSL,
 		history:    d.History,
 		proxy:      d.Proxy,
+		checker:    checker,
+		errBufCap:  200,
+		errBuf:     make([]ErrorEvent, 0, 200),
 
 		meshEnabled: d.MeshEnabled,
 		meshPeers:   d.MeshPeers,
@@ -150,12 +212,29 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// Live events — Server-Sent Events stream of blocks/egress/bots.
 	api.HandleFunc("/api/events/stream", s.handleEventsStream)
 
-	// DDoS + circuit-breaker stats.
+	// DDoS + circuit-breaker + shaper stats.
 	api.HandleFunc("/api/ddos/stats", s.handleDDoSStats)
 	api.HandleFunc("/api/breaker/stats", s.handleBreakerStats)
+	api.HandleFunc("/api/shaper/stats", s.handleShaperStats)
 
 	// Zero-trust path policies.
 	api.HandleFunc("/api/zerotrust/policies", s.handleZeroTrustPolicies)
+	api.HandleFunc("/api/zerotrust/templates", s.handleZeroTrustTemplates)
+
+	// Setup checks — self-validating Next Steps.
+	api.HandleFunc("/api/setup/checks/dns", s.handleSetupCheckDNS)
+	api.HandleFunc("/api/setup/checks/origin", s.handleSetupCheckOrigin)
+	api.HandleFunc("/api/setup/checks/ssl", s.handleSetupCheckSSL)
+	api.HandleFunc("/api/setup/checks/traffic", s.handleSetupCheckTraffic)
+	api.HandleFunc("/api/setup/checks/rules", s.handleSetupCheckRules)
+	api.HandleFunc("/api/setup/checks/history", s.handleSetupCheckHistory)
+	api.HandleFunc("/api/setup/checks/all", s.handleSetupCheckAll)
+
+	// Recent engine errors for the ops panel.
+	api.HandleFunc("/api/errors", s.handleErrors)
+
+	// Per-subsystem health from the watchdog.
+	api.HandleFunc("/api/health/detail", s.handleHealthDetail)
 
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
@@ -277,6 +356,12 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			MeshAPIKey             string   `json:"mesh_api_key"`
 			MeshSyncTimeoutSec     int      `json:"mesh_sync_timeout_sec"`
 			SecurityHeadersEnabled *bool    `json:"security_headers_enabled"`
+			ParanoiaLevel          int      `json:"paranoia_level"`
+			CRSEnabled             *bool    `json:"crs_enabled"`
+			FailsafeMode           string   `json:"failsafe_mode"`
+			ShaperEnabled          *bool    `json:"shaper_enabled"`
+			ShaperMaxRPS           int      `json:"shaper_max_rps"`
+			ShaperBurst            int      `json:"shaper_burst"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -327,6 +412,33 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.SecurityHeadersEnabled != nil {
 			s.cfg.SecurityHeadersEnabled = *payload.SecurityHeadersEnabled
+		}
+		if payload.ParanoiaLevel > 0 {
+			pl := payload.ParanoiaLevel
+			if pl > 4 {
+				pl = 4
+			}
+			s.cfg.ParanoiaLevel = pl
+		}
+		if payload.CRSEnabled != nil {
+			s.cfg.CRSEnabled = *payload.CRSEnabled
+		}
+		if payload.FailsafeMode == "open" || payload.FailsafeMode == "closed" {
+			s.cfg.FailsafeMode = payload.FailsafeMode
+		}
+		if payload.ShaperEnabled != nil {
+			s.cfg.ShaperEnabled = *payload.ShaperEnabled
+		}
+		if payload.ShaperMaxRPS > 0 {
+			s.cfg.ShaperMaxRPS = payload.ShaperMaxRPS
+		}
+		if payload.ShaperBurst > 0 {
+			s.cfg.ShaperBurst = payload.ShaperBurst
+		}
+		// Persist a config snapshot after any successful change so operators
+		// have a rollback target.
+		if path, err := s.cfg.SnapshotToFile("config_backup", 10); err == nil {
+			log.Printf("config snapshot saved: %s", path)
 		}
 		writeJSON(w, map[string]interface{}{"status": "ok", "mode": s.cfg.ModeSnapshot(), "history_rotate_hours": s.cfg.HistoryRotateHours})
 	default:
@@ -1271,6 +1383,18 @@ func (s *Server) handleBreakerStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.proxy.BreakerStats())
 }
 
+func (s *Server) handleShaperStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.proxy == nil {
+		writeJSON(w, map[string]interface{}{"enabled": false})
+		return
+	}
+	writeJSON(w, s.proxy.ShaperStats())
+}
+
 // ---- Zero-trust ----
 
 func (s *Server) handleZeroTrustPolicies(w http.ResponseWriter, r *http.Request) {
@@ -1298,6 +1422,140 @@ func (s *Server) handleZeroTrustPolicies(w http.ResponseWriter, r *http.Request)
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// ---- Setup checks ----
+
+func (s *Server) handleSetupCheckDNS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	domain := r.URL.Query().Get("domain")
+	expected := r.URL.Query().Get("expected_ip")
+	if r.Method == http.MethodPost {
+		var payload struct {
+			Domain     string `json:"domain"`
+			ExpectedIP string `json:"expected_ip"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		if payload.Domain != "" {
+			domain = payload.Domain
+		}
+		if payload.ExpectedIP != "" {
+			expected = payload.ExpectedIP
+		}
+	}
+	writeJSON(w, s.checker.CheckDNS(r.Context(), domain, expected))
+}
+
+func (s *Server) handleSetupCheckOrigin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, s.checker.CheckOrigin(r.Context()))
+}
+
+func (s *Server) handleSetupCheckSSL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	domain := r.URL.Query().Get("domain")
+	writeJSON(w, s.checker.CheckSSL(r.Context(), domain))
+}
+
+func (s *Server) handleSetupCheckTraffic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, s.checker.CheckTraffic(r.Context()))
+}
+
+func (s *Server) handleSetupCheckRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, s.checker.CheckRules(r.Context()))
+}
+
+func (s *Server) handleSetupCheckHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, s.checker.CheckHistory(r.Context()))
+}
+
+func (s *Server) handleSetupCheckAll(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	domain := r.URL.Query().Get("domain")
+	expectedIP := r.URL.Query().Get("expected_ip")
+	if r.Method == http.MethodPost {
+		var p struct {
+			Domain     string `json:"domain"`
+			ExpectedIP string `json:"expected_ip"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&p)
+		if p.Domain != "" {
+			domain = p.Domain
+		}
+		if p.ExpectedIP != "" {
+			expectedIP = p.ExpectedIP
+		}
+	}
+	results := s.checker.RunAll(r.Context(), domain, expectedIP)
+	writeJSON(w, map[string]interface{}{"results": results})
+}
+
+// ---- Errors panel ----
+
+func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.errMu.Lock()
+	out := make([]ErrorEvent, len(s.errBuf))
+	copy(out, s.errBuf)
+	s.errMu.Unlock()
+	writeJSON(w, map[string]interface{}{"errors": out, "count": len(out)})
+}
+
+// ---- Health detail ----
+
+func (s *Server) handleHealthDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.watchdog == nil {
+		writeJSON(w, map[string]interface{}{"overall": "unknown", "subsystems": []watchdog.Health{}})
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"overall":    s.watchdog.Overall(),
+		"failures":   s.watchdog.Failures(),
+		"subsystems": s.watchdog.Snapshot(),
+	})
+}
+
+// ---- Zero-trust templates ----
+
+func (s *Server) handleZeroTrustTemplates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"templates": zerotrust.Templates(),
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

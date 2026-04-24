@@ -36,6 +36,7 @@ const navItems: NavItem[] = [
   {
     id: 'zero-trust', label: 'Zero Trust', icon: Lock,
     children: [
+      { id: 'zero-trust-policies', label: 'Path Policies', icon: Shield },
       { id: 'insights', label: 'Insights', icon: Eye },
       { id: 'networks', label: 'Networks', icon: Network },
       { id: 'access-controls', label: 'Access Controls', icon: Fingerprint },

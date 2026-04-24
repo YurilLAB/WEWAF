@@ -262,8 +262,26 @@ export interface DDoSStats {
   flagged_volumetric?: number;
   flagged_conn_rate?: number;
   flagged_slow_read?: number;
+  flagged_botnet?: number;
   under_attack?: boolean;
   last_attack_unix?: number;
+  adaptive_baseline?: number;
+  spike_streak?: number;
+  spike_windows_req?: number;
+  min_absolute_rps?: number;
+}
+
+export interface ShaperStats {
+  enabled?: boolean;
+  base_max_rps?: number;
+  base_burst?: number;
+  current_rps?: number;
+  current_burst?: number;
+  tokens?: number;
+  admitted?: number;
+  rejected?: number;
+  tightenings?: number;
+  under_pressure?: boolean;
 }
 
 export interface BreakerStats {
@@ -282,6 +300,8 @@ export interface ZeroTrustPolicy {
   description?: string;
   path_prefix?: string;
   path_exact?: string;
+  path_regex?: string;
+  methods?: string[];
   require_auth_header?: string;
   require_mtls?: boolean;
   allowed_countries?: string[];
@@ -289,6 +309,39 @@ export interface ZeroTrustPolicy {
   allowed_cidrs?: string[];
   blocked_cidrs?: string[];
   fallback_allow?: boolean;
+  time_start?: string;
+  time_end?: string;
+  simulate?: boolean;
+  deny_by_default?: boolean;
+}
+
+export type SetupCheckStatus = 'pass' | 'fail' | 'warn' | 'skip';
+
+export interface SetupCheckResult {
+  step: string;
+  status: SetupCheckStatus;
+  message: string;
+  detail?: Record<string, unknown>;
+  at: string;
+}
+
+export interface ErrorEvent {
+  timestamp: string;
+  source: string;
+  message: string;
+  request_id?: string;
+}
+
+export interface HealthDetail {
+  overall: 'ok' | 'degraded' | 'fail' | 'unknown';
+  failures: number;
+  subsystems: Array<{
+    subsystem: string;
+    status: 'ok' | 'degraded' | 'fail';
+    message: string;
+    detail?: Record<string, unknown>;
+    at: string;
+  }>;
 }
 
 export interface SSLCertificate {
@@ -425,6 +478,12 @@ export const api = {
     mesh_sync_timeout_sec?: number;
     mesh_api_key?: string;
     security_headers_enabled?: boolean;
+    paranoia_level?: number;
+    crs_enabled?: boolean;
+    failsafe_mode?: 'closed' | 'open';
+    shaper_enabled?: boolean;
+    shaper_max_rps?: number;
+    shaper_burst?: number;
   }) =>
     post<ConfigResponse & { status: string }>('/config', payload),
   getBlocks: () => get<BlocksResponse>('/blocks'),
@@ -457,12 +516,30 @@ export const api = {
   autoMitigate: (threshold = 10, durationSec = 3600) =>
     post<AutoMitigateResponse>('/ip-auto-mitigate', { threshold, duration_sec: durationSec }),
 
-  // DDoS + circuit breaker + zero-trust
+  // DDoS + circuit breaker + shaper + zero-trust
   getDDoSStats: () => get<DDoSStats>('/ddos/stats'),
   getBreakerStats: () => get<BreakerStats>('/breaker/stats'),
+  getShaperStats: () => get<ShaperStats>('/shaper/stats'),
   getZeroTrustPolicies: () => get<{ policies: ZeroTrustPolicy[] }>('/zerotrust/policies'),
   setZeroTrustPolicies: (policies: ZeroTrustPolicy[]) =>
     put<{ status: string; count: number }>('/zerotrust/policies', { policies }),
+  getZeroTrustTemplates: () => get<{ templates: ZeroTrustPolicy[] }>('/zerotrust/templates'),
+
+  // Setup checks
+  checkSetupDNS: (domain: string, expectedIP?: string) =>
+    post<SetupCheckResult>('/setup/checks/dns', { domain, expected_ip: expectedIP }),
+  checkSetupOrigin: () => post<SetupCheckResult>('/setup/checks/origin', {}),
+  checkSetupSSL: (domain?: string) =>
+    get<SetupCheckResult>(`/setup/checks/ssl${domain ? '?domain=' + encodeURIComponent(domain) : ''}`),
+  checkSetupTraffic: () => post<SetupCheckResult>('/setup/checks/traffic', {}),
+  checkSetupRules: () => get<SetupCheckResult>('/setup/checks/rules'),
+  checkSetupHistory: () => get<SetupCheckResult>('/setup/checks/history'),
+  runSetupChecks: (domain?: string, expectedIP?: string) =>
+    post<{ results: SetupCheckResult[] }>('/setup/checks/all', { domain, expected_ip: expectedIP }),
+
+  // Ops panels
+  getErrors: () => get<{ errors: ErrorEvent[]; count: number }>('/errors'),
+  getHealthDetail: () => get<HealthDetail>('/health/detail'),
 
   // SSL/TLS
   getCertificates: () => get<{ certificates: SSLCertificate[] }>('/ssl/certificates'),
