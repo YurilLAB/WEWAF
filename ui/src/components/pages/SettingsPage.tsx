@@ -10,6 +10,8 @@ export default function SettingsPage() {
   const [form, setForm] = useState({ ...settings });
   const [saved, setSaved] = useState(false);
   const [backendError, setBackendError] = useState<string | null>(null);
+  const [meshTestStatus, setMeshTestStatus] = useState<{ text: string; ok: boolean | null }>({ text: '', ok: null });
+  const [egressStats, setEgressStats] = useState({ blocked: 0, allowed: 0 });
 
   useEffect(() => {
     api.getConfig().then((cfg) => {
@@ -49,6 +51,21 @@ export default function SettingsPage() {
     });
   }, [dispatch]);
 
+  useEffect(() => {
+    const poll = async () => {
+      const metrics = await api.getMetrics();
+      if (metrics) {
+        setEgressStats({
+          blocked: metrics.egress_blocked ?? 0,
+          allowed: metrics.egress_allowed ?? 0,
+        });
+      }
+    };
+    poll();
+    const id = setInterval(poll, 10000);
+    return () => clearInterval(id);
+  }, []);
+
   const handleSave = async () => {
     setBackendError(null);
     // Update local store
@@ -81,6 +98,22 @@ export default function SettingsPage() {
   const handleReset = () => {
     setForm({ ...settings });
     setBackendError(null);
+    setMeshTestStatus({ text: '', ok: null });
+  };
+
+  const handleTestPeer = async () => {
+    const peers = form.meshPeers.split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
+    if (peers.length === 0) {
+      setMeshTestStatus({ text: 'No peers configured.', ok: false });
+      return;
+    }
+    setMeshTestStatus({ text: 'Testing...', ok: null });
+    const res = await api.syncMeshPeer(peers[0], form.meshAPIKey);
+    if (res) {
+      setMeshTestStatus({ text: 'Connection successful!', ok: true });
+    } else {
+      setMeshTestStatus({ text: 'Connection failed.', ok: false });
+    }
   };
 
   return (
@@ -266,6 +299,16 @@ export default function SettingsPage() {
                 <input type="checkbox" checked={form.egressBlockPrivateIPs} onChange={(e) => setForm({ ...form, egressBlockPrivateIPs: e.target.checked })} className="rounded border-waf-border" />
                 Block requests to private IPs / localhost (SSRF protection)
               </label>
+              <div className="grid grid-cols-2 gap-4 pt-2">
+                <div className="bg-waf-elevated border border-waf-border rounded-lg p-3">
+                  <div className="text-[10px] text-waf-dim uppercase tracking-wider">Blocked</div>
+                  <div className="text-lg font-semibold text-waf-text">{egressStats.blocked}</div>
+                </div>
+                <div className="bg-waf-elevated border border-waf-border rounded-lg p-3">
+                  <div className="text-[10px] text-waf-dim uppercase tracking-wider">Allowed</div>
+                  <div className="text-lg font-semibold text-waf-text">{egressStats.allowed}</div>
+                </div>
+              </div>
             </motion.div>
           )}
         </div>
@@ -299,6 +342,19 @@ export default function SettingsPage() {
                 <label className="text-xs text-waf-muted mb-1 block">Mesh API Key</label>
                 <input type="password" value={form.meshAPIKey} onChange={(e) => setForm({ ...form, meshAPIKey: e.target.value })} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" placeholder="shared secret between peers" />
               </div>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={handleTestPeer}
+                  className="px-3 py-1.5 bg-waf-elevated border border-waf-border rounded-lg text-xs text-waf-text hover:bg-waf-border transition-colors"
+                >
+                  Test Peer Connection
+                </button>
+                {meshTestStatus.text && (
+                  <span className={`text-xs ${meshTestStatus.ok === true ? 'text-emerald-400' : meshTestStatus.ok === false ? 'text-red-400' : 'text-waf-dim'}`}>
+                    {meshTestStatus.text}
+                  </span>
+                )}
+              </div>
               <div className="flex items-center gap-2 text-xs text-waf-dim">
                 <Network className="w-3 h-3" />
                 <span>Peers: {state.meshStatus.peerCount} | Last sync: {state.meshStatus.lastSync ? new Date(state.meshStatus.lastSync).toLocaleString() : 'Never'}</span>
@@ -311,10 +367,22 @@ export default function SettingsPage() {
       {/* Response Hardening */}
       <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.295 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
         <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2"><Lock className="w-4 h-4 text-waf-orange" /> Response Hardening</h3>
-        <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
-          <input type="checkbox" checked={form.securityHeadersEnabled} onChange={(e) => setForm({ ...form, securityHeadersEnabled: e.target.checked })} className="rounded border-waf-border" />
-          Inject security headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy) and strip Server/X-Powered-By
-        </label>
+        <div className="space-y-4">
+          <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+            <input type="checkbox" checked={form.securityHeadersEnabled} onChange={(e) => setForm({ ...form, securityHeadersEnabled: e.target.checked })} className="rounded border-waf-border" />
+            Inject security headers (X-Content-Type-Options, X-Frame-Options, Referrer-Policy, Permissions-Policy) and strip Server/X-Powered-By
+          </label>
+          <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+            <input type="checkbox" checked={form.cspEnabled} onChange={(e) => setForm({ ...form, cspEnabled: e.target.checked })} className="rounded border-waf-border" />
+            Enable Content-Security-Policy header
+          </label>
+          {form.cspEnabled && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }}>
+              <label className="text-xs text-waf-muted mb-1 block">CSP Policy</label>
+              <textarea value={form.cspPolicy} onChange={(e) => setForm({ ...form, cspPolicy: e.target.value })} rows={3} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" placeholder="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" />
+            </motion.div>
+          )}
+        </div>
       </motion.div>
 
       {/* Alerts */}

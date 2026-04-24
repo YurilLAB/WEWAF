@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -202,6 +206,8 @@ func main() {
 
 	stopSampler := startTrafficSampler(metrics)
 
+	meshStopCh := make(chan struct{})
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
@@ -230,8 +236,87 @@ func main() {
 		}
 	}()
 
+	if cfg.MeshEnabled {
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("mesh gossip panic: %v", rec)
+				}
+			}()
+			ticker := time.NewTicker(time.Duration(cfg.MeshGossipIntervalSec) * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					localBans := banList.List()
+					payload := map[string]interface{}{"bans": localBans}
+					body, err := json.Marshal(payload)
+					if err != nil {
+						log.Printf("mesh gossip: failed to marshal bans: %v", err)
+						continue
+					}
+					for _, peerURL := range cfg.MeshPeers {
+						if peerURL == "" {
+							continue
+						}
+						syncURL := strings.TrimSuffix(peerURL, "/") + "/api/mesh/sync"
+						ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.MeshSyncTimeoutSec)*time.Second)
+						req, err := http.NewRequestWithContext(ctx, http.MethodPost, syncURL, bytes.NewReader(body))
+						if err != nil {
+							cancel()
+							log.Printf("mesh gossip: failed to create request for %s: %v", peerURL, err)
+							continue
+						}
+						req.Header.Set("Content-Type", "application/json")
+						if cfg.MeshAPIKey != "" {
+							req.Header.Set("X-Mesh-Key", cfg.MeshAPIKey)
+						}
+
+						resp, err := http.DefaultClient.Do(req)
+						cancel()
+						if err != nil {
+							log.Printf("mesh gossip: peer %s sync error: %v", peerURL, err)
+							continue
+						}
+
+						var result struct {
+							Status string          `json:"status"`
+							Bans   []core.BanEntry `json:"bans"`
+						}
+						if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+							resp.Body.Close()
+							log.Printf("mesh gossip: peer %s decode error: %v", peerURL, err)
+							continue
+						}
+						resp.Body.Close()
+
+						if resp.StatusCode == http.StatusOK {
+							for _, b := range result.Bans {
+								if b.IP == "" || net.ParseIP(b.IP) == nil {
+									continue
+								}
+								duration := time.Until(b.ExpiresAt)
+								if duration <= 0 {
+									continue
+								}
+								banList.Ban(b.IP, b.Reason, duration)
+							}
+							log.Printf("mesh gossip: peer %s synced, received %d bans", peerURL, len(result.Bans))
+						} else {
+							log.Printf("mesh gossip: peer %s returned status %d", peerURL, resp.StatusCode)
+						}
+					}
+				case <-meshStopCh:
+					return
+				}
+			}
+		}()
+	}
+
 	<-sigCh
 	log.Println("shutdown signal received, gracefully stopping...")
+
+	close(meshStopCh)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

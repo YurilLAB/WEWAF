@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -69,12 +70,75 @@ func (e *Engine) Reload(rs *rules.RuleSet) {
 	e.ruleSet = rs
 }
 
+var (
+	headlessUARe = regexp.MustCompile(`(?i)(headlesschrome|phantomjs|selenium|webdriver|puppeteer|playwright|cypress)`)
+	toolUARe     = regexp.MustCompile(`(?i)(scrapy|curl|wget|python-requests|java|libwww|httpclient|okhttp|axios)`)
+)
+
+// DetectBot analyzes the request for bot signatures.
+func (e *Engine) DetectBot(tx *core.Transaction) (isBot bool, botName string, score int) {
+	if tx == nil || tx.Request == nil {
+		return false, "", 0
+	}
+
+	ua := tx.Request.UserAgent()
+
+	// Check User-Agent for headless browser indicators.
+	if m := headlessUARe.FindString(ua); m != "" {
+		return true, m, 40
+	}
+
+	// Check for missing standard browser headers.
+	if tx.Request.Header.Get("Accept-Language") == "" || tx.Request.Header.Get("Accept") == "" {
+		return true, "MissingBrowserHeaders", 20
+	}
+
+	// Check for WebDriver traces in headers.
+	for k, v := range tx.Request.Header {
+		kv := strings.ToLower(k + ": " + strings.Join(v, ", "))
+		if strings.Contains(kv, "selenium") || strings.Contains(kv, "webdriver") || strings.Contains(kv, "phantom") {
+			return true, "WebDriverTrace", 30
+		}
+	}
+
+	// Check for automated tool signatures.
+	if m := toolUARe.FindString(ua); m != "" {
+		return true, m, 30
+	}
+
+	return false, "", 0
+}
+
 // ProcessRequestHeaders evaluates rules against the incoming request line and headers.
 func (e *Engine) ProcessRequestHeaders(tx *core.Transaction) *core.Interruption {
 	if tx == nil || tx.Request == nil {
 		return nil
 	}
 	targets := e.buildRequestHeaderTargets(tx.Request)
+
+	// Bot fingerprinting with panic recovery.
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				e.logger.Errorf("engine: panic during bot detection: %v", rec)
+			}
+		}()
+		isBot, botName, score := e.DetectBot(tx)
+		if isBot {
+			tx.AddMatch(core.Match{
+				RuleID:    "BOT-FINGERPRINT",
+				RuleName:  "Bot Fingerprint Detected: " + botName,
+				Phase:     core.PhaseRequestHeaders,
+				Target:    "headers",
+				Value:     botName,
+				Score:     score,
+				Action:    core.ActionLog,
+				Message:   "Automated client detected",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+	}()
+
 	return e.evaluatePhase(tx, core.PhaseRequestHeaders, targets)
 }
 

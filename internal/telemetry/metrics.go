@@ -59,6 +59,10 @@ type Metrics struct {
 	TotalBytesIn    uint64
 	TotalBytesOut   uint64
 	ErrorCount      uint64
+	EgressBlocked   uint64
+	EgressAllowed   uint64
+	BotsDetected    uint64
+	AnomalyScore    int64
 	UniqueIPs       map[string]struct{}
 	RecentBlocks    []BlockRecord
 	TrafficHistory  []TrafficPoint
@@ -196,11 +200,35 @@ func (m *Metrics) RecordBlockFromResponse(ip, method, path, ruleID, message stri
 	m.RecordBlock(ip, method, path, ruleID, message, score)
 }
 
+// RecordEgressBlock increments the egress-blocked counter.
+func (m *Metrics) RecordEgressBlock(targetURL, reason string) {
+	defer recoverPanic("RecordEgressBlock")
+	m.mu.Lock()
+	m.EgressBlocked++
+	m.mu.Unlock()
+}
+
+// RecordEgressAllow increments the egress-allowed counter.
+func (m *Metrics) RecordEgressAllow() {
+	defer recoverPanic("RecordEgressAllow")
+	m.mu.Lock()
+	m.EgressAllowed++
+	m.mu.Unlock()
+}
+
 // RecordError bumps the backend-error counter.
 func (m *Metrics) RecordError() {
 	defer recoverPanic("RecordError")
 	m.mu.Lock()
 	m.ErrorCount++
+	m.mu.Unlock()
+}
+
+// RecordBotDetected increments the bot-detected counter.
+func (m *Metrics) RecordBotDetected(botName string) {
+	defer recoverPanic("RecordBotDetected")
+	m.mu.Lock()
+	m.BotsDetected++
 	m.mu.Unlock()
 }
 
@@ -220,6 +248,9 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"total_bytes_in":   m.TotalBytesIn,
 		"total_bytes_out":  m.TotalBytesOut,
 		"errors":           m.ErrorCount,
+		"egress_blocked":   m.EgressBlocked,
+		"egress_allowed":   m.EgressAllowed,
+		"bots_detected":    m.BotsDetected,
 		"unique_ips":       len(m.UniqueIPs),
 		"recent_blocks":    recent,
 		"traffic_history":  history,

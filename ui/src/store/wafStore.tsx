@@ -171,6 +171,8 @@ export interface WAFSettings {
   meshSyncTimeoutSec: number;
   meshAPIKey: string;
   securityHeadersEnabled: boolean;
+  cspEnabled: boolean;
+  cspPolicy: string;
 }
 
 export interface HostMachineStats {
@@ -297,6 +299,14 @@ interface WAFState {
     lastSync: string;
     peerCount: number;
   };
+  egressStatus: {
+    enabled: boolean;
+    addr: string;
+    totalBlocked: number;
+    totalAllowed: number;
+  };
+  meshPeers: string[];
+  botsDetected: number;
 }
 
 type Action =
@@ -339,6 +349,9 @@ type Action =
   | { type: 'RECORD_CONNECTION_EVENT'; payload: { state: ConnectionState; ping_ms: number } }
   | { type: 'SET_MESH_STATUS'; payload: WAFState['meshStatus'] }
   | { type: 'UPDATE_MESH_STATUS'; payload: Partial<WAFState['meshStatus']> }
+  | { type: 'SET_EGRESS_STATUS'; payload: WAFState['egressStatus'] }
+  | { type: 'SET_MESH_PEERS'; payload: string[] }
+  | { type: 'SET_BOTS_DETECTED'; payload: number }
   | { type: 'RECORD_PING'; payload: number };
 
 const defaultSettings: WAFSettings = {
@@ -365,6 +378,8 @@ const defaultSettings: WAFSettings = {
   meshSyncTimeoutSec: 10,
   meshAPIKey: '',
   securityHeadersEnabled: true,
+  cspEnabled: false,
+  cspPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'",
 };
 
 const defaultDDoS: DDoSConfig = {
@@ -535,6 +550,9 @@ const initialState: WAFState = {
     lastSync: '',
     peerCount: 0,
   },
+  egressStatus: { enabled: false, addr: ':8081', totalBlocked: 0, totalAllowed: 0 },
+  meshPeers: [],
+  botsDetected: 0,
 };
 
 function wafReducer(state: WAFState, action: Action): WAFState {
@@ -653,6 +671,12 @@ function wafReducer(state: WAFState, action: Action): WAFState {
       return { ...state, meshStatus: action.payload };
     case 'UPDATE_MESH_STATUS':
       return { ...state, meshStatus: { ...state.meshStatus, ...action.payload } };
+    case 'SET_EGRESS_STATUS':
+      return { ...state, egressStatus: action.payload };
+    case 'SET_MESH_PEERS':
+      return { ...state, meshPeers: action.payload };
+    case 'SET_BOTS_DETECTED':
+      return { ...state, botsDetected: action.payload };
     case 'RECORD_PING': {
       const now = new Date().toISOString();
       const pings = [...state.sessionHistory.ping_history, { timestamp: now, ping_ms: action.payload }].slice(-50);
@@ -684,14 +708,14 @@ type PersistedKey =
   | 'botRules' | 'accessPolicies' | 'networkPolicies' | 'devicePostures'
   | 'tunnels' | 'ddosConfig' | 'settings' | 'nextSteps'
   | 'sslConfig' | 'sslCertificates' | 'connectionInfo' | 'sessionHistory'
-  | 'meshStatus';
+  | 'meshStatus' | 'egressStatus' | 'meshPeers' | 'botsDetected';
 
 const PERSISTED_KEYS: PersistedKey[] = [
   'domains', 'dnsRecords', 'wafRules', 'rateLimits', 'ipReputation',
   'botRules', 'accessPolicies', 'networkPolicies', 'devicePostures',
   'tunnels', 'ddosConfig', 'settings', 'nextSteps',
   'sslConfig', 'sslCertificates', 'connectionInfo', 'sessionHistory',
-  'meshStatus',
+  'meshStatus', 'egressStatus', 'meshPeers', 'botsDetected',
 ];
 
 function loadPersistedState(): Partial<WAFState> | null {
@@ -750,7 +774,8 @@ export function WAFProvider({ children }: { children: ReactNode }) {
     state.networkPolicies, state.devicePostures, state.tunnels,
     state.ddosConfig, state.settings, state.nextSteps,
     state.sslConfig, state.sslCertificates, state.connectionInfo,
-    state.sessionHistory, state.meshStatus,
+    state.sessionHistory, state.meshStatus, state.egressStatus,
+    state.meshPeers, state.botsDetected,
   ]);
 
   return <WAFContext.Provider value={{ state, dispatch }}>{children}</WAFContext.Provider>;

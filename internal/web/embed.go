@@ -122,6 +122,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// Distributed threat mesh
 	api.HandleFunc("/api/mesh/status", s.handleMeshStatus)
 	api.HandleFunc("/api/mesh/sync", s.handleMeshSync)
+	api.HandleFunc("/api/mesh/peers", s.handleMeshPeers)
+
+	// Egress proxy
+	api.HandleFunc("/api/egress/status", s.handleEgressStatus)
+
+	// Bot detections
+	api.HandleFunc("/api/bots/detected", s.handleBotsDetected)
 
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
@@ -793,6 +800,43 @@ func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"status": "synced",
 		"bans":   bans,
+	})
+}
+
+func (s *Server) handleEgressStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"enabled":           s.cfg.EgressEnabled,
+		"addr":              s.cfg.EgressAddr,
+		"block_private_ips": s.cfg.EgressBlockPrivateIPs,
+		"allowlist_count":   len(s.cfg.EgressAllowlist),
+		"total_blocked":     0,
+		"total_allowed":     0,
+	})
+}
+
+func (s *Server) handleMeshPeers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"peers":  s.meshPeers,
+		"count":  len(s.meshPeers),
+		"status": "active",
+	})
+}
+
+func (s *Server) handleBotsDetected(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, map[string]interface{}{
+		"bots": []interface{}{},
 	})
 }
 

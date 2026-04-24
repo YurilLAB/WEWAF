@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -571,6 +572,8 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !allowed {
+			ep.recordEgressBlock(targetURL, "destination not in egress allowlist")
+			ep.eng.LogError("egress: blocked request to %s: destination not in egress allowlist", targetURL)
 			http.Error(w, "Forbidden: destination not in egress allowlist", http.StatusForbidden)
 			return
 		}
@@ -579,9 +582,26 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Block private IPs.
 	if ep.cfg.EgressBlockPrivateIPs {
 		if isPrivateHost(parsed.Hostname()) {
+			ep.recordEgressBlock(targetURL, "private IP destination blocked")
+			ep.eng.LogError("egress: blocked request to %s: private IP destination blocked", targetURL)
 			http.Error(w, "Forbidden: private IP destination blocked", http.StatusForbidden)
 			return
 		}
+	}
+
+	// CONNECT tunnel support for HTTPS egress.
+	if r.Method == http.MethodConnect {
+		ep.recordEgressAllow()
+		ep.handleConnect(w, r)
+		return
+	}
+
+	// EgressMaxBodyBytes enforcement.
+	if r.ContentLength > ep.cfg.EgressMaxBodyBytes && r.ContentLength > 0 {
+		ep.recordEgressBlock(targetURL, "payload too large")
+		ep.eng.LogError("egress: blocked request to %s: payload too large", targetURL)
+		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+		return
 	}
 
 	// Buffer body for inspection.
@@ -612,9 +632,13 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if intr := ep.eng.EvaluateEgress(tx, targets); intr != nil {
+		ep.recordEgressBlock(targetURL, "egress policy violation")
+		ep.eng.LogError("egress: blocked request to %s: egress policy violation", targetURL)
 		http.Error(w, "Forbidden: egress policy violation", http.StatusForbidden)
 		return
 	}
+
+	ep.recordEgressAllow()
 
 	// Forward the request.
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bytes.NewReader(body))
@@ -643,6 +667,65 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			ep.eng.LogError("egress: panic in CONNECT tunnel: %v", rec)
+		}
+	}()
+
+	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	if err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+	defer destConn.Close()
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, _, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	defer clientConn.Close()
+
+	_, err = clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	if err != nil {
+		return
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(destConn, clientConn)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(clientConn, destConn)
+	}()
+
+	wg.Wait()
+}
+
+func (ep *EgressProxy) recordEgressBlock(targetURL, reason string) {
+	if ep.metrics != nil {
+		ep.metrics.RecordEgressBlock(targetURL, reason)
+	}
+}
+
+func (ep *EgressProxy) recordEgressAllow() {
+	if ep.metrics != nil {
+		ep.metrics.RecordEgressAllow()
+	}
 }
 
 func isPrivateHost(host string) bool {

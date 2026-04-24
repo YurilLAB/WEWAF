@@ -60,6 +60,9 @@ export interface MetricsResponse {
   unique_ips: number;
   recent_blocks: BlockRecord[];
   traffic_history: TrafficPoint[];
+  egress_blocked?: number;
+  egress_allowed?: number;
+  bots_detected?: number;
 }
 
 export interface BlockRecord {
@@ -68,6 +71,7 @@ export interface BlockRecord {
   method: string;
   path: string;
   rule_id: string;
+  rule_category?: string;
   score: number;
   message: string;
 }
@@ -247,6 +251,31 @@ export interface EgressConfigResponse {
   security_headers_enabled: boolean;
 }
 
+export interface EgressStatusResponse {
+  enabled: boolean;
+  addr: string;
+  block_private_ips: boolean;
+  allowlist_count: number;
+  total_blocked: number;
+  total_allowed: number;
+}
+
+export interface MeshPeersResponse {
+  peers: string[];
+  count: number;
+  status: string;
+}
+
+export interface BotsDetectedResponse {
+  bots: Array<{
+    timestamp: string;
+    ip: string;
+    user_agent: string;
+    bot_name: string;
+    score: number;
+  }>;
+}
+
 // =====================
 // API Functions (all return null on error - no throws)
 // =====================
@@ -283,6 +312,7 @@ export const api = {
   unbanIP: (ip: string) => del<{ status: string }>(`/bans?ip=${encodeURIComponent(ip)}`),
   getRateLimitConfig: () => get<RateLimitConfigResponse>('/ratelimit/config'),
   getRequests: () => get<{ requests: RequestEvent[] }>('/requests'),
+  getBotsDetected: () => get<{ bots_detected: number }>('/metrics').then(m => m?.bots_detected ?? null),
 
   // Host Machine Monitoring
   getHostStats: () => get<HostStatsResponse>('/host/stats'),
@@ -305,6 +335,8 @@ export const api = {
 
   getEgressConfig: () => get<EgressConfigResponse>('/config'),
   getMeshStatus: () => get<MeshStatusResponse>('/mesh/status'),
+  getEgressStatus: () => get<EgressStatusResponse>('/egress/status'),
+  getMeshPeers: () => get<MeshPeersResponse>('/mesh/peers'),
   syncMeshPeer: (peerUrl: string, apiKey: string) =>
     fetch(`${peerUrl}/api/mesh/sync`, {
       method: 'POST',

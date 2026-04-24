@@ -1,12 +1,53 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Activity, BarChart3, ArrowUp, ArrowDown, Globe, Clock } from 'lucide-react';
+import {
+  Activity, BarChart3, ArrowUp, ArrowDown, Globe, Clock,
+  Ban, ShieldCheck, Bot, Network,
+} from 'lucide-react';
 import { useWAF } from '../../store/wafStore';
+import { api } from '../../services/api';
 
 export default function TrafficAnalyticsPage() {
   const { state } = useWAF();
   const { trafficStats, requestLogs } = state;
   const [timeRange, setTimeRange] = useState('24h');
+
+  const [egressBlocked, setEgressBlocked] = useState(0);
+  const [egressAllowed, setEgressAllowed] = useState(0);
+  const [botsDetected, setBotsDetected] = useState(0);
+  const [meshStatus, setMeshStatus] = useState<{
+    enabled: boolean;
+    peerCount: number;
+    lastSync: string;
+  }>({ enabled: false, peerCount: 0, lastSync: '' });
+
+  // Fetch metrics (includes egress and bot stats)
+  useEffect(() => {
+    api.getMetrics().then((data) => {
+      if (data) {
+        setEgressBlocked(data.egress_blocked ?? 0);
+        setEgressAllowed(data.egress_allowed ?? 0);
+        setBotsDetected(data.bots_detected ?? 0);
+      }
+    });
+  }, []);
+
+  // Fetch and poll mesh status every 10s
+  useEffect(() => {
+    const fetchMesh = async () => {
+      const data = await api.getMeshStatus();
+      if (data) {
+        setMeshStatus({
+          enabled: data.enabled,
+          peerCount: data.peer_count ?? 0,
+          lastSync: data.last_sync ?? '',
+        });
+      }
+    };
+    fetchMesh();
+    const id = setInterval(fetchMesh, 10000);
+    return () => clearInterval(id);
+  }, []);
 
   const methodBreakdown = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -44,6 +85,13 @@ export default function TrafficAnalyticsPage() {
         <StatCard icon={ArrowUp} label="Allowed" value={trafficStats.allowedRequests} color="text-waf-orange" />
         <StatCard icon={ArrowDown} label="Blocked" value={trafficStats.blockedRequests} color="text-red-500" />
         <StatCard icon={Globe} label="Unique IPs" value={trafficStats.uniqueIPs} color="text-waf-amber" />
+      </div>
+
+      {/* Egress & Bot Stats */}
+      <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 lg:gap-4">
+        <StatCard icon={Ban} label="Egress Blocked" value={egressBlocked} color="text-red-500" />
+        <StatCard icon={ShieldCheck} label="Egress Allowed" value={egressAllowed} color="text-emerald-500" />
+        <StatCard icon={Bot} label="Bots Detected" value={botsDetected} color="text-waf-amber" />
       </div>
 
       {/* Breakdown Charts */}
@@ -134,6 +182,35 @@ export default function TrafficAnalyticsPage() {
           )}
         </div>
       </div>
+
+      {/* Mesh Status */}
+      <motion.div
+        initial={{ opacity: 0, y: 10 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5"
+      >
+        <h3 className="text-waf-text font-medium text-sm mb-4 flex items-center gap-2">
+          <Network className="w-4 h-4 text-waf-orange" /> Mesh Status
+        </h3>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="bg-waf-elevated rounded-lg p-3 text-center">
+            <p className="text-[10px] text-waf-muted uppercase tracking-wider mb-1">Status</p>
+            <p className={`text-xl font-bold ${meshStatus.enabled ? 'text-emerald-500' : 'text-waf-dim'}`}>
+              {meshStatus.enabled ? 'Enabled' : 'Disabled'}
+            </p>
+          </div>
+          <div className="bg-waf-elevated rounded-lg p-3 text-center">
+            <p className="text-[10px] text-waf-muted uppercase tracking-wider mb-1">Peers</p>
+            <p className="text-xl font-bold text-waf-text">{meshStatus.peerCount}</p>
+          </div>
+          <div className="bg-waf-elevated rounded-lg p-3 text-center">
+            <p className="text-[10px] text-waf-muted uppercase tracking-wider mb-1">Last Sync</p>
+            <p className="text-xl font-bold text-waf-text">
+              {meshStatus.lastSync ? new Date(meshStatus.lastSync).toLocaleString() : 'Never'}
+            </p>
+          </div>
+        </div>
+      </motion.div>
     </div>
   );
 }

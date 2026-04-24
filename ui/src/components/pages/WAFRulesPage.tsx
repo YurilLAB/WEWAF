@@ -1,167 +1,231 @@
-import { useState } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { FileText, Plus, Trash2, Edit3, Check, X, ToggleLeft, ToggleRight } from 'lucide-react';
-import { useWAF } from '../../store/wafStore';
-import type { WAFRules } from '../../store/wafStore';
+import { Shield, Search, FileText } from 'lucide-react';
+import { api } from '../../services/api';
+import type { CompiledRule } from '../../services/api';
 
-const categoryLabels: Record<string, string> = {
-  xss: 'XSS', sqli: 'SQL Injection', lfi: 'LFI/RFI', rfi: 'RFI',
-  xxe: 'XXE', command_injection: 'Command Injection', custom: 'Custom',
-};
+const CATEGORIES = ['All', 'XSS', 'SQLi', 'Bot', 'Egress', 'Injection', 'Protocol', 'Cloud', 'Other'] as const;
+type Category = (typeof CATEGORIES)[number];
 
-const categoryColors: Record<string, string> = {
-  xss: 'bg-red-500/10 text-red-500', sqli: 'bg-orange-500/10 text-orange-500', lfi: 'bg-yellow-500/10 text-yellow-500',
-  rfi: 'bg-yellow-500/10 text-yellow-500', xxe: 'bg-purple-500/10 text-purple-500',
-  command_injection: 'bg-orange-500/10 text-orange-500', custom: 'bg-gray-500/10 text-gray-400',
-};
+function inferCategory(rule: CompiledRule): Category {
+  const id = rule.id?.toUpperCase?.() ?? '';
+  if (id.startsWith('XSS')) return 'XSS';
+  if (id.startsWith('SQLI') || id.startsWith('NOSQL')) return 'SQLi';
+  if (id.startsWith('BOT') || id.startsWith('SCAN')) return 'Bot';
+  if (id.startsWith('EGRESS')) return 'Egress';
+  if (id.startsWith('CLOUD') || id.startsWith('K8S') || id.startsWith('DOCKER')) return 'Cloud';
+  if (
+    id.startsWith('RCE') || id.startsWith('TRAV') || id.startsWith('LDAP') ||
+    id.startsWith('CRLF') || id.startsWith('XXE') || id.startsWith('XPATH') ||
+    id.startsWith('SSI') || id.startsWith('SHELL') || id.startsWith('SSTI') ||
+    id.startsWith('DESER') || id.startsWith('JSON') || id.startsWith('XMLRPC') ||
+    id.startsWith('JNDI') || id.startsWith('PHP') || id.startsWith('SPRING') ||
+    id.startsWith('UPLOAD') || id.startsWith('HEADER') || id.startsWith('HPP') ||
+    id.startsWith('B64') || id.startsWith('CORS') || id.startsWith('CT') ||
+    id.startsWith('MASS') || id.startsWith('LOG') || id.startsWith('CRYPTO') ||
+    id.startsWith('STUFF') || id.startsWith('BL') || id.startsWith('IDOR') ||
+    id.startsWith('CLICK') || id.startsWith('METHOD') || id.startsWith('CACHE') ||
+    id.startsWith('HOST') || id.startsWith('GRAPHQL') || id.startsWith('OAUTH') ||
+    id.startsWith('JWT') || id.startsWith('REDIR') || id.startsWith('SSRF') ||
+    id.startsWith('SMUG') || id.startsWith('PROTO') || id.startsWith('DNS')
+  ) {
+    return 'Injection';
+  }
+  if (
+    id.startsWith('SSRF') || id.startsWith('SMUG') || id.startsWith('HOST') ||
+    id.startsWith('HEADER') || id.startsWith('METHOD') || id.startsWith('REDIR') ||
+    id.startsWith('CRLF') || id.startsWith('PROTO') || id.startsWith('DNS') ||
+    id.startsWith('CACHE') || id.startsWith('HPP') || id.startsWith('B64') ||
+    id.startsWith('CORS') || id.startsWith('CT') || id.startsWith('MASS') ||
+    id.startsWith('LOG') || id.startsWith('CRYPTO') || id.startsWith('STUFF') ||
+    id.startsWith('BL') || id.startsWith('IDOR') || id.startsWith('CLICK') ||
+    id.startsWith('GRAPHQL') || id.startsWith('OAUTH') || id.startsWith('JWT')
+  ) {
+    return 'Protocol';
+  }
+  return 'Other';
+}
+
+function actionColor(action: string): string {
+  const a = action?.toLowerCase?.() ?? '';
+  if (a === 'block') return 'bg-red-500/10 text-red-500';
+  if (a === 'log') return 'bg-blue-500/10 text-blue-500';
+  if (a === 'drop') return 'bg-orange-500/10 text-orange-500';
+  if (a === 'pass') return 'bg-waf-success/10 text-waf-success';
+  return 'bg-waf-orange/10 text-waf-orange';
+}
+
+function phaseLabel(phase: string | number): string {
+  const p = String(phase).toLowerCase();
+  if (p === '0' || p === 'request_headers') return 'Request Headers';
+  if (p === '1' || p === 'request_body') return 'Request Body';
+  if (p === '2' || p === 'response_headers') return 'Response Headers';
+  if (p === '3' || p === 'response_body') return 'Response Body';
+  if (p === '4' || p === 'logging') return 'Logging';
+  if (p === '5' || p === 'egress_request') return 'Egress';
+  return String(phase);
+}
 
 export default function WAFRulesPage() {
-  const { state, dispatch } = useWAF();
-  const { wafRules } = state;
-  const [showAdd, setShowAdd] = useState(false);
-  const [editId, setEditId] = useState<string | null>(null);
-  const [newRule, setNewRule] = useState({ name: '', description: '', pattern: '', action: 'block' as 'block' | 'challenge' | 'log', category: 'custom' as WAFRules['category'], priority: 5 });
-  const [editForm, setEditForm] = useState({ name: '', description: '', pattern: '', action: 'block' as 'block' | 'challenge' | 'log', priority: 5 });
+  const [rules, setRules] = useState<CompiledRule[]>([]);
+  const [search, setSearch] = useState('');
+  const [categoryFilter, setCategoryFilter] = useState<Category>('All');
+  const [loading, setLoading] = useState(true);
 
-  const handleAdd = () => {
-    if (!newRule.name.trim() || !newRule.pattern.trim()) return;
-    const rule: WAFRules = {
-      id: Date.now().toString(),
-      name: newRule.name.trim(),
-      description: newRule.description.trim(),
-      pattern: newRule.pattern.trim(),
-      action: newRule.action,
-      enabled: true,
-      priority: newRule.priority,
-      category: newRule.category,
-      hits: 0,
-    };
-    dispatch({ type: 'SET_WAF_RULES', payload: [...wafRules, rule] });
-    setNewRule({ name: '', description: '', pattern: '', action: 'block', category: 'custom', priority: 5 });
-    setShowAdd(false);
-  };
+  useEffect(() => {
+    setLoading(true);
+    api.getRules().then((data) => {
+      if (data?.rules) {
+        setRules(data.rules);
+      } else {
+        setRules([]);
+      }
+      setLoading(false);
+    });
+  }, []);
 
-  const toggleRule = (rule: WAFRules) => {
-    dispatch({ type: 'UPDATE_WAF_RULE', payload: { ...rule, enabled: !rule.enabled } });
-  };
+  const filtered = useMemo(() => {
+    return rules.filter((rule) => {
+      const cat = inferCategory(rule);
+      if (categoryFilter !== 'All' && cat !== categoryFilter) return false;
+      if (search) {
+        const s = search.toLowerCase();
+        const idMatch = rule.id?.toLowerCase().includes(s);
+        const nameMatch = rule.name?.toLowerCase().includes(s);
+        const descMatch = rule.description?.toLowerCase().includes(s);
+        if (!idMatch && !nameMatch && !descMatch) return false;
+      }
+      return true;
+    });
+  }, [rules, categoryFilter, search]);
 
-  const deleteRule = (id: string) => {
-    dispatch({ type: 'SET_WAF_RULES', payload: wafRules.filter((r) => r.id !== id) });
-  };
+  const stats = useMemo(() => {
+    const total = rules.length;
+    const block = rules.filter((r) => r.action?.toLowerCase?.() === 'block').length;
+    const log = rules.filter((r) => r.action?.toLowerCase?.() === 'log').length;
+    const drop = rules.filter((r) => r.action?.toLowerCase?.() === 'drop').length;
+    return { total, block, log, drop };
+  }, [rules]);
 
-  const startEdit = (rule: WAFRules) => {
-    setEditId(rule.id);
-    setEditForm({ name: rule.name, description: rule.description, pattern: rule.pattern, action: rule.action, priority: rule.priority });
-  };
-
-  const saveEdit = () => {
-    if (!editId) return;
-    const existing = wafRules.find((r) => r.id === editId);
-    if (!existing) return;
-    dispatch({ type: 'UPDATE_WAF_RULE', payload: { ...existing, ...editForm } });
-    setEditId(null);
-  };
-
-  const totalHits = wafRules.reduce((a, r) => a + r.hits, 0);
-  const activeRules = wafRules.filter((r) => r.enabled).length;
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = { All: rules.length };
+    for (const rule of rules) {
+      const cat = inferCategory(rule);
+      counts[cat] = (counts[cat] ?? 0) + 1;
+    }
+    return counts;
+  }, [rules]);
 
   return (
     <div className="space-y-4 lg:space-y-6">
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <div className="bg-waf-panel border border-waf-border rounded-xl p-3 lg:p-4">
           <p className="text-waf-muted text-xs mb-1">Total Rules</p>
-          <p className="text-2xl font-bold text-waf-text">{wafRules.length}</p>
+          <p className="text-2xl font-bold text-waf-text">{stats.total}</p>
         </div>
         <div className="bg-waf-panel border border-waf-border rounded-xl p-3 lg:p-4">
-          <p className="text-waf-muted text-xs mb-1">Active</p>
-          <p className="text-2xl font-bold text-waf-orange">{activeRules}</p>
+          <p className="text-waf-muted text-xs mb-1">Block</p>
+          <p className="text-2xl font-bold text-red-500">{stats.block}</p>
         </div>
         <div className="bg-waf-panel border border-waf-border rounded-xl p-3 lg:p-4">
-          <p className="text-waf-muted text-xs mb-1">Total Hits</p>
-          <p className="text-2xl font-bold text-waf-orange">{totalHits.toLocaleString()}</p>
+          <p className="text-waf-muted text-xs mb-1">Log</p>
+          <p className="text-2xl font-bold text-blue-500">{stats.log}</p>
         </div>
         <div className="bg-waf-panel border border-waf-border rounded-xl p-3 lg:p-4">
-          <p className="text-waf-muted text-xs mb-1">Disabled</p>
-          <p className="text-2xl font-bold text-waf-dim">{wafRules.length - activeRules}</p>
+          <p className="text-waf-muted text-xs mb-1">Drop</p>
+          <p className="text-2xl font-bold text-orange-500">{stats.drop}</p>
         </div>
       </div>
 
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <p className="text-waf-dim text-xs lg:text-sm">Manage WAF rules for blocking malicious traffic patterns.</p>
-        <button onClick={() => setShowAdd(!showAdd)} className="flex items-center gap-2 px-4 py-2 bg-waf-orange text-white rounded-lg text-sm font-medium hover:bg-orange-600 transition-colors w-full sm:w-auto justify-center">
-          <Plus className="w-4 h-4" /> Add Rule
-        </button>
+      <p className="text-waf-dim text-xs lg:text-sm">Browse and filter WAF detection rules served by the backend.</p>
+
+      <div className="flex flex-col sm:flex-row gap-3">
+        <div className="relative flex-1">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-waf-dim" />
+          <input
+            type="text"
+            placeholder="Search by ID, name, or description..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="w-full bg-waf-panel border border-waf-border rounded-lg pl-9 pr-3 py-2 text-sm text-waf-text placeholder:text-waf-dim focus:outline-none focus:border-waf-orange"
+          />
+        </div>
       </div>
 
-      {showAdd && (
-        <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 space-y-3">
-          <h3 className="text-waf-text font-medium text-sm">New WAF Rule</h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <input type="text" placeholder="Rule name" value={newRule.name} onChange={(e) => setNewRule({ ...newRule, name: e.target.value })} className="bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text placeholder:text-waf-dim focus:outline-none focus:border-waf-orange" />
-            <input type="text" placeholder="Description" value={newRule.description} onChange={(e) => setNewRule({ ...newRule, description: e.target.value })} className="bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text placeholder:text-waf-dim focus:outline-none focus:border-waf-orange" />
-          </div>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <select value={newRule.category} onChange={(e) => setNewRule({ ...newRule, category: e.target.value as any })} className="bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange">
-              {Object.entries(categoryLabels).map(([k, v]) => (<option key={k} value={k}>{v}</option>))}
-            </select>
-            <select value={newRule.action} onChange={(e) => setNewRule({ ...newRule, action: e.target.value as any })} className="bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange">
-              <option value="block">Block</option>
-              <option value="challenge">Challenge</option>
-              <option value="log">Log Only</option>
-            </select>
-            <input type="number" placeholder="Priority (1-10)" value={newRule.priority} onChange={(e) => setNewRule({ ...newRule, priority: parseInt(e.target.value) || 5 })} className="bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" />
-          </div>
-          <input type="text" placeholder="Regex pattern (e.g. <script|onerror=)" value={newRule.pattern} onChange={(e) => setNewRule({ ...newRule, pattern: e.target.value })} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text placeholder:text-waf-dim focus:outline-none focus:border-waf-orange font-mono" />
-          <div className="flex gap-2">
-            <button onClick={handleAdd} className="px-4 py-2 bg-waf-success text-white rounded-lg text-sm font-medium hover:bg-emerald-600">Add Rule</button>
-            <button onClick={() => setShowAdd(false)} className="px-4 py-2 bg-waf-elevated text-waf-muted rounded-lg text-sm hover:bg-waf-border">Cancel</button>
-          </div>
-        </motion.div>
-      )}
-
-      <div className="space-y-3">
-        {wafRules.map((rule) => (
-          <motion.div key={rule.id} layout className="bg-waf-panel border border-waf-border rounded-xl p-4">
-            {editId === rule.id ? (
-              <div className="space-y-3">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <input type="text" value={editForm.name} onChange={(e) => setEditForm({ ...editForm, name: e.target.value })} className="bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" />
-                  <input type="text" value={editForm.description} onChange={(e) => setEditForm({ ...editForm, description: e.target.value })} className="bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" />
-                </div>
-                <input type="text" value={editForm.pattern} onChange={(e) => setEditForm({ ...editForm, pattern: e.target.value })} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange font-mono" />
-                <div className="flex gap-2">
-                  <button onClick={saveEdit} className="flex items-center gap-1 px-3 py-1.5 bg-waf-success text-white rounded text-sm hover:bg-emerald-600"><Check className="w-3.5 h-3.5" /> Save</button>
-                  <button onClick={() => setEditId(null)} className="flex items-center gap-1 px-3 py-1.5 bg-waf-elevated text-waf-muted rounded text-sm hover:bg-waf-border"><X className="w-3.5 h-3.5" /> Cancel</button>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col sm:flex-row sm:items-center gap-3">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <FileText className="w-4 h-4 text-waf-orange shrink-0" />
-                    <span className="text-waf-text font-medium text-sm">{rule.name}</span>
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${categoryColors[rule.category]}`}>{categoryLabels[rule.category] || rule.category}</span>
-                    <span className={`px-2 py-0.5 rounded text-[10px] font-medium uppercase ${rule.action === 'block' ? 'bg-red-500/10 text-red-500' : rule.action === 'challenge' ? 'bg-waf-orange/10 text-waf-amber' : 'bg-waf-orange/10 text-waf-orange'}`}>{rule.action}</span>
-                  </div>
-                  <p className="text-waf-dim text-xs mt-1">{rule.description}</p>
-                  <div className="flex items-center gap-3 mt-2">
-                    <code className="text-xs text-waf-muted bg-waf-elevated px-2 py-0.5 rounded font-mono truncate max-w-[300px]">{rule.pattern}</code>
-                    <span className="text-xs text-waf-dim">Priority: {rule.priority}</span>
-                    <span className="text-xs text-waf-orange font-bold">{rule.hits} hits</span>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button onClick={() => toggleRule(rule)} className="text-waf-muted hover:text-waf-text">
-                    {rule.enabled ? <ToggleRight className="w-6 h-6 text-waf-orange" /> : <ToggleLeft className="w-6 h-6 text-waf-dim" />}
-                  </button>
-                  <button onClick={() => startEdit(rule)} className="p-1.5 rounded-md hover:bg-waf-elevated text-waf-muted hover:text-waf-text"><Edit3 className="w-4 h-4" /></button>
-                  <button onClick={() => deleteRule(rule.id)} className="p-1.5 rounded-md hover:bg-red-500/10 text-waf-muted hover:text-red-500"><Trash2 className="w-4 h-4" /></button>
-                </div>
-              </div>
-            )}
-          </motion.div>
+      <div className="flex flex-wrap gap-2">
+        {CATEGORIES.map((cat) => (
+          <button
+            key={cat}
+            onClick={() => setCategoryFilter(cat)}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+              categoryFilter === cat
+                ? 'bg-waf-orange text-white'
+                : 'bg-waf-panel border border-waf-border text-waf-muted hover:text-waf-text hover:bg-waf-elevated'
+            }`}
+          >
+            {cat}
+            <span className="ml-1.5 opacity-70">({categoryCounts[cat] ?? 0})</span>
+          </button>
         ))}
       </div>
+
+      {loading ? (
+        <div className="bg-waf-panel border border-waf-border rounded-xl p-8 text-center">
+          <p className="text-waf-muted font-medium">Loading rules...</p>
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="bg-waf-panel border border-waf-border rounded-xl p-8 text-center">
+          <Shield className="w-10 h-10 text-waf-dim mx-auto mb-3" />
+          <p className="text-waf-muted font-medium">No rules found</p>
+          <p className="text-waf-dim text-xs mt-1">
+            {rules.length === 0 ? 'The backend returned zero rules.' : 'Try adjusting your search or category filter.'}
+          </p>
+        </div>
+      ) : (
+        <div className="bg-waf-panel border border-waf-border rounded-xl overflow-hidden">
+          <div className="overflow-x-auto">
+            <table className="w-full text-left">
+              <thead>
+                <tr className="border-b border-waf-border text-xs text-waf-muted uppercase">
+                  <th className="px-4 py-3">ID</th>
+                  <th className="px-4 py-3">Name</th>
+                  <th className="px-4 py-3 hidden md:table-cell">Phase</th>
+                  <th className="px-4 py-3">Action</th>
+                  <th className="px-4 py-3 hidden sm:table-cell">Score</th>
+                  <th className="px-4 py-3 hidden lg:table-cell">Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filtered.map((rule) => (
+                  <motion.tr
+                    key={rule.id}
+                    layout
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="border-b border-waf-border/50 hover:bg-waf-elevated/30 transition-colors"
+                  >
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <FileText className="w-3.5 h-3.5 text-waf-orange shrink-0" />
+                        <span className="text-xs text-waf-muted font-mono">{rule.id}</span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-sm text-waf-text font-medium">{rule.name}</td>
+                    <td className="px-4 py-3 text-xs text-waf-dim hidden md:table-cell">{phaseLabel(rule.phase)}</td>
+                    <td className="px-4 py-3">
+                      <span className={`px-2 py-0.5 rounded text-[10px] font-medium uppercase ${actionColor(String(rule.action))}`}>
+                        {rule.action}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-xs text-waf-dim hidden sm:table-cell">{rule.score}</td>
+                    <td className="px-4 py-3 text-xs text-waf-dim hidden lg:table-cell max-w-xs truncate">{rule.description}</td>
+                  </motion.tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -1,7 +1,8 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Shield, AlertTriangle, Ban, Zap, Search, Bug, Clock, Crosshair } from 'lucide-react';
+import { Shield, AlertTriangle, Ban, Zap, Search, Bug, Clock, Crosshair, ArrowLeftRight, Network, Lock, Bot } from 'lucide-react';
 import { useWAF } from '../../store/wafStore';
+import { api } from '../../services/api';
 
 const eventIcons: Record<string, any> = {
   xss: Bug, sql_injection: Crosshair, brute_force: Ban, ddos: Zap, bot: Bug, rate_limit: Clock, ip_reputation: AlertTriangle,
@@ -15,12 +16,58 @@ const typeColors: Record<string, string> = {
   xss: 'text-red-500', sql_injection: 'text-waf-amber', brute_force: 'text-orange-500', ddos: 'text-waf-amber', bot: 'text-waf-orange', rate_limit: 'text-waf-muted', ip_reputation: 'text-waf-orange',
 };
 
+interface NetworkStatusData {
+  egressEnabled: boolean;
+  egressAddr: string;
+  meshEnabled: boolean;
+  securityHeadersEnabled: boolean;
+  meshPeers: number;
+  meshLastSync: string;
+  egressBlocked: number;
+  botsDetected: number;
+}
+
 export default function SecurityEventsPage() {
   const { state } = useWAF();
   const { securityEvents } = state;
   const [filter, setFilter] = useState('all');
   const [severityFilter, setSeverityFilter] = useState('all');
   const [searchQuery, setSearchQuery] = useState('');
+  const [networkStatus, setNetworkStatus] = useState<NetworkStatusData>({
+    egressEnabled: false,
+    egressAddr: '',
+    meshEnabled: false,
+    securityHeadersEnabled: false,
+    meshPeers: 0,
+    meshLastSync: '',
+    egressBlocked: 0,
+    botsDetected: 0,
+  });
+
+  const fetchNetworkStatus = async () => {
+    const [config, mesh, metrics] = await Promise.all([
+      api.getConfig(),
+      api.getMeshStatus(),
+      api.getMetrics(),
+    ]);
+
+    setNetworkStatus({
+      egressEnabled: typeof config?.egress_enabled === 'boolean' ? config.egress_enabled : false,
+      egressAddr: typeof config?.egress_addr === 'string' ? config.egress_addr : '',
+      meshEnabled: typeof config?.mesh_enabled === 'boolean' ? config.mesh_enabled : false,
+      securityHeadersEnabled: typeof config?.security_headers_enabled === 'boolean' ? config.security_headers_enabled : false,
+      meshPeers: mesh?.peer_count ?? 0,
+      meshLastSync: mesh?.last_sync ?? '',
+      egressBlocked: (metrics as any)?.egress_blocked ?? 0,
+      botsDetected: (metrics as any)?.bots_detected ?? 0,
+    });
+  };
+
+  useEffect(() => {
+    fetchNetworkStatus();
+    const interval = setInterval(fetchNetworkStatus, 10000);
+    return () => clearInterval(interval);
+  }, []);
 
   const filtered = useMemo(() => {
     return securityEvents.filter((e) => {
@@ -41,6 +88,48 @@ export default function SecurityEventsPage() {
   return (
     <div className="space-y-4 lg:space-y-6">
       <p className="text-waf-dim text-xs lg:text-sm">Review and analyze security events detected by your WAF.</p>
+
+      {/* Network Defense Status */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        <StatusCard
+          icon={ArrowLeftRight}
+          label="Egress Proxy"
+          enabled={networkStatus.egressEnabled}
+          enabledLabel="Enabled"
+          disabledLabel="Disabled"
+          details={[
+            networkStatus.egressEnabled && networkStatus.egressAddr ? `Listen: ${networkStatus.egressAddr}` : null,
+            `Blocked: ${networkStatus.egressBlocked.toLocaleString()}`,
+          ]}
+        />
+        <StatusCard
+          icon={Network}
+          label="Threat Mesh"
+          enabled={networkStatus.meshEnabled}
+          enabledLabel="Enabled"
+          disabledLabel="Disabled"
+          details={[
+            `Peers: ${networkStatus.meshPeers}`,
+            networkStatus.meshLastSync ? `Last sync: ${new Date(networkStatus.meshLastSync).toLocaleTimeString()}` : 'Last sync: Never',
+          ]}
+        />
+        <StatusCard
+          icon={Lock}
+          label="Response Hardening"
+          enabled={networkStatus.securityHeadersEnabled}
+          enabledLabel="Enabled"
+          disabledLabel="Disabled"
+          details={['Security headers injection']}
+        />
+        <StatusCard
+          icon={Bot}
+          label="Bot Detection"
+          enabled={networkStatus.botsDetected > 0}
+          enabledLabel="Active"
+          disabledLabel="No bots"
+          details={[`Detected: ${networkStatus.botsDetected.toLocaleString()}`]}
+        />
+      </div>
 
       {/* Stats */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
@@ -138,6 +227,46 @@ function StatCard({ icon: Icon, label, value, color }: { icon: any; label: strin
     <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="bg-waf-panel border border-waf-border rounded-xl p-3 lg:p-4">
       <div className="flex items-center gap-2 mb-1"><Icon className={`w-4 h-4 ${color}`} /><span className="text-waf-muted text-xs">{label}</span></div>
       <p className={`text-xl font-bold tabular-nums ${color}`}>{value.toLocaleString()}</p>
+    </motion.div>
+  );
+}
+
+function StatusCard({
+  icon: Icon,
+  label,
+  enabled,
+  enabledLabel,
+  disabledLabel,
+  details,
+}: {
+  icon: any;
+  label: string;
+  enabled: boolean;
+  enabledLabel: string;
+  disabledLabel: string;
+  details: (string | null | false)[];
+}) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, scale: 0.95 }}
+      animate={{ opacity: 1, scale: 1 }}
+      className="bg-waf-panel border border-waf-border rounded-xl p-3 lg:p-4"
+    >
+      <div className="flex items-center gap-2 mb-2">
+        <Icon className={`w-4 h-4 ${enabled ? 'text-emerald-500' : 'text-waf-dim'}`} />
+        <span className="text-waf-muted text-xs">{label}</span>
+      </div>
+      <div className="flex items-center gap-2 mb-1">
+        <span className={`w-2 h-2 rounded-full ${enabled ? 'bg-emerald-500' : 'bg-waf-dim'}`} />
+        <span className={`text-sm font-semibold ${enabled ? 'text-emerald-500' : 'text-waf-muted'}`}>
+          {enabled ? enabledLabel : disabledLabel}
+        </span>
+      </div>
+      <div className="space-y-0.5">
+        {details.filter(Boolean).map((detail, i) => (
+          <p key={i} className="text-xs text-waf-dim">{detail}</p>
+        ))}
+      </div>
     </motion.div>
   );
 }
