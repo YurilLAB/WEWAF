@@ -10,6 +10,29 @@ inspects every transaction against a compiled rule set, and persists
 telemetry to a rotating set of SQLite databases so historical data survives
 restarts and stays searchable by time range.
 
+### Feature matrix
+
+| Area              | Feature                                                   | Default  |
+|-------------------|-----------------------------------------------------------|----------|
+| Rule engine       | Native signatures + OWASP CRS (paranoia 1–4)              | enabled  |
+| Rule engine       | Request canonicalisation (3-pass URL decode, NFKC, dotseg)| enabled  |
+| Rule engine       | Homoglyph folding (Cyrillic/Greek/fullwidth → ASCII)      | enabled  |
+| Rule engine       | Fail-closed panic recovery per phase                      | enabled  |
+| Traffic           | Per-IP rate limit + global semaphore                      | enabled  |
+| Traffic           | Pre-WAF token-bucket shaper with auto-tighten on attack   | opt-in   |
+| Traffic           | Gzip/Brotli decompression with ratio cap                  | enabled  |
+| Resilience        | Hardened reverse-proxy transport (timeouts + pool caps)   | enabled  |
+| Resilience        | Circuit breaker with half-open probe gating               | enabled  |
+| Resilience        | Adaptive DDoS detector (volumetric + botnet + Slowloris)  | enabled  |
+| Resilience        | Exponential-backoff bans (doubling duration, capped)      | enabled  |
+| Observability     | Prometheus `/metrics` exposition                          | enabled  |
+| Observability     | Per-rule match counters (JSON + Prometheus)               | enabled  |
+| Observability     | Server-Sent Events stream of blocks / egress / bots       | enabled  |
+| Operational       | Config hot-reload (mtime watcher, recompiles rules)       | enabled  |
+| Operational       | Rotating SQLite history store (time-sliced, WAL)          | enabled  |
+| Operational       | Egress proxy with DNS cache, allowlist, SSRF guards       | opt-in   |
+| Operational       | Zero-trust per-path policies (CIDR, country, mTLS, time)  | opt-in   |
+
 ## What makes WEWAF different
 
 Most open-source WAFs fall into two camps: heavyweight rule engines glued to
@@ -311,40 +334,59 @@ After startup the proxy listens on `:8080` and the admin dashboard on
 ## Configuration
 
 Defaults are applied for every missing field in `config.json`, so only
-the ones you want to override need to be listed. The sections that
-typically matter:
+the ones you want to override need to be listed. The tables below cover
+the fields most operators touch; every field also has a JSON-tag comment
+in `internal/config/config.go` for reference.
 
-- **Proxy**: `listen_addr`, `admin_addr`, `backend_url`, `trust_xff`,
-  `read_timeout_sec`, `write_timeout_sec`.
-- **Resource limits**: `max_cpu_cores`, `max_memory_mb`,
-  `max_concurrent_req`, `max_body_bytes`.
-- **Security thresholds**: `block_threshold`, `rate_limit_rps`,
-  `rate_limit_burst`, `brute_force_window_sec`, `brute_force_threshold`,
-  `reputation_*`.
-- **DDoS**: `ddos_volumetric_baseline` (initial RPS guess, replaced by the
-  adaptive EMA after `ddos_warmup_seconds`), `ddos_volumetric_spike`
-  (multiplier over baseline), `ddos_min_absolute_rps` (absolute floor —
-  never flag below this even if the multiplier says so),
-  `ddos_spike_windows_required` (consecutive spike windows before tripping,
-  default 3), `ddos_cooldown_seconds` (quiet period before releasing
-  attack state), `ddos_conn_rate_threshold` (per-IP conns/10s),
-  `ddos_botnet_unique_ip_threshold` (unique IPs on sensitive paths/60s to
-  flag), `ddos_slow_read_bps` (Slowloris floor).
-- **Shaper** (pre-WAF admission control): `shaper_enabled`, `shaper_max_rps`,
-  `shaper_burst`. Off by default — opt in once you've observed your
-  traffic profile.
-- **Rule engine**: `paranoia_level` (1–4, default 1), `crs_enabled`
-  (default true, load the OWASP CRS pack on top of the native signatures).
-- **Circuit breaker**: `breaker_consecutive_failures` (trip threshold,
-  default 10), `breaker_open_timeout_sec` (cool-down, default 30).
-- **Failsafe**: `failsafe_mode` — `"closed"` (default, 503 on engine
-  panic) or `"open"` (forward unfiltered on panic).
-- **Egress**: `egress_enabled`, `egress_addr`, `egress_allowlist`
-  (exact hosts or `*.wildcard.com`), `egress_block_private_ips`,
-  `egress_max_body_bytes`.
-- **History**: `history_dir`, `history_rotate_hours`,
-  `history_buffer_size`, `history_flush_seconds`.
-- **Engine**: `mode`, `log_level`, `audit_log_path`, `rule_files`.
+### Core proxy and limits
+
+| Field                 | Default           | Purpose                                         |
+|-----------------------|-------------------|-------------------------------------------------|
+| `listen_addr`         | `":8080"`         | Where inbound traffic hits the WAF.             |
+| `admin_addr`          | `":8443"`         | Dashboard + API port. Put behind auth in prod.  |
+| `backend_url`         | required          | Origin the proxy forwards to.                   |
+| `trust_xff`           | `false`           | Trust `X-Forwarded-For` (only behind a CDN).    |
+| `max_concurrent_req`  | `10000`           | Global semaphore on in-flight requests.         |
+| `max_body_bytes`      | `10 MiB`          | Cap on request/response body inspection.        |
+| `block_threshold`     | `100`             | Aggregate score at which a request is blocked.  |
+| `rate_limit_rps`      | `100`             | Per-IP token bucket rate.                       |
+| `rate_limit_burst`    | `150`             | Per-IP token bucket burst size.                 |
+| `paranoia_level`      | `1`               | OWASP CRS paranoia 1–4. Raise after tuning.     |
+
+### Resilience features
+
+| Field                                  | Default  | Purpose                                                        |
+|----------------------------------------|----------|----------------------------------------------------------------|
+| `backend_dial_timeout_ms`              | `5000`   | TCP dial timeout on the origin transport.                      |
+| `backend_response_header_timeout_ms`   | `30000`  | Max time the origin can take to send response headers.         |
+| `backend_tls_handshake_timeout_ms`     | `10000`  | TLS handshake cap on upstream connections.                     |
+| `backend_max_idle_conns`               | `200`    | Connection-pool cap across all origins.                        |
+| `backend_max_conns_per_host`           | `64`     | Per-host connection cap (prevents single-origin exhaustion).   |
+| `decompress_inspect`                   | `true`   | gzip / brotli bodies are decompressed into a ratio-capped buffer before engine eval (zip-bomb defence). |
+| `decompress_ratio_cap`                 | `100`    | Max allowed (decompressed ÷ compressed) ratio.                 |
+| `max_decompress_bytes`                 | `64 MiB` | Absolute decompressed-size cap.                                |
+| `failsafe_mode`                        | `closed` | `closed` = 503 on engine panic, `open` = forward unfiltered.   |
+| `breaker_consecutive_failures`         | `10`     | Origin failures in a row before the breaker opens.             |
+| `breaker_open_timeout_sec`             | `30`     | Cool-down before a half-open probe is allowed.                 |
+
+### Bans, DDoS, and admission control
+
+| Field                              | Default  | Purpose                                                          |
+|------------------------------------|----------|------------------------------------------------------------------|
+| `ddos_spike_windows_required`      | `3`      | Consecutive 10-second spike windows before declaring attack.     |
+| `ddos_cooldown_seconds`            | `60`     | Quiet period before releasing attack state.                      |
+| `ddos_conn_rate_threshold`         | `300`    | Per-IP connections in a 10 s window (CDN-friendly default).      |
+| `ddos_botnet_unique_ip_threshold`  | `200`    | Unique IPs converging on a sensitive path in 60 s.               |
+| `shaper_enabled`                   | `false`  | Pre-WAF token-bucket admission. Tightens under attack.           |
+| `shaper_max_rps` / `shaper_burst`  | `2000 / 4000` | Base budget and burst for the shaper.                       |
+| `ban_backoff_enabled`              | `true`   | Repeat bans on the same IP inside the window get longer.         |
+| `ban_backoff_multiplier`           | `2`      | Duration multiplier per repeat offence.                          |
+| `ban_backoff_window_sec`           | `86400`  | Window inside which repeats count as the same offender.          |
+| `max_ban_duration_sec`             | `604800` | Upper cap so backoff doesn't grow without bound.                 |
+
+Other sections (egress proxy, history rotation, rule engine mode,
+paranoia level, SSL manager, mesh gossip) keep the same JSON tags as
+before — see `internal/config/config.go` for the full list.
 
 Set `WAF_API_KEY` in the environment to require an API key on every
 `/api/*` request. Clients present it via `X-API-Key` header or
@@ -383,6 +425,62 @@ important ones to know about beyond the obvious `/api/health`,
 
 All routes honour CORS and the optional API key.
 
+### Observability endpoints at a glance
+
+| Endpoint                    | Format       | What you get                                       |
+|-----------------------------|--------------|----------------------------------------------------|
+| `/metrics`                  | Prometheus   | Counters, gauges, per-rule match totals.           |
+| `/api/rules/counters`       | JSON         | `{counters: {RULE_ID: n, ...}}` — same data as `/metrics` but keyed for the UI. |
+| `/api/events/stream`        | SSE          | Live blocks / egress decisions / bot detections.   |
+| `/api/ddos/stats`           | JSON         | Adaptive baseline, spike streak, `under_attack`.   |
+| `/api/breaker/stats`        | JSON         | Circuit-breaker state + failure count.             |
+| `/api/shaper/stats`         | JSON         | Admitted / rejected / tightened flag.              |
+| `/api/history/events`       | JSON         | Time-ranged query across rotated SQLite files.     |
+
+### Key Prometheus metrics
+
+| Metric                        | Type    | Labels     | Meaning                                 |
+|-------------------------------|---------|------------|-----------------------------------------|
+| `wewaf_requests_total`        | counter | —          | All requests seen by the proxy.         |
+| `wewaf_blocked_total`         | counter | —          | Requests the WAF blocked.               |
+| `wewaf_passed_total`          | counter | —          | Requests forwarded to the backend.      |
+| `wewaf_errors_total`          | counter | —          | Proxy errors (backend failures).        |
+| `wewaf_egress_blocked_total`  | counter | —          | Egress requests blocked.                |
+| `wewaf_bots_detected_total`   | counter | —          | Requests matched a bot/scanner sig.     |
+| `wewaf_rule_matches_total`    | counter | `rule_id`  | Per-rule match counts for noise tuning. |
+| `wewaf_response_status`       | counter | `bucket`   | 2xx / 3xx / 4xx / 5xx distribution.     |
+| `wewaf_bytes_in_per_second`   | gauge   | —          | Ingress rate sampled every 10 s.        |
+| `wewaf_bytes_out_per_second`  | gauge   | —          | Egress rate sampled every 10 s.         |
+| `wewaf_unique_ips`            | gauge   | —          | Distinct source IPs since rotation.     |
+
+## Testing
+
+```bash
+go test -race ./...
+```
+
+Tests live alongside the package they exercise — Go's compiler requires
+`_test.go` files in the same directory as the package under test. Black-
+box integration tests that boot a real `httptest.Server` behind the proxy
+live under `tests/integration/`.
+
+| Package                         | What it covers                                            |
+|---------------------------------|-----------------------------------------------------------|
+| `internal/rules`                | False-positive regression suite + malicious-traffic match suite (41 cases). |
+| `internal/limits`               | Rate-limiter math + eviction; breaker state machine inc. half-open probe gating. |
+| `internal/bruteforce`           | Window expiry, reset, race safety.                        |
+| `internal/core`                 | BanList expiry, cleanup, exponential-backoff math.        |
+| `internal/engine`               | Canonicalise, path traversal, homoglyph fold, obfuscated Transfer-Encoding. |
+| `tests/integration`             | End-to-end: allow + block + per-rule counters + Prometheus exposition. |
+
+## Hot-reload
+
+Start the daemon with `-config config.json` and edit the file in place —
+the watcher re-reads on mtime change, recompiles rules, and pushes the
+result to the running engine. Fields that can't safely hot-swap (listen
+addresses, admin API key, SQLite paths) are silently ignored and still
+need a restart. A `[config hot-reload]` log line confirms each reload.
+
 ## Project layout
 
 ```
@@ -401,7 +499,8 @@ internal/host/        — CPU/mem/disk/net sampler (gopsutil)
 internal/connection/  — backend probe + ping/event history
 internal/ssl/         — cert storage + TLS policy
 internal/bruteforce/  — sliding-window login attempt tracker
-internal/web/         — admin HTTP server + embedded SPA + SSE stream
+internal/web/         — admin HTTP server + embedded SPA + SSE stream + /metrics
+tests/integration/    — black-box end-to-end tests (boot real proxy + backend)
 ui/                   — React + Vite source (builds to internal/web/dist)
 history/              — created at runtime; rotating SQLite files live here
 certs/                — created at runtime; uploaded PEM cert pairs
