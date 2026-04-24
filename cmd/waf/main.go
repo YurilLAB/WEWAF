@@ -162,6 +162,7 @@ func main() {
 		Connection:  connMgr,
 		SSL:         sslMgr,
 		History:     historyStore,
+		Proxy:       wp,
 		MeshEnabled: cfg.MeshEnabled,
 		MeshPeers:   cfg.MeshPeers,
 		MeshAPIKey:  cfg.MeshAPIKey,

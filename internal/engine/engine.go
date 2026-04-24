@@ -453,25 +453,24 @@ func (e *Engine) buildRequestHeaderTargets(r *http.Request) map[string]string {
 		return targets
 	}
 
+	// URI / path go through Canonicalize so double-encoded, unicode, and
+	// mixed-slash variants all collapse to one representation before rules
+	// run. This is the hard-to-bypass counterpart to plain url.PathUnescape.
 	if uri, err := url.PathUnescape(r.URL.RequestURI()); err == nil {
-		add("uri", uri)
+		add("uri", Canonicalize(uri))
 	} else {
-		add("uri", r.URL.RequestURI())
+		add("uri", Canonicalize(r.URL.RequestURI()))
 	}
 	add("method", r.Method)
-	if path, err := url.PathUnescape(r.URL.Path); err == nil {
-		add("path", path)
-	} else {
-		add("path", r.URL.Path)
-	}
+	add("path", CanonicalizePath(r.URL.Path))
 	for k, v := range r.URL.Query() {
 		raw := strings.Join(v, ", ")
 		if decoded, err := url.QueryUnescape(raw); err == nil {
-			if !add("args."+k, decoded) {
+			if !add("args."+k, Canonicalize(decoded)) {
 				break
 			}
 		} else {
-			if !add("args."+k, raw) {
+			if !add("args."+k, Canonicalize(raw)) {
 				break
 			}
 		}

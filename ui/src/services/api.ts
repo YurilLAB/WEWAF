@@ -257,6 +257,40 @@ export interface AutoMitigateResponse {
   threshold: number;
 }
 
+export interface DDoSStats {
+  total_requests?: number;
+  flagged_volumetric?: number;
+  flagged_conn_rate?: number;
+  flagged_slow_read?: number;
+  under_attack?: boolean;
+  last_attack_unix?: number;
+}
+
+export interface BreakerStats {
+  state?: 'closed' | 'open' | 'half_open';
+  consecutive_failures?: number;
+  successes?: number;
+  total_failures?: number;
+  short_circuited?: number;
+  opened_at_unix_nano?: number;
+  failure_threshold?: number;
+  open_timeout_seconds?: number;
+}
+
+export interface ZeroTrustPolicy {
+  id: string;
+  description?: string;
+  path_prefix?: string;
+  path_exact?: string;
+  require_auth_header?: string;
+  require_mtls?: boolean;
+  allowed_countries?: string[];
+  blocked_countries?: string[];
+  allowed_cidrs?: string[];
+  blocked_cidrs?: string[];
+  fallback_allow?: boolean;
+}
+
 export interface SSLCertificate {
   id: string;
   domain: string;
@@ -422,6 +456,13 @@ export const api = {
   getIPInsights: (ip: string) => get<IPInsights>(`/ip/${encodeURIComponent(ip)}`),
   autoMitigate: (threshold = 10, durationSec = 3600) =>
     post<AutoMitigateResponse>('/ip-auto-mitigate', { threshold, duration_sec: durationSec }),
+
+  // DDoS + circuit breaker + zero-trust
+  getDDoSStats: () => get<DDoSStats>('/ddos/stats'),
+  getBreakerStats: () => get<BreakerStats>('/breaker/stats'),
+  getZeroTrustPolicies: () => get<{ policies: ZeroTrustPolicy[] }>('/zerotrust/policies'),
+  setZeroTrustPolicies: (policies: ZeroTrustPolicy[]) =>
+    put<{ status: string; count: number }>('/zerotrust/policies', { policies }),
 
   // SSL/TLS
   getCertificates: () => get<{ certificates: SSLCertificate[] }>('/ssl/certificates'),

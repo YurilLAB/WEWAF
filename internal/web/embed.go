@@ -20,8 +20,10 @@ import (
 	"wewaf/internal/history"
 	"wewaf/internal/host"
 	"wewaf/internal/limits"
+	"wewaf/internal/proxy"
 	"wewaf/internal/ssl"
 	"wewaf/internal/telemetry"
+	"wewaf/internal/zerotrust"
 )
 
 //go:embed all:dist
@@ -37,6 +39,7 @@ type Server struct {
 	connection *connection.Manager
 	ssl        *ssl.Manager
 	history    *history.Store
+	proxy      *proxy.WAFProxy
 
 	meshEnabled  bool
 	meshPeers    []string
@@ -55,6 +58,7 @@ type Deps struct {
 	Connection *connection.Manager
 	SSL        *ssl.Manager
 	History    *history.Store
+	Proxy      *proxy.WAFProxy
 
 	MeshEnabled bool
 	MeshPeers   []string
@@ -72,6 +76,7 @@ func NewServer(d Deps) *Server {
 		connection: d.Connection,
 		ssl:        d.SSL,
 		history:    d.History,
+		proxy:      d.Proxy,
 
 		meshEnabled: d.MeshEnabled,
 		meshPeers:   d.MeshPeers,
@@ -144,6 +149,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Live events — Server-Sent Events stream of blocks/egress/bots.
 	api.HandleFunc("/api/events/stream", s.handleEventsStream)
+
+	// DDoS + circuit-breaker stats.
+	api.HandleFunc("/api/ddos/stats", s.handleDDoSStats)
+	api.HandleFunc("/api/breaker/stats", s.handleBreakerStats)
+
+	// Zero-trust path policies.
+	api.HandleFunc("/api/zerotrust/policies", s.handleZeroTrustPolicies)
 
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
@@ -1230,6 +1242,61 @@ func (s *Server) handleEventsStream(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
+	}
+}
+
+// ---- DDoS / Circuit breaker ----
+
+func (s *Server) handleDDoSStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.proxy == nil {
+		writeJSON(w, map[string]interface{}{})
+		return
+	}
+	writeJSON(w, s.proxy.DDoSStats())
+}
+
+func (s *Server) handleBreakerStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.proxy == nil {
+		writeJSON(w, map[string]interface{}{})
+		return
+	}
+	writeJSON(w, s.proxy.BreakerStats())
+}
+
+// ---- Zero-trust ----
+
+func (s *Server) handleZeroTrustPolicies(w http.ResponseWriter, r *http.Request) {
+	if s.proxy == nil || s.proxy.ZeroTrustEngine() == nil {
+		http.Error(w, "zero-trust unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	zt := s.proxy.ZeroTrustEngine()
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, map[string]interface{}{"policies": zt.Policies()})
+	case http.MethodPut, http.MethodPost:
+		var payload struct {
+			Policies []*zerotrust.Policy `json:"policies"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		if err := zt.SetPolicies(payload.Policies); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]interface{}{"status": "ok", "count": len(payload.Policies)})
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}
 }
 

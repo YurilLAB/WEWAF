@@ -290,6 +290,90 @@ func DefaultRules() []core.Rule {
 		{ID: "BL-004", Name: "Carding Attack Pattern", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Small amount with card details suggests carding", Targets: []string{"args", "body"}, Pattern: `(?i)(?:amount|price|total|sum)\s*[:=]\s*(?:0\.0[1-9]|0\.[1-9]\d?|\d{1,3})(?:\.\d+)?\b.*(?:cvv|ccv|cvc|security[_\s]?code|expir|exp[_\s]?date)`},
 		{ID: "BL-005", Name: "Comment Spam URLs", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Excessive URLs in form data suggests comment spam", Targets: []string{"args", "body"}, Pattern: `(?i)(?:https?://[^\s&"<>]{4,}.*?){8,}`},
 		{ID: "BL-006", Name: "XML-RPC Pingback Abuse", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "XML-RPC pingback.ping method detected", Targets: []string{"body", "uri"}, Pattern: `(?i)pingback\.ping`},
+
+		// --- CVE-specific and framework exploitation patterns ---
+		{ID: "CVE-LOG4J-001", Name: "Log4Shell JNDI Injection", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "JNDI lookup in request (CVE-2021-44228)", Targets: []string{"args", "headers", "body", "uri"}, Pattern: `(?i)\$\{(?:jndi|j\$\{::-n\}dnl?i|j[^}]*ndi)[:\s]*(?:ldap|rmi|dns|nis|iiop|corba|nds|http)s?:`},
+		{ID: "CVE-LOG4J-002", Name: "Log4Shell Obfuscated", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Obfuscated JNDI with ${lower} / ${upper} / ${env}", Targets: []string{"args", "headers", "body", "uri"}, Pattern: `(?i)\$\{(?:\$\{(?:lower|upper|env|sys|::-)[^}]*\}|[^}]*\$\{[^}]*\}){2,}`},
+		{ID: "CVE-SPRING4SHELL-001", Name: "Spring4Shell ClassLoader", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Spring4Shell class-loader path traversal (CVE-2022-22965)", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)class\.module\.classLoader|class\.classLoader\.resources\.context`},
+		{ID: "CVE-STRUTS-S2-001", Name: "Struts OGNL", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Struts OGNL expression injection", Targets: []string{"headers", "args", "body", "uri"}, Pattern: `(?i)%\{.*(?:#context|#request|#response|@java\.lang|@?ognl\.)`},
+		{ID: "CVE-CONFLUENCE-2022-26134", Name: "Confluence OGNL", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Atlassian Confluence OGNL injection CVE-2022-26134", Targets: []string{"uri", "args"}, Pattern: `(?i)\$\{[^}]*@java\.lang\.(?:Runtime|ProcessBuilder)`},
+		{ID: "CVE-PROXYSHELL-001", Name: "Exchange ProxyShell path", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "Exchange ProxyShell URL rewrite (CVE-2021-34473)", Targets: []string{"uri", "path"}, Pattern: `(?i)/autodiscover/autodiscover\.json.*@.*/(?:powershell|mapi|ews)`},
+		{ID: "CVE-MOVEIT-001", Name: "MOVEit Transfer SQLi", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "MOVEit Transfer human.aspx abuse (CVE-2023-34362)", Targets: []string{"uri", "path"}, Pattern: `(?i)/(?:human|guestaccess)\.aspx.*(?:transaction|folderid|groupid)=.{0,20}(?:union|select|\-\-)`},
+		{ID: "CVE-F5-BIG-IP-001", Name: "F5 iControl RCE", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "F5 iControl REST RCE (CVE-2022-1388)", Targets: []string{"uri"}, Pattern: `(?i)/mgmt/tm/util/bash`},
+		{ID: "CVE-GITLAB-EXIFTOOL", Name: "GitLab ExifTool RCE path", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "GitLab user-avatar DjVu/ExifTool RCE (CVE-2021-22205)", Targets: []string{"body"}, Pattern: `(?i)\(metadata\s+"[^"]*\\\s*"`},
+
+		// --- SSTI (Server-Side Template Injection) ---
+		{ID: "SSTI-JINJA-001", Name: "Jinja2 Template Injection", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Jinja2 {{ }} with attribute traversal", Targets: []string{"args", "body", "uri"}, Pattern: `\{\{[^{}]*(?:config|self|request|__class__|__mro__|__subclasses__|__globals__|__import__)[^{}]*\}\}`},
+		{ID: "SSTI-TWIG-001", Name: "Twig / Symfony SSTI", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Twig _self or app object escape", Targets: []string{"args", "body"}, Pattern: `\{\{[^{}]*(?:_self\.env|app\.request|registerUndefinedFilterCallback|getFilter\()[^{}]*\}\}`},
+		{ID: "SSTI-ERB-001", Name: "ERB / Ruby SSTI", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "ERB <%= ... system/exec ... %>", Targets: []string{"args", "body"}, Pattern: `(?i)<%=?\s*(?:system|exec|%x|IO\.popen|open3|File\.(?:read|open)|eval|instance_eval)\b`},
+		{ID: "SSTI-VELOCITY-001", Name: "Velocity SSTI", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Velocity #set / $class.forName", Targets: []string{"args", "body"}, Pattern: `(?i)\$class\.(?:forName|newInstance|getDeclared)`},
+		{ID: "SSTI-FREEMARKER-001", Name: "Freemarker SSTI", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Freemarker Execute or freemarker.template.utility", Targets: []string{"args", "body"}, Pattern: `(?i)<#assign[^>]*freemarker\.template\.utility\.Execute`},
+		{ID: "SSTI-SMARTY-001", Name: "Smarty SSTI", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Smarty {php} or getStreamVariable", Targets: []string{"args", "body"}, Pattern: `(?i)\{(?:php|Smarty_Internal|getStreamVariable)\}`},
+
+		// --- GraphQL abuse ---
+		{ID: "GQL-001", Name: "GraphQL Introspection Abuse", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "Introspection query from non-tooling client", Targets: []string{"body", "args"}, Pattern: `(?i)__schema\s*\{[^}]*types\s*\{`},
+		{ID: "GQL-002", Name: "GraphQL Field Duplication DoS", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Same field queried >50 times in one op (batch DoS)", Targets: []string{"body"}, Pattern: `(?:\b(\w{3,20})\b[^\w]+){50,}`},
+		{ID: "GQL-003", Name: "GraphQL Mutation Injection", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Unauthenticated-looking mutation with payload", Targets: []string{"body"}, Pattern: `(?i)mutation\s*\{[^}]*(?:deleteUser|updateRole|grantAdmin|resetPassword)`},
+		{ID: "GQL-004", Name: "GraphQL Deep Nesting", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Excessively nested GraphQL query", Targets: []string{"body"}, Pattern: `(?:\{[^{}]*){8,}`},
+
+		// --- Insecure Deserialization ---
+		{ID: "DESER-JAVA-001", Name: "Java Serialized Object Header", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "aced0005 / rO0 Java serialized header", Targets: []string{"body", "headers"}, Pattern: `(?:aced0005|rO0[AB])`},
+		{ID: "DESER-PHP-001", Name: "PHP Serialized Gadget", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "PHP serialize() output with object marker", Targets: []string{"body"}, Pattern: `O:\d+:"[A-Za-z_][A-Za-z0-9_\\]{0,100}":\d+:\{`},
+		{ID: "DESER-NODE-001", Name: "Node Deserialization RCE", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "node-serialize _$$ND_FUNC$$_ gadget", Targets: []string{"body", "args"}, Pattern: `_\$\$ND_FUNC\$\$_function`},
+		{ID: "DESER-PYTHON-001", Name: "Python Pickle / base64", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Python cPickle / __reduce__ byte markers", Targets: []string{"body"}, Pattern: `(?:\\x80\\x04\\x95|cposix\nsystem|c__builtin__\nglobals)`},
+		{ID: "DESER-RUBY-001", Name: "Ruby Marshal Gadget", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Ruby Marshal.load / DeprecatedInstance gadget", Targets: []string{"body"}, Pattern: `(?i)Gem::DependencyList|Rails::Info|DeprecatedInstanceVariableProxy`},
+		{ID: "DESER-YAML-001", Name: "YAML Ruby tag injection", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "!!ruby/object or !!python/object tag", Targets: []string{"body"}, Pattern: `(?i)!!(?:ruby|python)/(?:object|struct|module)(?::[^\s]+)?\s`},
+
+		// --- Server-Side Includes / Edge-Side Includes ---
+		{ID: "SSI-001", Name: "SSI exec cmd", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "<!--#exec cmd= SSI injection", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)<!--#\s*(?:exec|include|printenv|config)\s`},
+		{ID: "ESI-001", Name: "ESI Include Injection", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "ESI <esi:include> payload in user input", Targets: []string{"args", "body"}, Pattern: `(?i)<esi:(?:include|vars|eval|choose)`},
+
+		// --- HTTP Request Smuggling + H2 ---
+		{ID: "SMUG-003", Name: "Obfuscated Transfer-Encoding", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "TE header with non-standard token", Targets: []string{"headers.Transfer-Encoding", "headers"}, Pattern: `(?i)transfer[-\s_]*encoding\s*:\s*(?:\s*chunked\s*[;,].+|[^\w,]*chunked[^\w,]*\S)`},
+		{ID: "SMUG-004", Name: "Content-Length Chunk Conflict", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Body claims chunked but has length marker", Targets: []string{"body"}, Pattern: `(?s)^0+\r?\n\r?\nGET\s|^[0-9a-f]+\r?\n[\s\S]*?\r?\n0\r?\n[A-Z]`},
+
+		// --- Advanced bot / scanner fingerprints ---
+		{ID: "SCAN-010", Name: "Nuclei scanner", Phase: core.PhaseRequestHeaders, Score: 50, Action: core.ActionBlock, Description: "Nuclei user-agent", Targets: []string{"headers.User-Agent"}, Pattern: `(?i)\bNuclei\b`},
+		{ID: "SCAN-011", Name: "Nikto scanner", Phase: core.PhaseRequestHeaders, Score: 50, Action: core.ActionBlock, Description: "Nikto user-agent", Targets: []string{"headers.User-Agent"}, Pattern: `(?i)Nikto/`},
+		{ID: "SCAN-012", Name: "masscan / zmap", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionBlock, Description: "Mass-scanner fingerprints", Targets: []string{"headers.User-Agent"}, Pattern: `(?i)(?:masscan|zmap|zgrab)\b`},
+		{ID: "SCAN-013", Name: "acunetix / netsparker", Phase: core.PhaseRequestHeaders, Score: 50, Action: core.ActionBlock, Description: "Commercial vuln scanners", Targets: []string{"headers.User-Agent", "headers"}, Pattern: `(?i)(?:acunetix|netsparker|invicti|qualys|tenable|nessus)\b`},
+		{ID: "SCAN-014", Name: "Probing path signatures", Phase: core.PhaseRequestHeaders, Score: 35, Action: core.ActionLog, Description: "Well-known scanner paths", Targets: []string{"uri", "path"}, Pattern: `(?i)/(?:\.env|\.git/(?:HEAD|config)|wp-admin/install\.php|phpinfo\.php|\.aws/credentials|\.ssh/id_rsa|actuator/(?:env|heapdump|trace))\b`},
+		{ID: "SCAN-015", Name: "Common webshell names", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Known webshell filenames in URL", Targets: []string{"uri", "path"}, Pattern: `(?i)/(?:c99|r57|b374k|wso|adminer|filesman|weevely)\.(?:php|jsp|aspx?)\b`},
+
+		// --- Headers / Cookie abuse ---
+		{ID: "HDR-001", Name: "Host Header Injection", Phase: core.PhaseRequestHeaders, Score: 50, Action: core.ActionBlock, Description: "CRLF or URL in Host header", Targets: []string{"headers.Host"}, Pattern: `[\r\n]|(?i)https?://`},
+		{ID: "HDR-002", Name: "Forwarded Header Spoof", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "Forwarded with SSRF-range host", Targets: []string{"headers.X-Forwarded-For", "headers.Forwarded"}, Pattern: `(?i)(?:127\.|0\.0\.0\.0|169\.254\.|10\.|192\.168\.|::1|localhost|metadata)`},
+		{ID: "HDR-003", Name: "Oversized Cookie Header", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Cookie header >4KB used in scanner probes", Targets: []string{"headers.Cookie"}, Pattern: `.{1000}.{1000}.{1000}.{1000}`},
+
+		// --- Path traversal / file inclusion variants ---
+		{ID: "LFI-010", Name: "Unicode traversal", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Unicode / alt-encoded ../ sequences", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:%c0%ae|%c1%9c|%uff0e|%u002e|\.\\\.\\|\.\./\\)`},
+		{ID: "LFI-011", Name: "PHP wrapper", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PHP stream wrappers (data, expect, phar, zip)", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)\b(?:data|expect|phar|zip|compress\.zlib|compress\.bzip2|glob|ogg|ssh2|rar):/{0,2}[^\s]`},
+		{ID: "LFI-012", Name: "Windows sensitive file", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Windows system path in request", Targets: []string{"uri", "args"}, Pattern: `(?i)\b(?:c:\\windows\\system32\\|boot\.ini|win\.ini|\\sam|\\security|\\ntds\.dit)\b`},
+
+		// --- SQLi extensions ---
+		{ID: "SQLI-020", Name: "PostgreSQL pg_sleep", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Time-based pg_sleep injection", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)pg_sleep\s*\(`},
+		{ID: "SQLI-021", Name: "MSSQL waitfor delay", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "MSSQL waitfor delay time-based", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)waitfor\s+delay\s+["']\d`},
+		{ID: "SQLI-022", Name: "Hex-encoded SQLi payload", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "0x68657870... hex-encoded strings", Targets: []string{"args", "body"}, Pattern: `(?i)0x[0-9a-f]{20,}`},
+		{ID: "SQLI-023", Name: "Stacked queries", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "Semicolon-separated query followed by keyword", Targets: []string{"args", "body"}, Pattern: `(?i);\s*(?:select|insert|update|delete|drop|create|alter|exec|xp_cmdshell)\b`},
+		{ID: "SQLI-024", Name: "Comment-based evasion", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "MySQL /*!...*/ or -- evasion", Targets: []string{"args", "body"}, Pattern: `(?i)/\*!\d{5}.*\*/|\bunion\b\s*(?:/\*.*?\*/\s*)?select`},
+
+		// --- RCE / command injection extensions ---
+		{ID: "RCE-010", Name: "Powershell encoded command", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PowerShell -EncodedCommand / IEX DownloadString", Targets: []string{"args", "body"}, Pattern: `(?i)(?:-EncodedCommand|iex\s*\(\s*new-object\s+net\.webclient|DownloadString\s*\()`},
+		{ID: "RCE-011", Name: "bash curl|sh", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Classic curl ... | (sh|bash) install pattern", Targets: []string{"args", "body"}, Pattern: `(?i)(?:curl|wget|fetch)\s+[^|&]{3,}\s*\|\s*(?:sh|bash|zsh|python|perl|ruby|php)\b`},
+		{ID: "RCE-012", Name: "Shellshock", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Bash Shellshock (CVE-2014-6271) function definition", Targets: []string{"headers"}, Pattern: `\(\s*\)\s*\{\s*[:_].*?\}\s*;`},
+		{ID: "RCE-013", Name: "Python one-liner revshell", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Python socket-based reverse shell one-liner", Targets: []string{"args", "body"}, Pattern: `(?i)python.{0,20}-c.{0,50}(?:socket|subprocess).{0,100}(?:connect|dup2)`},
+
+		// --- Request shape anomalies ---
+		{ID: "ANOM-001", Name: "Method with body anomaly", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "GET/HEAD/DELETE with non-zero Content-Length", Targets: []string{"method", "headers.Content-Length"}, Pattern: `^(?:GET|HEAD|DELETE|OPTIONS)$`},
+		{ID: "ANOM-002", Name: "Long URL", Phase: core.PhaseRequestHeaders, Score: 25, Action: core.ActionLog, Description: "URL longer than 2000 chars — likely fuzzing", Targets: []string{"uri"}, Pattern: `.{1000}.{1000}`},
+		{ID: "ANOM-003", Name: "Null byte in URL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Null byte in URL — parser confusion", Targets: []string{"uri", "path", "args"}, Pattern: `\x00|%00|\\x00|\\u0000`},
+
+		// --- Credential-stuffing patterns ---
+		{ID: "CS-001", Name: "Combo-list format", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "user:pass colon-separated payload", Targets: []string{"body"}, Pattern: `(?i)^[a-z0-9._%+\-]+@[a-z0-9.\-]+:[^\s]{4,}$`},
+		{ID: "CS-002", Name: "openbullet config markers", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "OpenBullet / BAS tool signatures", Targets: []string{"headers.User-Agent", "headers"}, Pattern: `(?i)(?:openbullet|blackbullet|anomaly|storm|silverbullet|sentrymba)\b`},
+
+		// --- JSONP / callback abuse ---
+		{ID: "JSONP-001", Name: "Suspicious JSONP callback", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "JSONP callback param with JS payload", Targets: []string{"args"}, Pattern: `(?i)^(?:callback|jsonp|cb)=[^a-z0-9_$.]+`},
 	}
 }
 

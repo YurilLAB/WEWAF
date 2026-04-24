@@ -20,21 +20,50 @@ import (
 	"wewaf/internal/bruteforce"
 	"wewaf/internal/config"
 	"wewaf/internal/core"
+	"wewaf/internal/ddos"
 	"wewaf/internal/engine"
 	"wewaf/internal/limits"
 	"wewaf/internal/telemetry"
+	"wewaf/internal/zerotrust"
 )
 
 // WAFProxy wraps a reverse proxy with WAF inspection.
 type WAFProxy struct {
-	cfg     *config.Config
-	eng     *engine.Engine
-	metrics *telemetry.Metrics
-	bf      *bruteforce.Detector
-	sema    *limits.Semaphore
-	rl      *limits.RateLimiter
-	backend *url.URL
-	proxy   *httputil.ReverseProxy
+	cfg       *config.Config
+	eng       *engine.Engine
+	metrics   *telemetry.Metrics
+	bf        *bruteforce.Detector
+	sema      *limits.Semaphore
+	rl        *limits.RateLimiter
+	backend   *url.URL
+	proxy     *httputil.ReverseProxy
+	ddos      *ddos.Detector
+	breaker   *limits.Breaker
+	zeroTrust *zerotrust.Engine
+}
+
+// DDoSStats returns the detector's counters for the admin API.
+func (wp *WAFProxy) DDoSStats() map[string]interface{} {
+	if wp == nil || wp.ddos == nil {
+		return map[string]interface{}{}
+	}
+	return wp.ddos.StatsSnapshot()
+}
+
+// BreakerStats returns the breaker's counters for the admin API.
+func (wp *WAFProxy) BreakerStats() map[string]interface{} {
+	if wp == nil || wp.breaker == nil {
+		return map[string]interface{}{}
+	}
+	return wp.breaker.StatsSnapshot()
+}
+
+// ZeroTrustEngine exposes the policy engine so the admin API can update it.
+func (wp *WAFProxy) ZeroTrustEngine() *zerotrust.Engine {
+	if wp == nil {
+		return nil
+	}
+	return wp.zeroTrust
 }
 
 // seekableBody wraps a bytes.Reader so it can be re-read by the engine.
@@ -67,6 +96,17 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 		sema:    sema,
 		rl:      rl,
 		backend: backend,
+		ddos: ddos.New(ddos.Config{
+			VolumetricBaseline: cfg.DDoSVolumetricBaseline,
+			VolumetricSpike:    cfg.DDoSVolumetricSpike,
+			ConnRateThreshold:  cfg.DDoSConnRateThreshold,
+			SlowMinBPS:         cfg.DDoSSlowReadBPS,
+		}),
+		breaker: limits.NewBreaker(
+			cfg.BreakerConsecutiveFailures,
+			time.Duration(cfg.BreakerOpenTimeoutSec)*time.Second,
+		),
+		zeroTrust: zerotrust.NewEngine(nil),
 	}
 
 	wp.proxy = httputil.NewSingleHostReverseProxy(backend)
@@ -83,7 +123,15 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if rec := recover(); rec != nil {
 			wp.eng.LogError("proxy: panic in ServeHTTP: %v", rec)
 			if w != nil {
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				// Failsafe: block on panic unless operator opted into
+				// fail-open. 503 + Retry-After lets clients back off.
+				if wp.cfg.FailsafeMode == "open" {
+					w.Header().Set("X-WAF-Failsafe", "open-pass")
+					wp.proxy.ServeHTTP(w, r)
+					return
+				}
+				w.Header().Set("Retry-After", "5")
+				http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 			}
 		}
 		if elapsed := time.Since(start); elapsed > 10*time.Second {
@@ -116,10 +164,50 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer wp.sema.Release()
 
 	clientIP := getClientIP(r, wp.cfg.TrustXFF)
+
+	// DDoS detection: classify the request before we spend any effort on it.
+	// A volumetric verdict means the whole WAF is under attack and we
+	// should shed load; a connection-rate verdict is a single IP misbehaving.
+	switch wp.ddos.RecordRequest(clientIP) {
+	case ddos.VerdictVolumetric:
+		w.Header().Set("Retry-After", "30")
+		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-VOLUMETRIC", "global RPS spike", 0)
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	case ddos.VerdictConnRate:
+		w.Header().Set("Retry-After", "30")
+		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-CONN-RATE", "connection-rate flood", 0)
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+
 	if !wp.rl.Allow(clientIP) {
 		w.Header().Set("Retry-After", "60")
 		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "RATE-LIMIT", "Rate limit exceeded", 0)
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	}
+
+	// Zero-trust policy evaluation — applies path-scoped IP/country/header
+	// rules before the request gets near the rule engine.
+	if wp.zeroTrust != nil {
+		if decision, reason, policy := wp.zeroTrust.Evaluate(r, clientIP); decision == zerotrust.DecisionDeny {
+			polID := "-"
+			if policy != nil {
+				polID = policy.ID
+			}
+			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "ZERO-TRUST:"+polID, reason, 100)
+			http.Error(w, "Forbidden: "+reason, http.StatusForbidden)
+			return
+		}
+	}
+
+	// Circuit breaker — if the backend has been failing, short-circuit
+	// before we spend time inspecting a request we can't deliver.
+	if !wp.breaker.Allow() {
+		w.Header().Set("Retry-After", "10")
+		wp.metrics.RecordError()
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -149,9 +237,11 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Buffer body for inspection and forwarding.
 	var body []byte
 	if r.Body != nil {
+		readStart := time.Now()
 		limited := io.LimitReader(r.Body, wp.cfg.MaxBodyBytes)
 		var err error
 		body, err = io.ReadAll(limited)
+		readElapsed := time.Since(readStart)
 		if err != nil {
 			wp.eng.LogError("proxy: body read error: %v", err)
 			_ = r.Body.Close()
@@ -161,6 +251,15 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = r.Body.Close()
+		// Slow-read detection: a request whose body took ages to arrive at
+		// a byte rate below the configured floor is a Slowloris variant.
+		if wp.ddos.RecordSlowRead(len(body), readElapsed) {
+			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-SLOW-READ",
+				"slow body read", 0)
+			http.Error(w, "Request Timeout", http.StatusRequestTimeout)
+			wp.eng.ProcessLogging(tx)
+			return
+		}
 		r.Body = &seekableBody{Reader: bytes.NewReader(body)}
 		r.ContentLength = int64(len(body))
 		r.Header.Set("Content-Length", strconv.Itoa(len(body)))
@@ -242,6 +341,16 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // modifyResponse inspects backend responses (Phase 3 and 4).
 func (wp *WAFProxy) modifyResponse(res *http.Response) error {
+	// A response means the backend was reachable, regardless of status.
+	// 5xx responses are still reported to the breaker as errors so a
+	// backend that's stuck 500ing trips it.
+	if res != nil && wp.breaker != nil {
+		if res.StatusCode >= 500 && res.StatusCode <= 599 {
+			wp.breaker.RecordFailure()
+		} else {
+			wp.breaker.RecordSuccess()
+		}
+	}
 	if res == nil || res.Request == nil {
 		return nil
 	}
@@ -386,6 +495,10 @@ func (wp *WAFProxy) errorHandler(w http.ResponseWriter, r *http.Request, err err
 			}
 		}
 	}()
+	// Backend-level failure: count it against the circuit breaker.
+	if wp.breaker != nil {
+		wp.breaker.RecordFailure()
+	}
 	var logMsg string
 	switch {
 	case errors.Is(err, syscall.ECONNREFUSED):
@@ -508,11 +621,13 @@ func isLoginRequest(r *http.Request) bool {
 
 // EgressProxy intercepts outbound HTTP requests from the backend app.
 type EgressProxy struct {
-	cfg     *config.Config
-	eng     *engine.Engine
-	metrics *telemetry.Metrics
-	banList *core.BanList
-	client  *http.Client
+	cfg      *config.Config
+	eng      *engine.Engine
+	metrics  *telemetry.Metrics
+	banList  *core.BanList
+	client   *http.Client
+	dnsCache *egressDNSCache
+	rl       *egressRateLimiter
 }
 
 // NewEgressProxy creates an egress inspection proxy.
@@ -530,6 +645,8 @@ func NewEgressProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.M
 				TLSHandshakeTimeout: 10 * time.Second,
 			},
 		},
+		dnsCache: newEgressDNSCache(60*time.Second, 4096),
+		rl:       newEgressRateLimiter(50, 100),
 	}
 }
 
@@ -582,14 +699,24 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Block private IPs. Resolves the hostname so an attacker-controlled DNS
-	// record that points to 127.0.0.1 / 169.254.169.254 is caught too.
+	// record that points to 127.0.0.1 / 169.254.169.254 is caught too. The
+	// DNS cache avoids hammering the resolver for every request.
 	if ep.cfg.EgressBlockPrivateIPs {
-		if reason := resolvedDangerReason(parsed.Hostname()); reason != "" {
+		if reason := ep.dangerReason(r.Context(), parsed.Hostname()); reason != "" {
 			ep.recordEgressBlock(targetURL, reason)
 			ep.eng.LogError("egress: blocked request to %s: %s", targetURL, reason)
 			http.Error(w, "Forbidden: "+reason, http.StatusForbidden)
 			return
 		}
+	}
+
+	// Per-destination rate limit — one noisy dependency can't flood a
+	// single third-party. We key on the raw hostname so CNAME chains that
+	// resolve to the same backing IP are still counted separately.
+	if !ep.rl.Allow(strings.ToLower(parsed.Hostname())) {
+		ep.recordEgressBlock(targetURL, "egress rate limit exceeded")
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
 	}
 
 	// CONNECT tunnel support for HTTPS egress.
@@ -787,9 +914,39 @@ var metadataIPs = map[string]struct{}{
 	"fd00:ec2::254":   {}, // AWS IMDSv2 over IPv6
 }
 
-// resolvedDangerReason returns a non-empty reason string if host either is or
-// resolves to a private / loopback / link-local / cloud-metadata address.
-// Returning an empty string means the host is safe to contact.
+// dangerReason is the DNS-cached version of resolvedDangerReason. The
+// EgressProxy uses this on the hot path so repeated outbound calls to the
+// same host don't re-resolve.
+func (ep *EgressProxy) dangerReason(ctx context.Context, host string) string {
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return "empty destination host"
+	}
+	lower := strings.ToLower(host)
+	if lower == "localhost" || strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal") {
+		return "internal hostname blocked"
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if reason := classifyIP(ip); reason != "" {
+			return reason
+		}
+		return ""
+	}
+	ips, err := ep.dnsCache.Lookup(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return "dns resolution failed"
+	}
+	for _, ip := range ips {
+		if reason := classifyIP(ip); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// resolvedDangerReason is preserved for legacy callers that don't have an
+// EgressProxy instance. New code should prefer (*EgressProxy).dangerReason
+// which reuses the DNS cache.
 func resolvedDangerReason(host string) string {
 	host = strings.Trim(host, "[]")
 	if host == "" {
@@ -799,15 +956,12 @@ func resolvedDangerReason(host string) string {
 	if lower == "localhost" || strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal") {
 		return "internal hostname blocked"
 	}
-	// Literal IP — direct classification.
 	if ip := net.ParseIP(host); ip != nil {
 		if reason := classifyIP(ip); reason != "" {
 			return reason
 		}
 		return ""
 	}
-	// Hostname — resolve and check every answer. A short timeout keeps the
-	// hot path snappy; resolution failures fail closed.
 	resolver := net.Resolver{}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

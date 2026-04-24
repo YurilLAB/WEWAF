@@ -65,6 +65,23 @@ type Config struct {
 	// Response hardening
 	SecurityHeadersEnabled bool `json:"security_headers_enabled"`
 
+	// Failsafe behaviour when the engine panics or the backend is unhealthy.
+	// "closed" (default) returns 503 to fail secure; "open" forwards the
+	// request unfiltered. Production deployments should keep this closed.
+	FailsafeMode string `json:"failsafe_mode"` // "closed" | "open"
+
+	// Circuit breaker for the backend. If the backend produces
+	// ConsecutiveFailures errors in a row the breaker opens for
+	// OpenTimeoutSec, during which the proxy short-circuits to 503.
+	BreakerConsecutiveFailures int `json:"breaker_consecutive_failures"`
+	BreakerOpenTimeoutSec      int `json:"breaker_open_timeout_sec"`
+
+	// DDoS detection
+	DDoSVolumetricBaseline int     `json:"ddos_volumetric_baseline"` // requests/sec considered normal
+	DDoSVolumetricSpike    float64 `json:"ddos_volumetric_spike"`    // multiplier that flips "under attack"
+	DDoSConnRateThreshold  int     `json:"ddos_conn_rate_threshold"` // per-IP conns in 10s to mitigate
+	DDoSSlowReadBPS        int     `json:"ddos_slow_read_bps"`       // bytes/sec below which a slow read is flagged
+
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 }
 
@@ -107,6 +124,14 @@ func Default() *Config {
 		MeshGossipIntervalSec:    60,
 		MeshSyncTimeoutSec:       10,
 		SecurityHeadersEnabled:   true,
+
+		FailsafeMode:               "closed",
+		BreakerConsecutiveFailures: 10,
+		BreakerOpenTimeoutSec:      30,
+		DDoSVolumetricBaseline:     500,
+		DDoSVolumetricSpike:        4.0,
+		DDoSConnRateThreshold:      100,
+		DDoSSlowReadBPS:            128,
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -187,6 +212,27 @@ func (c *Config) Validate() error {
 	}
 	if c.MeshSyncTimeoutSec <= 0 {
 		c.MeshSyncTimeoutSec = 10
+	}
+	if c.FailsafeMode != "open" && c.FailsafeMode != "closed" {
+		c.FailsafeMode = "closed"
+	}
+	if c.BreakerConsecutiveFailures <= 0 {
+		c.BreakerConsecutiveFailures = 10
+	}
+	if c.BreakerOpenTimeoutSec <= 0 {
+		c.BreakerOpenTimeoutSec = 30
+	}
+	if c.DDoSVolumetricBaseline <= 0 {
+		c.DDoSVolumetricBaseline = 500
+	}
+	if c.DDoSVolumetricSpike <= 0 {
+		c.DDoSVolumetricSpike = 4.0
+	}
+	if c.DDoSConnRateThreshold <= 0 {
+		c.DDoSConnRateThreshold = 100
+	}
+	if c.DDoSSlowReadBPS <= 0 {
+		c.DDoSSlowReadBPS = 128
 	}
 	return nil
 }
