@@ -235,10 +235,32 @@ func (e *Engine) ProcessLogging(tx *core.Transaction) {
 }
 
 // evaluatePhase runs the rule set for a single phase and updates the transaction.
-func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets map[string]string) *core.Interruption {
+func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets map[string]string) (intr *core.Interruption) {
+	// Panic-to-failsafe: if anything inside this function panics (bad regex,
+	// nil map, corrupt target) we return a block interruption when the
+	// operator has chosen fail-closed. Previously the recover logged and
+	// silently returned nil → the request forwarded unblocked even after a
+	// mid-score panic. Fail-open deployments still get pass-through.
 	defer func() {
 		if rec := recover(); rec != nil {
 			e.logger.Errorf("engine: panic during evaluation: %v", rec)
+			mode := ""
+			failsafe := "closed"
+			if e.cfg != nil {
+				snap := e.cfg.Snapshot()
+				mode = snap.ModeSnapshot()
+				if snap.FailsafeMode != "" {
+					failsafe = snap.FailsafeMode
+				}
+			}
+			if failsafe != "open" && mode != "detection" && mode != "learning" {
+				tx.SetBlocked(phase)
+				intr = &core.Interruption{
+					Action:  core.ActionBlock,
+					Status:  503,
+					Message: "engine panic — failsafe block",
+				}
+			}
 		}
 	}()
 	e.mu.RLock()
@@ -359,6 +381,43 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 			})
 		}
 
+		// HTTP Smuggling: obfuscated Transfer-Encoding. Catches "chunked,
+		// chunked", whitespace-padded variants, and unknown-encoding +
+		// chunked combos that several smuggling PoCs use to coerce mismatched
+		// parsing between intermediaries.
+		if teValues, ok := tx.Request.Header["Transfer-Encoding"]; ok && HasObfuscatedTransferEncoding(teValues) {
+			addMatch(core.Match{
+				RuleID:    "SMUG-010",
+				RuleName:  "HTTP Smuggling Obfuscated TE",
+				Phase:     phase,
+				Target:    "headers",
+				Value:     strings.Join(teValues, ", "),
+				Score:     85,
+				Action:    core.ActionBlock,
+				Message:   "Obfuscated Transfer-Encoding header",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
+		// HTTP/2 smuggling indicator: presence of both :method pseudo-style
+		// hop-by-hop headers and Content-Length where the protocol is h2c.
+		// In Go's net/http server, HTTP/2 requests surface through ProtoMajor.
+		if tx.Request.ProtoMajor == 2 && tx.Request.Header.Get("Content-Length") != "" {
+			if _, hasTE := tx.Request.Header["Transfer-Encoding"]; hasTE {
+				addMatch(core.Match{
+					RuleID:    "SMUG-011",
+					RuleName:  "HTTP/2 CL+TE anomaly",
+					Phase:     phase,
+					Target:    "headers",
+					Value:     "h2 with both TE and CL",
+					Score:     80,
+					Action:    core.ActionBlock,
+					Message:   "HTTP/2 request with Content-Length and Transfer-Encoding",
+					Timestamp: time.Now().UTC(),
+				})
+			}
+		}
+
 		// Empty / missing User-Agent
 		ua := tx.Request.UserAgent()
 		if ua == "" {
@@ -453,24 +512,26 @@ func (e *Engine) buildRequestHeaderTargets(r *http.Request) map[string]string {
 		return targets
 	}
 
-	// URI / path go through Canonicalize so double-encoded, unicode, and
-	// mixed-slash variants all collapse to one representation before rules
-	// run. This is the hard-to-bypass counterpart to plain url.PathUnescape.
+	// URI / path go through Canonicalize + FoldHomoglyphs so double-encoded,
+	// unicode-confusable, and mixed-slash variants all collapse to one
+	// representation before rules run. Homoglyph folding in particular
+	// catches payloads that swap in Cyrillic or fullwidth lookalikes that
+	// NFKC alone leaves intact.
 	if uri, err := url.PathUnescape(r.URL.RequestURI()); err == nil {
-		add("uri", Canonicalize(uri))
+		add("uri", FoldHomoglyphs(Canonicalize(uri)))
 	} else {
-		add("uri", Canonicalize(r.URL.RequestURI()))
+		add("uri", FoldHomoglyphs(Canonicalize(r.URL.RequestURI())))
 	}
 	add("method", r.Method)
-	add("path", CanonicalizePath(r.URL.Path))
+	add("path", FoldHomoglyphs(CanonicalizePath(r.URL.Path)))
 	for k, v := range r.URL.Query() {
 		raw := strings.Join(v, ", ")
 		if decoded, err := url.QueryUnescape(raw); err == nil {
-			if !add("args."+k, Canonicalize(decoded)) {
+			if !add("args."+k, FoldHomoglyphs(Canonicalize(decoded))) {
 				break
 			}
 		} else {
-			if !add("args."+k, Canonicalize(raw)) {
+			if !add("args."+k, FoldHomoglyphs(Canonicalize(raw))) {
 				break
 			}
 		}

@@ -5,6 +5,7 @@ package host
 
 import (
 	"context"
+	"log"
 	"os"
 	"runtime"
 	"sync"
@@ -112,8 +113,12 @@ func (c *Collector) Stop() {
 
 func (c *Collector) loop(ctx context.Context) {
 	defer func() {
-		// Panics in gopsutil should not crash the daemon.
-		_ = recover()
+		// Panics in gopsutil should not crash the daemon, but we still want
+		// the operator to see when metrics collection quietly died — silent
+		// recovery was masking driver bugs on Windows in the past.
+		if r := recover(); r != nil {
+			log.Printf("host.Collector: loop goroutine panic: %v", r)
+		}
 	}()
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
@@ -130,7 +135,11 @@ func (c *Collector) loop(ctx context.Context) {
 }
 
 func (c *Collector) sample(ctx context.Context) {
-	defer func() { _ = recover() }()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("host.Collector: sample panic: %v", r)
+		}
+	}()
 
 	cpuPct := 0.0
 	if vals, err := cpu.PercentWithContext(ctx, 0, false); err == nil && len(vals) > 0 {

@@ -101,6 +101,39 @@ type Config struct {
 	// only want the native WEWAF signatures.
 	CRSEnabled bool `json:"crs_enabled"`
 
+	// Backend transport tuning — the reverse proxy's outbound HTTP client.
+	// Zero values keep hard-coded defaults (see proxy.newBackendTransport).
+	BackendDialTimeoutMs           int `json:"backend_dial_timeout_ms"`
+	BackendResponseHeaderTimeoutMs int `json:"backend_response_header_timeout_ms"`
+	BackendTLSHandshakeTimeoutMs   int `json:"backend_tls_handshake_timeout_ms"`
+	BackendMaxIdleConns            int `json:"backend_max_idle_conns"`
+	BackendMaxConnsPerHost         int `json:"backend_max_conns_per_host"`
+
+	// Compression defense. If enabled, the WAF decompresses gzip/br bodies
+	// into a buffer for inspection, rejecting payloads whose decompressed
+	// size exceeds CompressRatioCap * compressed size (classic zip-bomb
+	// protection). MaxDecompressBytes caps the absolute decompressed size.
+	DecompressInspect   bool  `json:"decompress_inspect"`
+	DecompressRatioCap  int   `json:"decompress_ratio_cap"`  // default 100
+	MaxDecompressBytes  int64 `json:"max_decompress_bytes"`  // default 64 MB
+
+	// Per-rule telemetry. When enabled the engine counts matches per rule
+	// ID so operators can see which rules are firing.
+	PerRuleCounters bool `json:"per_rule_counters"`
+
+	// IP reputation feed ingestion. Populates the BanList with published
+	// DROP / tor-exit lists at the configured interval.
+	IPReputationEnabled       bool     `json:"ip_reputation_enabled"`
+	IPReputationRefreshMin    int      `json:"ip_reputation_refresh_min"` // default 360
+	IPReputationFeeds         []string `json:"ip_reputation_feeds"`
+
+	// Exponential-backoff bans. When enabled, repeat bans on the same IP
+	// within a window double the ban duration (up to MaxBanDurationSec).
+	BanBackoffEnabled       bool `json:"ban_backoff_enabled"`
+	BanBackoffMultiplier    int  `json:"ban_backoff_multiplier"`
+	BanBackoffWindowSec     int  `json:"ban_backoff_window_sec"`
+	MaxBanDurationSec       int  `json:"max_ban_duration_sec"`
+
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 }
 
@@ -166,6 +199,27 @@ func Default() *Config {
 		ShaperBurst:   4000,
 		ParanoiaLevel: 1,
 		CRSEnabled:    true,
+
+		BackendDialTimeoutMs:           5000,
+		BackendResponseHeaderTimeoutMs: 30000,
+		BackendTLSHandshakeTimeoutMs:   10000,
+		BackendMaxIdleConns:            200,
+		BackendMaxConnsPerHost:         64,
+
+		DecompressInspect:  true,
+		DecompressRatioCap: 100,
+		MaxDecompressBytes: 64 * 1024 * 1024,
+
+		PerRuleCounters: true,
+
+		IPReputationEnabled:    false,
+		IPReputationRefreshMin: 360,
+		IPReputationFeeds:      []string{},
+
+		BanBackoffEnabled:    true,
+		BanBackoffMultiplier: 2,
+		BanBackoffWindowSec:  86400,
+		MaxBanDurationSec:    7 * 24 * 3600,
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -295,6 +349,39 @@ func (c *Config) Validate() error {
 	if c.ParanoiaLevel > 4 {
 		c.ParanoiaLevel = 4
 	}
+	if c.BackendDialTimeoutMs <= 0 {
+		c.BackendDialTimeoutMs = 5000
+	}
+	if c.BackendResponseHeaderTimeoutMs <= 0 {
+		c.BackendResponseHeaderTimeoutMs = 30000
+	}
+	if c.BackendTLSHandshakeTimeoutMs <= 0 {
+		c.BackendTLSHandshakeTimeoutMs = 10000
+	}
+	if c.BackendMaxIdleConns <= 0 {
+		c.BackendMaxIdleConns = 200
+	}
+	if c.BackendMaxConnsPerHost <= 0 {
+		c.BackendMaxConnsPerHost = 64
+	}
+	if c.DecompressRatioCap <= 0 {
+		c.DecompressRatioCap = 100
+	}
+	if c.MaxDecompressBytes <= 0 {
+		c.MaxDecompressBytes = 64 * 1024 * 1024
+	}
+	if c.IPReputationRefreshMin <= 0 {
+		c.IPReputationRefreshMin = 360
+	}
+	if c.BanBackoffMultiplier <= 0 {
+		c.BanBackoffMultiplier = 2
+	}
+	if c.BanBackoffWindowSec <= 0 {
+		c.BanBackoffWindowSec = 86400
+	}
+	if c.MaxBanDurationSec <= 0 {
+		c.MaxBanDurationSec = 7 * 24 * 3600
+	}
 	return nil
 }
 
@@ -357,6 +444,27 @@ func (c *Config) Snapshot() *Config {
 		ShaperBurst:                 c.ShaperBurst,
 		ParanoiaLevel:               c.ParanoiaLevel,
 		CRSEnabled:                  c.CRSEnabled,
+
+		BackendDialTimeoutMs:           c.BackendDialTimeoutMs,
+		BackendResponseHeaderTimeoutMs: c.BackendResponseHeaderTimeoutMs,
+		BackendTLSHandshakeTimeoutMs:   c.BackendTLSHandshakeTimeoutMs,
+		BackendMaxIdleConns:            c.BackendMaxIdleConns,
+		BackendMaxConnsPerHost:         c.BackendMaxConnsPerHost,
+
+		DecompressInspect:  c.DecompressInspect,
+		DecompressRatioCap: c.DecompressRatioCap,
+		MaxDecompressBytes: c.MaxDecompressBytes,
+
+		PerRuleCounters: c.PerRuleCounters,
+
+		IPReputationEnabled:    c.IPReputationEnabled,
+		IPReputationRefreshMin: c.IPReputationRefreshMin,
+		IPReputationFeeds:      append([]string(nil), c.IPReputationFeeds...),
+
+		BanBackoffEnabled:    c.BanBackoffEnabled,
+		BanBackoffMultiplier: c.BanBackoffMultiplier,
+		BanBackoffWindowSec:  c.BanBackoffWindowSec,
+		MaxBanDurationSec:    c.MaxBanDurationSec,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	copy(cp.EgressAllowlist, c.EgressAllowlist)

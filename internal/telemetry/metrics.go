@@ -87,6 +87,11 @@ type Metrics struct {
 	egressCap       int
 	botCap          int
 	persister       Persister
+
+	// Per-rule match counters so the UI can highlight the noisiest rules.
+	// Lazily initialised in RecordBlockWithCategory to keep the zero value
+	// useful for tests.
+	RuleCounters map[string]uint64
 }
 
 // EgressEvent records an outbound egress decision.
@@ -207,6 +212,21 @@ func (m *Metrics) RecordBlockWithCategory(ip, method, path, ruleID, category, me
 		over := len(m.RecentBlocks) - m.recentBlocksCap
 		copy(m.RecentBlocks, m.RecentBlocks[over:])
 		m.RecentBlocks = m.RecentBlocks[:m.recentBlocksCap]
+	}
+	if ruleID != "" {
+		if m.RuleCounters == nil {
+			m.RuleCounters = make(map[string]uint64, 64)
+		}
+		// Bound the map — an attacker crafting synthetic rule IDs could
+		// otherwise grow it unboundedly. 4096 covers every real rule pack
+		// with headroom; once hit we stop adding new keys but keep
+		// incrementing existing ones.
+		if len(m.RuleCounters) < 4096 || func() bool {
+			_, exists := m.RuleCounters[ruleID]
+			return exists
+		}() {
+			m.RuleCounters[ruleID]++
+		}
 	}
 	p := m.persister
 	m.mu.Unlock()
@@ -401,6 +421,18 @@ func (m *Metrics) CountersSnapshot() map[string]uint64 {
 		"egress_blocked":   m.EgressBlocked,
 		"egress_allowed":   m.EgressAllowed,
 	}
+}
+
+// RuleCountersSnapshot returns a copy of per-rule match counts so callers can
+// sort/render without holding the metrics lock.
+func (m *Metrics) RuleCountersSnapshot() map[string]uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]uint64, len(m.RuleCounters))
+	for k, v := range m.RuleCounters {
+		out[k] = v
+	}
+	return out
 }
 
 // RecentBlocksSnapshot returns the last N block records.

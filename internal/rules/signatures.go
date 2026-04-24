@@ -22,10 +22,20 @@ type RuleSet struct {
 	rules []CompiledRule
 }
 
-// NewRuleSet builds a RuleSet from raw rules. Returns error if any pattern fails to compile.
+// NewRuleSet builds a RuleSet from raw rules. Returns error if any pattern
+// fails to compile or if the same rule ID appears twice — duplicates were
+// previously silent and confused dashboards that group by ID.
 func NewRuleSet(raw []core.Rule) (*RuleSet, error) {
 	rs := &RuleSet{rules: make([]CompiledRule, 0, len(raw))}
+	seen := make(map[string]struct{}, len(raw))
 	for _, r := range raw {
+		if r.ID == "" {
+			return nil, fmt.Errorf("rules: rule with empty ID: %q", r.Name)
+		}
+		if _, dup := seen[r.ID]; dup {
+			return nil, fmt.Errorf("rules: duplicate rule ID %q", r.ID)
+		}
+		seen[r.ID] = struct{}{}
 		re, err := regexp.Compile(r.Pattern)
 		if err != nil {
 			return nil, fmt.Errorf("rules: compile pattern for rule %q: %w", r.ID, err)
@@ -336,11 +346,11 @@ func DefaultRules() []core.Rule {
 		{ID: "DESER-YAML-001", Name: "YAML Ruby tag injection", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "!!ruby/object or !!python/object tag", Targets: []string{"body"}, Pattern: `(?i)!!(?:ruby|python)/(?:object|struct|module)(?::[^\s]+)?\s`},
 
 		// --- Server-Side Includes / Edge-Side Includes ---
-		{ID: "SSI-001", Name: "SSI exec cmd", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "<!--#exec cmd= SSI injection", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)<!--#\s*(?:exec|include|printenv|config)\s`},
+		{ID: "SSI-002", Name: "SSI exec cmd", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "<!--#exec cmd= SSI injection", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)<!--#\s*(?:exec|include|printenv|config)\s`},
 		{ID: "ESI-001", Name: "ESI Include Injection", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "ESI <esi:include> payload in user input", Targets: []string{"args", "body"}, Pattern: `(?i)<esi:(?:include|vars|eval|choose)`},
 
 		// --- HTTP Request Smuggling + H2 ---
-		{ID: "SMUG-003", Name: "Obfuscated Transfer-Encoding", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "TE header with non-standard token", Targets: []string{"headers.Transfer-Encoding", "headers"}, Pattern: `(?i)transfer[-\s_]*encoding\s*:\s*(?:\s*chunked\s*[;,].+|[^\w,]*chunked[^\w,]*\S)`},
+		{ID: "SMUG-005", Name: "Obfuscated Transfer-Encoding", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "TE header with non-standard token", Targets: []string{"headers.Transfer-Encoding", "headers"}, Pattern: `(?i)transfer[-\s_]*encoding\s*:\s*(?:\s*chunked\s*[;,].+|[^\w,]*chunked[^\w,]*\S)`},
 		{ID: "SMUG-004", Name: "Content-Length Chunk Conflict", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Body claims chunked but has length marker", Targets: []string{"body"}, Pattern: `(?s)^0+\r?\n\r?\nGET\s|^[0-9a-f]+\r?\n[\s\S]*?\r?\n0\r?\n[A-Z]`},
 
 		// --- Advanced bot / scanner fingerprints ---

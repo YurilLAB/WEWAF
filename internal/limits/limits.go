@@ -132,16 +132,19 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	now := time.Now()
 	b, ok := rl.buckets[ip]
 	if !ok {
+		// Bounded random-drop eviction. Scanning 1M buckets to find "oldest"
+		// while holding the write lock would stall every caller; Go's map
+		// iteration is already randomised, so dropping a small sample is an
+		// unbiased eviction that runs in O(budget).
 		if len(rl.buckets) >= maxBuckets {
-			var oldestIP string
-			var oldestTime time.Time
-			for k, v := range rl.buckets {
-				if oldestTime.IsZero() || v.last.Before(oldestTime) {
-					oldestIP = k
-					oldestTime = v.last
+			dropBudget := 128
+			for k := range rl.buckets {
+				delete(rl.buckets, k)
+				dropBudget--
+				if dropBudget <= 0 {
+					break
 				}
 			}
-			delete(rl.buckets, oldestIP)
 		}
 		b = &rateBucket{tokens: rl.burst - 1, last: now}
 		rl.buckets[ip] = b

@@ -13,6 +13,7 @@ package connection
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -113,7 +114,11 @@ func (m *Manager) Stop() {
 }
 
 func (m *Manager) loop(ctx context.Context) {
-	defer func() { _ = recover() }()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("connection.Manager: loop goroutine panic: %v", r)
+		}
+	}()
 	// One reusable timer so we don't leak one per iteration via time.After.
 	timer := time.NewTimer(time.Hour)
 	if !timer.Stop() {

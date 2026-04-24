@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -29,6 +30,11 @@ import (
 	"wewaf/internal/watchdog"
 	"wewaf/internal/web"
 )
+
+// meshMaxResponseBytes caps the size of a peer's gossip response. A malicious
+// or misbehaving peer returning an unbounded stream would otherwise OOM the
+// daemon; 4 MB is more than enough for thousands of ban entries.
+const meshMaxResponseBytes = 4 * 1024 * 1024
 
 const wafVersion = "0.2.0"
 
@@ -162,6 +168,12 @@ func main() {
 		return out
 	}
 	banList := core.NewBanList()
+	banList.ConfigureBackoff(
+		cfg.BanBackoffEnabled,
+		cfg.BanBackoffMultiplier,
+		time.Duration(cfg.BanBackoffWindowSec)*time.Second,
+		time.Duration(cfg.MaxBanDurationSec)*time.Second,
+	)
 	stopBanCleanup := banList.StartCleanup(time.Minute)
 	defer stopBanCleanup()
 
@@ -172,6 +184,37 @@ func main() {
 		log.Printf("config snapshot saved: %s", path)
 	} else {
 		log.Printf("config snapshot failed: %v", err)
+	}
+
+	// Config hot-reload. We watch the loaded file (only if the operator
+	// supplied one) and on change we recompile rules + push soft settings
+	// like Mode and BlockThreshold to the running daemon. Things that can't
+	// safely hot-swap — listen address, admin auth, SQLite paths — still
+	// require a full restart, and the watcher silently leaves them alone.
+	var cfgWatcher *config.Watcher
+	if configPath != "" {
+		cfgWatcher = config.NewWatcher(configPath, 5*time.Second, func(fresh *config.Config) {
+			newRules := rules.DefaultRules()
+			if fresh.CRSEnabled {
+				newRules = append(newRules, rules.CRSRules()...)
+			}
+			compiled, err := rules.NewRuleSet(newRules)
+			if err != nil {
+				log.Printf("config hot-reload: rule compile failed, keeping existing rules: %v", err)
+				return
+			}
+			eng.Reload(compiled)
+			cfg.SetMode(fresh.Mode)
+			cfg.BlockThreshold = fresh.BlockThreshold
+			cfg.ParanoiaLevel = fresh.ParanoiaLevel
+			cfg.RateLimitRPS = fresh.RateLimitRPS
+			cfg.RateLimitBurst = fresh.RateLimitBurst
+			log.Printf("config hot-reload: %d rules compiled, mode=%s paranoia=%d",
+				compiled.Count(), fresh.Mode, fresh.ParanoiaLevel)
+		})
+		cfgWatcher.Start()
+		defer cfgWatcher.Stop()
+		log.Printf("config hot-reload watcher enabled for %s", configPath)
 	}
 
 	admin := web.NewServer(web.Deps{
@@ -329,6 +372,29 @@ func main() {
 			if interval <= 0 {
 				interval = 60 * time.Second
 			}
+			// Dedicated client with a hard timeout so a peer that stalls its
+			// TLS handshake doesn't hang this goroutine per tick; also gives
+			// us a bounded connection pool separate from DefaultClient.
+			meshTimeout := time.Duration(cfg.MeshSyncTimeoutSec) * time.Second
+			if meshTimeout <= 0 {
+				meshTimeout = 10 * time.Second
+			}
+			meshClient := &http.Client{
+				Timeout: meshTimeout,
+				Transport: &http.Transport{
+					DialContext: (&net.Dialer{
+						Timeout:   3 * time.Second,
+						KeepAlive: 30 * time.Second,
+					}).DialContext,
+					MaxIdleConns:          16,
+					MaxIdleConnsPerHost:   2,
+					MaxConnsPerHost:       4,
+					IdleConnTimeout:       90 * time.Second,
+					TLSHandshakeTimeout:   5 * time.Second,
+					ResponseHeaderTimeout: meshTimeout,
+					ExpectContinueTimeout: 1 * time.Second,
+				},
+			}
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
@@ -358,23 +424,35 @@ func main() {
 							req.Header.Set("X-Mesh-Key", cfg.MeshAPIKey)
 						}
 
-						resp, err := http.DefaultClient.Do(req)
+						resp, err := meshClient.Do(req)
 						cancel()
 						if err != nil {
 							log.Printf("mesh gossip: peer %s sync error: %v", peerURL, err)
 							continue
 						}
 
+						// Bound the decoded body so a malicious peer cannot OOM
+						// the daemon. Reading one byte past the cap lets us
+						// detect the overflow case explicitly.
+						limited := io.LimitReader(resp.Body, meshMaxResponseBytes+1)
+						raw, readErr := io.ReadAll(limited)
+						resp.Body.Close()
+						if readErr != nil {
+							log.Printf("mesh gossip: peer %s body read error: %v", peerURL, readErr)
+							continue
+						}
+						if int64(len(raw)) > meshMaxResponseBytes {
+							log.Printf("mesh gossip: peer %s response exceeded %d bytes, dropping", peerURL, meshMaxResponseBytes)
+							continue
+						}
 						var result struct {
 							Status string          `json:"status"`
 							Bans   []core.BanEntry `json:"bans"`
 						}
-						if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-							resp.Body.Close()
+						if err := json.Unmarshal(raw, &result); err != nil {
 							log.Printf("mesh gossip: peer %s decode error: %v", peerURL, err)
 							continue
 						}
-						resp.Body.Close()
 
 						if resp.StatusCode == http.StatusOK {
 							for _, b := range result.Bans {

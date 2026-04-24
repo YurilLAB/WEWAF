@@ -81,6 +81,110 @@ func CanonicalizeHeaderName(name string) string {
 	return strings.ToLower(strings.TrimSpace(name))
 }
 
+// FoldHomoglyphs rewrites visually-confusable Cyrillic / Greek letters that
+// look like ASCII so rules that match e.g. "script" still catch obfuscated
+// payloads that use Cyrillic small-letter-es (U+0441) where "c" would be.
+// NFKC alone doesn't collapse these because they're distinct code points —
+// only their glyphs overlap. This list targets the handful of confusables
+// that show up in real WAF-bypass attempts and not the full Unicode chart.
+func FoldHomoglyphs(s string) string {
+	// Fast path: pure ASCII needs no replacement.
+	if isASCII(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if mapped, ok := homoglyphMap[r]; ok {
+			b.WriteRune(mapped)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// homoglyphMap is a conservative subset of the Unicode confusables that are
+// commonly used to bypass WAF string matching. We keep it small and ASCII-
+// only on the right side so mapped strings remain regex-compatible.
+var homoglyphMap = map[rune]rune{
+	// Cyrillic lookalikes
+	'а': 'a', // а
+	'е': 'e', // е
+	'о': 'o', // о
+	'р': 'p', // р
+	'с': 'c', // с
+	'у': 'y', // у
+	'х': 'x', // х
+	'Ѕ': 'S', // Ѕ
+	'І': 'I', // І
+	'Ј': 'J', // Ј
+	// Greek lookalikes
+	'Α': 'A', // Α
+	'Β': 'B', // Β
+	'Ε': 'E', // Ε
+	'Ζ': 'Z', // Ζ
+	'Η': 'H', // Η
+	'Κ': 'K', // Κ
+	'Μ': 'M', // Μ
+	'Ν': 'N', // Ν
+	'Ο': 'O', // Ο
+	'Ρ': 'P', // Ρ
+	'Τ': 'T', // Τ
+	'Χ': 'X', // Χ
+	'ο': 'o', // ο
+	// Fullwidth punctuation frequently smuggled into URLs
+	'／': '/', // ／
+	'＼': '\\',
+	'＜': '<', // ＜
+	'＞': '>', // ＞
+	'＇': '\'',
+	'＂': '"',
+}
+
+// HasObfuscatedTransferEncoding returns true if a Transfer-Encoding header
+// uses smuggling tricks like "chunked, chunked", whitespace padding around
+// the value, or an obfuscated keyword. This extends the basic TE+CL mismatch
+// detection with variants several smuggling PoCs use in practice.
+func HasObfuscatedTransferEncoding(values []string) bool {
+	for _, raw := range values {
+		// Inspect the raw value first — tab/vtab/form-feed around the token
+		// is itself a smuggling signal, and TrimSpace would hide it.
+		for i := 0; i < len(raw); i++ {
+			if raw[i] == '\t' || raw[i] == '\v' || raw[i] == '\f' {
+				return true
+			}
+		}
+		v := strings.ToLower(strings.TrimSpace(raw))
+		if v == "" || v == "identity" || v == "chunked" || v == "gzip" || v == "deflate" {
+			continue
+		}
+		// "chunked, chunked", "chunked , chunked" — duplicate signal.
+		if strings.Count(v, "chunked") >= 2 {
+			return true
+		}
+		// Any unrecognised encoding on a request path smells suspicious.
+		switch v {
+		case "gzip, chunked", "chunked, gzip", "deflate, chunked", "chunked, deflate":
+			// Legitimate combinations.
+		default:
+			if strings.Contains(v, "chunked") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func collapseSlashes(s string) string {
 	if !strings.Contains(s, "//") {
 		return s

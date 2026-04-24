@@ -64,22 +64,19 @@ func (d *Detector) Record(key string) int {
 	now := time.Now().UTC()
 	e, ok := d.entries[key]
 	if !ok {
+		// Bounded random-drop eviction: walking the full map under the write
+		// lock to find "oldest" was O(n) at 100 000 entries and caused self-
+		// DoS under rotating-IP login floods. Go's map iteration is randomised,
+		// so dropping the first few entries is an unbiased sample.
 		if len(d.entries) >= maxEntries {
-			var oldestKey string
-			var oldestTime time.Time
-			for k, v := range d.entries {
-				if len(v.attempts) > 0 {
-					last := v.attempts[len(v.attempts)-1]
-					if oldestTime.IsZero() || last.Before(oldestTime) {
-						oldestKey = k
-						oldestTime = last
-					}
-				} else {
-					oldestKey = k
+			dropBudget := 64
+			for k := range d.entries {
+				delete(d.entries, k)
+				dropBudget--
+				if dropBudget <= 0 {
 					break
 				}
 			}
-			delete(d.entries, oldestKey)
 		}
 		e = &entry{}
 		d.entries[key] = e

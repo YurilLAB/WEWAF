@@ -238,6 +238,13 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	mux.Handle("/api/", s.withCORS(s.withAuth(api)))
 
+	// Prometheus scrape endpoint — unauthenticated on the admin port because
+	// every Prometheus server expects /metrics without a token; operators
+	// running on a hostile network should put this behind a firewall or wrap
+	// with withAuth as appropriate.
+	mux.HandleFunc("/metrics", s.handlePrometheus)
+	api.HandleFunc("/api/rules/counters", s.handleRuleCounters)
+
 	// Serve the embedded SPA.
 	spaFS, err := fs.Sub(distFS, "dist")
 	if err != nil {
@@ -1556,6 +1563,39 @@ func (s *Server) handleZeroTrustTemplates(w http.ResponseWriter, r *http.Request
 	writeJSON(w, map[string]interface{}{
 		"templates": zerotrust.Templates(),
 	})
+}
+
+// handlePrometheus exposes counters in Prometheus text exposition format so
+// operators can scrape the WAF from their existing monitoring stack.
+func (s *Server) handlePrometheus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if r.Method == http.MethodHead {
+		return
+	}
+	if s.metrics == nil {
+		return
+	}
+	if err := s.metrics.WritePrometheus(w); err != nil {
+		log.Printf("web: prometheus exposition error: %v", err)
+	}
+}
+
+// handleRuleCounters returns a JSON map of rule_id -> match count so the UI
+// can highlight the noisiest rules and flag candidates for tuning.
+func (s *Server) handleRuleCounters(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, map[string]interface{}{"counters": map[string]uint64{}})
+		return
+	}
+	writeJSON(w, map[string]interface{}{"counters": s.metrics.RuleCountersSnapshot()})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

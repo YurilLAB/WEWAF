@@ -43,6 +43,10 @@ type WAFProxy struct {
 	breaker   *limits.Breaker
 	zeroTrust *zerotrust.Engine
 	shaper    *shaper.Shaper
+	// shaperAttack tracks the shaper's "tightened" state so Tighten/Relax
+	// are only invoked at the state-transition edge. Calling them on every
+	// request was an unnecessary mutex acquisition per hit.
+	shaperAttack atomic.Bool
 }
 
 // ShaperStats returns the admission controller's counters.
@@ -83,6 +87,30 @@ type seekableBody struct {
 }
 
 func (s *seekableBody) Close() error { return nil }
+
+// multiReadCloser combines an in-memory prefix with the original response
+// body so Phase-4 can hand the full stream back to the proxy. The underlying
+// io.NopCloser+io.MultiReader idiom dropped the upstream Close, leaking the
+// backend connection whenever a client disconnected before reading the tail.
+// Close here propagates to the original body exactly once.
+type multiReadCloser struct {
+	reader io.Reader
+	closer io.Closer
+	closed bool
+}
+
+func (m *multiReadCloser) Read(p []byte) (int, error) { return m.reader.Read(p) }
+
+func (m *multiReadCloser) Close() error {
+	if m.closed {
+		return nil
+	}
+	m.closed = true
+	if m.closer == nil {
+		return nil
+	}
+	return m.closer.Close()
+}
 
 var credLeakRE = regexp.MustCompile(`(?i)(api_key|password|secret)=([^&\s"']+)`)
 
@@ -131,10 +159,59 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	}
 
 	wp.proxy = httputil.NewSingleHostReverseProxy(backend)
+	// A reverse proxy left on DefaultTransport has no per-connection timeouts
+	// and no pool caps — a slow backend can park proxy goroutines for the full
+	// WriteTimeout and unbounded idle connections can exhaust FD limits. We
+	// give it a hardened transport with explicit timeouts at every stage of
+	// the request lifecycle, a keep-alive idle cap, and an expect-continue
+	// timeout so backends that ignore 100-continue don't hang the proxy.
+	wp.proxy.Transport = newBackendTransport(cfg)
 	wp.proxy.ModifyResponse = wp.modifyResponse
 	wp.proxy.ErrorHandler = wp.errorHandler
 
 	return wp, nil
+}
+
+// newBackendTransport returns an http.Transport with explicit timeouts and
+// bounded connection pools so a stalled backend cannot exhaust proxy
+// goroutines or file descriptors. Defaults are deliberately conservative
+// enough to detect real failures quickly while still tolerating a WAN-backed
+// origin.
+func newBackendTransport(cfg *config.Config) *http.Transport {
+	dialTimeout := 5 * time.Second
+	if cfg.BackendDialTimeoutMs > 0 {
+		dialTimeout = time.Duration(cfg.BackendDialTimeoutMs) * time.Millisecond
+	}
+	respTimeout := 30 * time.Second
+	if cfg.BackendResponseHeaderTimeoutMs > 0 {
+		respTimeout = time.Duration(cfg.BackendResponseHeaderTimeoutMs) * time.Millisecond
+	}
+	tlsTimeout := 10 * time.Second
+	if cfg.BackendTLSHandshakeTimeoutMs > 0 {
+		tlsTimeout = time.Duration(cfg.BackendTLSHandshakeTimeoutMs) * time.Millisecond
+	}
+	maxIdle := 200
+	if cfg.BackendMaxIdleConns > 0 {
+		maxIdle = cfg.BackendMaxIdleConns
+	}
+	maxPerHost := 64
+	if cfg.BackendMaxConnsPerHost > 0 {
+		maxPerHost = cfg.BackendMaxConnsPerHost
+	}
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          maxIdle,
+		MaxIdleConnsPerHost:   maxPerHost / 2,
+		MaxConnsPerHost:       maxPerHost,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   tlsTimeout,
+		ResponseHeaderTimeout: respTimeout,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
 
 // ServeHTTP implements http.Handler.
@@ -196,10 +273,17 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// to serve the traffic it DOES admit. In normal operation the budget
 	// is well above real traffic so this is a no-op.
 	if wp.shaper != nil {
+		// Edge-trigger the budget change — Tighten/Relax take a mutex, so
+		// firing them on every request during a sustained attack was a
+		// measurable contention source. Only flip on state transitions.
 		if wp.ddos != nil && wp.ddos.IsUnderAttack() {
-			wp.shaper.Tighten(0.2)
-		} else if wp.shaper != nil {
-			wp.shaper.Relax()
+			if wp.shaperAttack.CompareAndSwap(false, true) {
+				wp.shaper.Tighten(0.2)
+			}
+		} else {
+			if wp.shaperAttack.CompareAndSwap(true, false) {
+				wp.shaper.Relax()
+			}
 		}
 		if !wp.shaper.Admit() {
 			w.Header().Set("Retry-After", "5")
@@ -309,11 +393,9 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Buffer body for inspection and forwarding.
 	var body []byte
 	if r.Body != nil {
-		readStart := time.Now()
 		limited := io.LimitReader(r.Body, wp.cfg.MaxBodyBytes)
 		var err error
 		body, err = io.ReadAll(limited)
-		readElapsed := time.Since(readStart)
 		if err != nil {
 			wp.eng.LogError("proxy: body read error: %v", err)
 			_ = r.Body.Close()
@@ -323,14 +405,34 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = r.Body.Close()
-		// Slow-read detection: a request whose body took ages to arrive at
-		// a byte rate below the configured floor is a Slowloris variant.
-		if wp.ddos.RecordSlowRead(len(body), readElapsed) {
+		// Slow-read detection: measure total request lifetime (from proxy
+		// accept, which is `start`), not just the body-read window. A true
+		// Slowloris trickles headers AND body; measuring only the body read
+		// hid it from the detector because the read itself completed fast
+		// once we called io.ReadAll. The detector gates on SlowMinAge (10 s)
+		// to avoid flagging legitimate slow clients with tiny payloads.
+		if wp.ddos.RecordSlowRead(len(body), time.Since(start)) {
 			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-SLOW-READ",
 				"slow body read", 0)
 			http.Error(w, "Request Timeout", http.StatusRequestTimeout)
 			wp.eng.ProcessLogging(tx)
 			return
+		}
+		// Optional gzip/brotli bomb defense. The compressed body passed the
+		// MaxBodyBytes gate; decompress it into a ratio-capped buffer before
+		// handing it to the engine so a 10 KB bomb expanding to 1 GB cannot
+		// starve inspection memory. On failure we reject the request rather
+		// than silently forwarding an uninspected compressed payload.
+		if wp.cfg.DecompressInspect {
+			if decoded, reason := maybeDecompressBody(r.Header, body,
+				wp.cfg.DecompressRatioCap, wp.cfg.MaxDecompressBytes); reason != "" {
+				wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "COMPRESS-BOMB", reason, 100)
+				http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+				wp.eng.ProcessLogging(tx)
+				return
+			} else if len(decoded) > 0 {
+				tx.SetMetadata("decoded_body", decoded)
+			}
 		}
 		r.Body = &seekableBody{Reader: bytes.NewReader(body)}
 		r.ContentLength = int64(len(body))
@@ -463,7 +565,12 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	res.ContentLength = -1
 
 	// Reconstruct full body: inspected prefix + remainder of original stream.
-	res.Body = io.NopCloser(io.MultiReader(bytes.NewReader(inspectBody), res.Body))
+	// multiReadCloser propagates Close to the original response body so the
+	// backend connection is released even if the client disconnects early.
+	res.Body = &multiReadCloser{
+		reader: io.MultiReader(bytes.NewReader(inspectBody), res.Body),
+		closer: res.Body,
+	}
 
 	// Inject security headers and strip identifying ones.
 	if wp.cfg.SecurityHeadersEnabled {
@@ -741,9 +848,17 @@ func NewEgressProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.M
 		client: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				IdleConnTimeout:     90 * time.Second,
-				TLSHandshakeTimeout: 10 * time.Second,
+				DialContext: (&net.Dialer{
+					Timeout:   5 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   16,
+				MaxConnsPerHost:       32,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 20 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
 		dnsCache: newEgressDNSCache(60*time.Second, 4096),

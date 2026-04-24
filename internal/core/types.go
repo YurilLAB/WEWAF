@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -248,24 +249,44 @@ func clientIP(r *http.Request, trustXFF bool) string {
 
 // BanEntry records a single IP ban.
 type BanEntry struct {
-	IP        string    `json:"ip"`
-	Reason    string    `json:"reason"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Timestamp time.Time `json:"timestamp"`
+	IP         string    `json:"ip"`
+	Reason     string    `json:"reason"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Timestamp  time.Time `json:"timestamp"`
+	Offenses   int       `json:"offenses"`    // how many bans on this IP inside the backoff window
+	LastBanned time.Time `json:"last_banned"` // most recent ban time (may equal Timestamp)
 }
 
 // BanList is a thread-safe in-memory IP ban list with automatic expiry.
 type BanList struct {
 	mu       sync.RWMutex
 	entries  map[string]BanEntry
+	history  map[string]banHistory // offender tracking for exponential backoff
 	stopCh   chan struct{}
 	stopOnce sync.Once
+
+	// Exponential-backoff configuration. When enabled, Ban's effective
+	// duration = duration * multiplier^(offenses-1), clamped at maxDuration.
+	// Offenses reset after backoffWindow has elapsed since the last ban.
+	backoffEnabled    bool
+	backoffMultiplier int
+	backoffWindow     time.Duration
+	maxDuration       time.Duration
+}
+
+// banHistory tracks repeat-offender state outside of the active bans map so
+// it survives the TTL expiry. This is what lets a returning offender get a
+// longer ban the second time.
+type banHistory struct {
+	offenses   int
+	lastBanned time.Time
 }
 
 // NewBanList creates a new empty BanList.
 func NewBanList() *BanList {
 	return &BanList{
 		entries: make(map[string]BanEntry),
+		history: make(map[string]banHistory),
 		stopCh:  make(chan struct{}),
 	}
 }
@@ -279,7 +300,14 @@ func (bl *BanList) StartCleanup(interval time.Duration) func() {
 		interval = time.Minute
 	}
 	go func() {
-		defer func() { _ = recover() }()
+		defer func() {
+			if r := recover(); r != nil {
+				// Silent recovery here would lose eviction forever; the
+				// goroutine returns on panic, so at least log it so an
+				// operator can see why bans stopped being cleaned up.
+				log.Printf("core.BanList: cleanup goroutine panic: %v", r)
+			}
+		}()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -296,16 +324,69 @@ func (bl *BanList) StartCleanup(interval time.Duration) func() {
 	}
 }
 
-// Ban adds or updates a ban entry for the given IP.
+// ConfigureBackoff enables exponential-backoff bans. A multiplier of 2 and
+// window of 24 h means a repeat ban within 24 hours doubles the duration, up
+// to maxDuration. Passing multiplier <= 1 or enabled=false disables backoff.
+func (bl *BanList) ConfigureBackoff(enabled bool, multiplier int, window, maxDuration time.Duration) {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	bl.backoffEnabled = enabled
+	bl.backoffMultiplier = multiplier
+	bl.backoffWindow = window
+	bl.maxDuration = maxDuration
+}
+
+// Ban adds or updates a ban entry for the given IP. When backoff is enabled,
+// repeat bans on the same IP within the backoff window apply an exponential
+// multiplier to the duration, capped at maxDuration.
 func (bl *BanList) Ban(ip, reason string, duration time.Duration) {
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 	now := time.Now().UTC()
+
+	offenses := 1
+	if bl.backoffEnabled && bl.backoffMultiplier > 1 {
+		if bl.history == nil {
+			bl.history = make(map[string]banHistory)
+		}
+		h, ok := bl.history[ip]
+		if ok && (bl.backoffWindow <= 0 || now.Sub(h.lastBanned) <= bl.backoffWindow) {
+			offenses = h.offenses + 1
+		}
+		// Apply multiplier^(offenses-1) — cheap loop beats math.Pow for small N.
+		scaled := duration
+		for i := 1; i < offenses && scaled > 0; i++ {
+			scaled = scaled * time.Duration(bl.backoffMultiplier)
+			if bl.maxDuration > 0 && scaled > bl.maxDuration {
+				scaled = bl.maxDuration
+				break
+			}
+		}
+		if scaled > duration {
+			duration = scaled
+		}
+		bl.history[ip] = banHistory{offenses: offenses, lastBanned: now}
+		// Bound history map the same way entries is bounded elsewhere —
+		// otherwise an attacker rotating IPs could grow history without limit.
+		if len(bl.history) > 50_000 {
+			dropBudget := 64
+			for k := range bl.history {
+				delete(bl.history, k)
+				dropBudget--
+				if dropBudget <= 0 {
+					break
+				}
+			}
+		}
+	}
+
 	bl.entries[ip] = BanEntry{
-		IP:        ip,
-		Reason:    reason,
-		ExpiresAt: now.Add(duration),
-		Timestamp: now,
+		IP:         ip,
+		Reason:     reason,
+		ExpiresAt:  now.Add(duration),
+		Timestamp:  now,
+		Offenses:   offenses,
+		LastBanned: now,
 	}
 }
 
