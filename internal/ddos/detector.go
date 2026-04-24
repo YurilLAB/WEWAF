@@ -339,8 +339,17 @@ func (d *Detector) checkBotnet(ip, path string) Verdict {
 		d.botPaths[path] = ips
 	}
 
-	// Prune stale IPs.
-	if len(ips) > d.cfg.BotnetUniqueIPThreshold*2 {
+	// Prune stale IPs so len(ips) IS the fresh count. Doing this only
+	// when the map outgrows the threshold (to amortise the sweep cost)
+	// was the old behaviour, but it left the per-request path counting
+	// every entry — O(n) under lock. A threshold-anchored prune here
+	// caps the map size tightly around BotnetUniqueIPThreshold and lets
+	// the fresh check collapse to a single len() read.
+	pruneAbove := d.cfg.BotnetUniqueIPThreshold
+	if pruneAbove < 16 {
+		pruneAbove = 16
+	}
+	if len(ips) > pruneAbove {
 		for k, ts := range ips {
 			if ts < cutoff {
 				delete(ips, k)
@@ -349,16 +358,21 @@ func (d *Detector) checkBotnet(ip, path string) Verdict {
 	}
 	ips[ip] = now
 
-	// Count fresh IPs only.
-	fresh := 0
-	for _, ts := range ips {
-		if ts >= cutoff {
-			fresh++
+	if len(ips) >= d.cfg.BotnetUniqueIPThreshold {
+		// Belt-and-braces: if the map is at the threshold but a chunk
+		// of entries are stale (we haven't tripped a prune yet), count
+		// fresh entries for the final decision so we don't false-flag
+		// on a map that's mostly expired cruft.
+		fresh := 0
+		for _, ts := range ips {
+			if ts >= cutoff {
+				fresh++
+			}
 		}
-	}
-	if fresh >= d.cfg.BotnetUniqueIPThreshold {
-		d.flaggedBotnet.Add(1)
-		return VerdictBotnet
+		if fresh >= d.cfg.BotnetUniqueIPThreshold {
+			d.flaggedBotnet.Add(1)
+			return VerdictBotnet
+		}
 	}
 	return VerdictOK
 }

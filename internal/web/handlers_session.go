@@ -3,12 +3,42 @@ package web
 import (
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
 	"wewaf/internal/session"
 )
+
+// sessionEndpointBodyLimit caps anything a browser posts to the session /
+// challenge endpoints. Real signals fit comfortably under 1 KiB; the cap
+// makes sure a hostile client can't hold the server in io.ReadAll on a
+// slow trickle of bytes.
+const sessionEndpointBodyLimit = 8 * 1024
+
+// safeSessionHandler wraps a session/challenge handler with a deferred
+// recover. These endpoints run on the protected origin and anything that
+// panics here — a nil map, a broken cookie, a dependency regression —
+// would otherwise surface to the client as a 500. Fail-quiet to 204
+// instead, log once for operator visibility, and keep the request path
+// unbroken.
+func safeSessionHandler(label string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("session handler panic (%s): %v", label, rec)
+				// Only try to write if the ResponseWriter hasn't flushed yet.
+				// http.Error is safe even after a partial write because it
+				// just sets a status + writes — the net/http stack will log
+				// a "superfluous WriteHeader" warning we can live with.
+				w.WriteHeader(http.StatusNoContent)
+			}
+		}()
+		next(w, r)
+	}
+}
 
 // --- Browser challenge --------------------------------------------------
 
@@ -54,14 +84,19 @@ func (s *Server) handleBrowserChallengeVerify(w http.ResponseWriter, r *http.Req
 	}
 	// CORS — client posts from the origin being protected.
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	// Bound the body — signals should be under 1 KiB.
-	_ = r.ParseForm() // also parses a url-encoded body
-	if r.ContentLength <= 0 && len(r.PostForm) == 0 {
-		// Try reading manually up to a small cap in case the body didn't
-		// parse (sendBeacon sets Content-Type correctly but some proxies
-		// strip it).
-		limited := io.LimitReader(r.Body, 4096)
-		if raw, err := io.ReadAll(limited); err == nil {
+	// Hard-cap the body before ParseForm walks it — without this, a
+	// hostile client could dribble bytes forever.
+	r.Body = http.MaxBytesReader(w, r.Body, sessionEndpointBodyLimit)
+	if err := r.ParseForm(); err != nil {
+		// MaxBytesReader hit? Unknown Content-Type? Fall through with an
+		// empty PostForm — VerifyChallengeSignals returns score=100 in
+		// that case, which is safe.
+		r.PostForm = url.Values{}
+	}
+	if len(r.PostForm) == 0 && r.Body != nil {
+		// Fallback path for sendBeacon with a stripped Content-Type.
+		// Body is already capped by MaxBytesReader above.
+		if raw, err := io.ReadAll(r.Body); err == nil {
 			if parsed, perr := parseForm(string(raw)); perr == nil {
 				for k, v := range parsed {
 					r.PostForm[k] = v
@@ -76,7 +111,11 @@ func (s *Server) handleBrowserChallengeVerify(w http.ResponseWriter, r *http.Req
 		if passed && sess != nil {
 			c, _ := s.sessions.IssueChallengeCookie()
 			http.SetCookie(w, c)
-			s.sessions.RecordChallengePass(sess.ID)
+			// Rotate the session ID before recording the pass so any
+			// pre-challenge ID an attacker might have planted becomes
+			// invalid — classic session-fixation defence.
+			newID := s.sessions.RotateSession(w, sess.ID)
+			s.sessions.RecordChallengePass(newID)
 		}
 	}
 	// Response is diagnostic — real browsers ignore it. Helpful for
@@ -106,7 +145,12 @@ func (s *Server) handleSessionBeacon(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	_ = r.ParseForm()
+	// Hard-cap before ParseForm. Beacon payloads are three integers.
+	r.Body = http.MaxBytesReader(w, r.Body, sessionEndpointBodyLimit)
+	if err := r.ParseForm(); err != nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	mouse := parseUintCapped(r.PostForm.Get("m"), 100_000)
 	keys := parseUintCapped(r.PostForm.Get("k"), 10_000)
 	tms := parseUintCapped(r.PostForm.Get("t"), 5*60*1000)
@@ -184,13 +228,14 @@ func (s *Server) handleGraphQLStats(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg := s.graphql.ConfigSnapshot()
 	writeJSON(w, map[string]interface{}{
-		"enabled":     cfg.Enabled,
-		"max_depth":   cfg.MaxDepth,
-		"max_aliases": cfg.MaxAliases,
-		"max_fields":  cfg.MaxFields,
-		"block":       cfg.BlockOnError,
-		"role_header": cfg.RequireRoleHdr,
-		"stats":       s.graphql.StatsSnapshot(),
+		"enabled":             cfg.Enabled,
+		"max_depth":           cfg.MaxDepth,
+		"max_aliases":         cfg.MaxAliases,
+		"max_fields":          cfg.MaxFields,
+		"block":               cfg.BlockOnError,
+		"role_header":         cfg.RequireRoleHdr,
+		"block_subscriptions": cfg.BlockSubscriptions,
+		"stats":               s.graphql.StatsSnapshot(),
 	})
 }
 
@@ -204,6 +249,65 @@ func (s *Server) handleGraphQLRecent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]interface{}{"recent": s.graphql.Recent()})
+}
+
+// --- DPI + audit admin endpoints ---------------------------------------
+
+func (s *Server) handleDPIStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	stats := map[string]uint64{}
+	if s.proxy != nil {
+		stats = s.proxy.DPIStats()
+	}
+	writeJSON(w, map[string]interface{}{
+		"grpc_inspect":        s.cfg.GRPCInspect,
+		"grpc_block":          s.cfg.GRPCBlockOnError,
+		"websocket_inspect":   s.cfg.WebSocketInspect,
+		"websocket_allowlist": s.cfg.WebSocketOriginAllowlist,
+		"stats":               stats,
+	})
+}
+
+func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.audit == nil {
+		writeJSON(w, map[string]interface{}{"enabled": false})
+		return
+	}
+	ok, badSeq, total := s.audit.Verify()
+	appends, verifyFails := s.audit.Stats()
+	writeJSON(w, map[string]interface{}{
+		"enabled":       true,
+		"ok":            ok,
+		"bad_seq":       badSeq,
+		"total":         total,
+		"appends":       appends,
+		"verify_fails":  verifyFails,
+	})
+}
+
+func (s *Server) handleAuditTail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.audit == nil {
+		writeJSON(w, map[string]interface{}{"entries": []interface{}{}})
+		return
+	}
+	n := 100
+	if v := r.URL.Query().Get("n"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= 1000 {
+			n = parsed
+		}
+	}
+	writeJSON(w, map[string]interface{}{"entries": s.audit.Tail(n)})
 }
 
 // --- helpers ------------------------------------------------------------
@@ -224,7 +328,10 @@ func parseUintCapped(s string, max uint64) uint64 {
 }
 
 // parseForm parses a url-encoded body manually for the sendBeacon path
-// where ParseForm() can fail on unusual MIME types.
+// where ParseForm() can fail on unusual MIME types. We URL-decode both
+// keys and values so downstream lookups match what the ParseForm path
+// produces — the old "slice the raw bytes" version would mis-key any
+// pair containing %-encoded characters, yielding silent signal loss.
 func parseForm(body string) (map[string][]string, error) {
 	out := map[string][]string{}
 	for _, pair := range strings.Split(body, "&") {
@@ -232,12 +339,20 @@ func parseForm(body string) (map[string][]string, error) {
 			continue
 		}
 		eq := strings.IndexByte(pair, '=')
+		var rawKey, rawVal string
 		if eq < 0 {
-			out[pair] = append(out[pair], "")
-			continue
+			rawKey, rawVal = pair, ""
+		} else {
+			rawKey, rawVal = pair[:eq], pair[eq+1:]
 		}
-		k := pair[:eq]
-		v := pair[eq+1:]
+		k, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			k = rawKey
+		}
+		v, err := url.QueryUnescape(rawVal)
+		if err != nil {
+			v = rawVal
+		}
 		out[k] = append(out[k], v)
 	}
 	return out, nil

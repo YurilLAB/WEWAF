@@ -41,6 +41,12 @@ type Config struct {
 	SchemaSDL       string
 	RequireRoleHdr  string // header name carrying the requester's role (e.g. "X-User-Role")
 	BlockOnError    bool   // if false, log-only
+	// BlockSubscriptions rejects all `subscription` operations outright.
+	// GraphQL subscriptions usually arrive over WebSocket frames that a
+	// classic HTTP WAF can't fully inspect; if the backend doesn't use
+	// subscriptions, blocking them eliminates a whole class of
+	// amplification attacks. Off by default to avoid breaking legit apps.
+	BlockSubscriptions bool
 }
 
 // Validator holds compiled schema state. Safe for concurrent use.
@@ -50,13 +56,15 @@ type Validator struct {
 	mu          sync.Mutex // serialises schema reloads
 
 	// Stats — atomic counters surfaced via /api/graphql/stats.
-	statsRequests   atomic.Uint64
-	statsBlocked    atomic.Uint64
-	statsDepthFails atomic.Uint64
-	statsAliasFails atomic.Uint64
-	statsFieldFails atomic.Uint64
-	statsAuthFails  atomic.Uint64
-	statsParseFails atomic.Uint64
+	statsRequests        atomic.Uint64
+	statsBlocked         atomic.Uint64
+	statsDepthFails      atomic.Uint64
+	statsAliasFails      atomic.Uint64
+	statsFieldFails      atomic.Uint64
+	statsAuthFails       atomic.Uint64
+	statsParseFails      atomic.Uint64
+	statsSubscriptions   atomic.Uint64 // observed subscription ops (total)
+	statsSubscriptBlocks atomic.Uint64 // subscription ops blocked by config
 
 	// Last seen query sample (for the UI "recent queries" list). Bounded
 	// ring buffer to avoid memory growth under load.
@@ -192,34 +200,54 @@ func (v *Validator) Validate(bodyJSON []byte, role string) Result {
 	}
 	v.statsRequests.Add(1)
 
-	query, opName := extractQuery(bodyJSON)
-	if query == "" {
+	queries, opNames := extractQueries(bodyJSON)
+	if len(queries) == 0 {
 		// Persisted queries / apq — we can't inspect them without the
 		// server's registry, so forward untouched.
 		return Result{}
 	}
 
-	doc, gerr := parser.ParseQuery(&ast.Source{Name: "request", Input: query})
-	if gerr != nil {
-		v.statsParseFails.Add(1)
-		// Malformed — let the backend reject it with a native error.
-		v.recordSample(Sample{
-			Timestamp: time.Now().UTC(),
-			Operation: opName,
-			Blocked:   false,
-			Reason:    "parse error (forwarded)",
-		})
-		return Result{}
-	}
-
 	schema := v.schema.Load()
 	total := countStats{}
-	for _, op := range doc.Operations {
-		walkSelectionSet(op.SelectionSet, schema, rootTypeFor(schema, op), 1, &total, role, cfg)
-		if total.blocked {
+	var subscriptionReason string
+	var primaryOpName string
+	for idx, query := range queries {
+		doc, gerr := parser.ParseQuery(&ast.Source{Name: "request", Input: query})
+		if gerr != nil {
+			v.statsParseFails.Add(1)
+			// Malformed — let the backend reject it with a native error.
+			// Keep walking the rest of the batch: a bad entry shouldn't
+			// short-circuit inspection of sibling queries.
+			v.recordSample(Sample{
+				Timestamp: time.Now().UTC(),
+				Operation: opNames[idx],
+				Blocked:   false,
+				Reason:    "parse error (forwarded)",
+			})
+			continue
+		}
+		if primaryOpName == "" {
+			primaryOpName = opNames[idx]
+		}
+		for _, op := range doc.Operations {
+			if op.Operation == ast.Subscription {
+				v.statsSubscriptions.Add(1)
+				if cfg.BlockSubscriptions {
+					v.statsSubscriptBlocks.Add(1)
+					subscriptionReason = "subscription operations disabled"
+					break
+				}
+			}
+			walkSelectionSet(op.SelectionSet, schema, rootTypeFor(schema, op), 1, &total, role, cfg)
+			if total.blocked {
+				break
+			}
+		}
+		if total.blocked || subscriptionReason != "" {
 			break
 		}
 	}
+	opName := primaryOpName
 
 	res := Result{
 		Depth:   total.maxDepth,
@@ -227,7 +255,10 @@ func (v *Validator) Validate(bodyJSON []byte, role string) Result {
 		Fields:  total.fields,
 	}
 
-	if total.maxDepth > cfg.MaxDepth {
+	if subscriptionReason != "" {
+		res.Blocked = cfg.BlockOnError
+		res.Reason = subscriptionReason
+	} else if total.maxDepth > cfg.MaxDepth {
 		v.statsDepthFails.Add(1)
 		res.Blocked = cfg.BlockOnError
 		res.Reason = fmt.Sprintf("depth %d exceeds max %d", total.maxDepth, cfg.MaxDepth)
@@ -399,12 +430,14 @@ func (v *Validator) Recent() []Sample {
 // StatsSnapshot returns the counters for the admin API.
 func (v *Validator) StatsSnapshot() map[string]uint64 {
 	return map[string]uint64{
-		"requests":     v.statsRequests.Load(),
-		"blocked":      v.statsBlocked.Load(),
-		"depth_fails":  v.statsDepthFails.Load(),
-		"alias_fails":  v.statsAliasFails.Load(),
-		"field_fails":  v.statsFieldFails.Load(),
-		"auth_fails":   v.statsAuthFails.Load(),
-		"parse_fails":  v.statsParseFails.Load(),
+		"requests":             v.statsRequests.Load(),
+		"blocked":              v.statsBlocked.Load(),
+		"depth_fails":          v.statsDepthFails.Load(),
+		"alias_fails":          v.statsAliasFails.Load(),
+		"field_fails":          v.statsFieldFails.Load(),
+		"auth_fails":           v.statsAuthFails.Load(),
+		"parse_fails":          v.statsParseFails.Load(),
+		"subscriptions":        v.statsSubscriptions.Load(),
+		"subscription_blocks":  v.statsSubscriptBlocks.Load(),
 	}
 }

@@ -473,6 +473,7 @@ export interface GraphQLStatsResponse {
   max_fields?: number;
   block?: boolean;
   role_header?: string;
+  block_subscriptions?: boolean;
   stats?: {
     requests: number;
     blocked: number;
@@ -481,6 +482,8 @@ export interface GraphQLStatsResponse {
     field_fails: number;
     auth_fails: number;
     parse_fails: number;
+    subscriptions?: number;
+    subscription_blocks?: number;
   };
 }
 
@@ -517,6 +520,8 @@ export const api = {
     egress_addr?: string;
     egress_allowlist?: string[];
     egress_block_private_ips?: boolean;
+    egress_exfil_inspect?: boolean;
+    egress_exfil_block?: boolean;
     mesh_enabled?: boolean;
     mesh_peers?: string[];
     mesh_gossip_interval_sec?: number;
@@ -551,6 +556,12 @@ export const api = {
     graphql_max_aliases?: number;
     graphql_max_fields?: number;
     graphql_role_header?: string;
+    graphql_block_subscriptions?: boolean;
+    trust_xff?: boolean;
+    hsts_enabled?: boolean;
+    hsts_max_age_sec?: number;
+    hsts_include_subdomains?: boolean;
+    hsts_preload?: boolean;
   }) =>
     post<ConfigResponse & { status: string }>('/config', payload),
   getRuleCounters: () => get<{ counters: Record<string, number> }>('/rules/counters'),

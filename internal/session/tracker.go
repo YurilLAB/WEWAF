@@ -28,7 +28,9 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -137,6 +139,11 @@ type Tracker struct {
 	// restart. Read on the hot path, so they're atomic.
 	requestRateCeiling atomic.Int64 // reqs/min above this starts scoring
 	pathCountCeiling   atomic.Int64 // distinct paths above this starts scoring
+
+	// trustXFF mirrors the proxy-level TrustXFF flag. When false the
+	// tracker ignores X-Forwarded-For / X-Real-Ip so hostile clients
+	// can't spoof source IPs past the per-session IP-drift check.
+	trustXFF atomic.Bool
 }
 
 // Config holds tracker tuning. Zero/empty fields fall back to sane defaults.
@@ -147,6 +154,7 @@ type Config struct {
 	Enabled            bool          // if false, GetOrCreate still works but signals are skipped
 	RequestRateCeiling int           // per-minute threshold that starts scoring
 	PathCountCeiling   int           // distinct-path threshold that starts scoring
+	TrustXFF           bool          // if true, parse X-Forwarded-For / X-Real-Ip; otherwise RemoteAddr only
 }
 
 // NewTracker returns a Tracker with a cleanup goroutine started.
@@ -183,6 +191,7 @@ func NewTracker(cfg Config) *Tracker {
 		stopCh:      make(chan struct{}),
 	}
 	t.enabled.Store(cfg.Enabled)
+	t.trustXFF.Store(cfg.TrustXFF)
 	if cfg.RequestRateCeiling > 0 {
 		t.requestRateCeiling.Store(int64(cfg.RequestRateCeiling))
 	} else {
@@ -206,6 +215,11 @@ func (t *Tracker) Stop() {
 // GetOrCreate still returns a session (so cookies round-trip) but no
 // scoring work happens on the hot path.
 func (t *Tracker) SetEnabled(on bool) { t.enabled.Store(on) }
+
+// SetTrustXFF updates whether the tracker parses X-Forwarded-For /
+// X-Real-Ip when extracting client IPs for drift scoring. Mirrors the
+// proxy-level flag so both layers agree on source-IP truth.
+func (t *Tracker) SetTrustXFF(on bool) { t.trustXFF.Store(on) }
 
 // Enabled reports whether scoring is active. The proxy checks this to
 // decide whether to invoke the tracker at all.
@@ -298,7 +312,7 @@ func (t *Tracker) touchSession(id string, r *http.Request) *Session {
 				s.Paths[p]++
 			}
 		}
-		if ip := clientIPFromRequest(r); ip != "" {
+		if ip := t.clientIP(r); ip != "" {
 			if len(s.IPs) < 8 || s.IPs[ip] > 0 {
 				s.IPs[ip]++
 			}
@@ -332,6 +346,32 @@ func (t *Tracker) RecordChallengePass(id string) {
 		s.ChallengeAt = time.Now().UTC()
 	}
 	t.mu.Unlock()
+}
+
+// RotateSession moves an existing session under a freshly minted ID and
+// issues a replacement Set-Cookie on w. It's the textbook defence against
+// session fixation: if an attacker tricked a victim into loading a page
+// that pre-seeded __wewaf_sid, rotating after the browser proves itself
+// legitimate (challenge pass) means the attacker's captured ID is dead
+// weight. Returns the new ID, or oldID unchanged if rotation isn't
+// possible (unknown id / nil writer / tracker disabled).
+func (t *Tracker) RotateSession(w http.ResponseWriter, oldID string) string {
+	if t == nil || oldID == "" || w == nil {
+		return oldID
+	}
+	newID := randomID()
+	t.mu.Lock()
+	s, ok := t.sessions[oldID]
+	if !ok {
+		t.mu.Unlock()
+		return oldID
+	}
+	delete(t.sessions, oldID)
+	s.ID = newID
+	t.sessions[newID] = s
+	t.mu.Unlock()
+	t.setCookie(w, newID)
+	return newID
 }
 
 // RecordBeacon is called when the client-side beacon posts an update.
@@ -387,14 +427,11 @@ func (t *Tracker) List(limit int) []SessionView {
 		out = append(out, s.Snapshot())
 	}
 	t.mu.RUnlock()
-	// Most recent first.
-	for i := 0; i < len(out); i++ {
-		for j := i + 1; j < len(out); j++ {
-			if out[j].LastSeen.After(out[i].LastSeen) {
-				out[i], out[j] = out[j], out[i]
-			}
-		}
-	}
+	// O(n log n) instead of the previous nested-loop bubble sort — at
+	// 200k sessions the old path was pathological (~40B comparisons).
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].LastSeen.After(out[j].LastSeen)
+	})
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -539,22 +576,30 @@ func randomID() string {
 	return hex.EncodeToString(b)
 }
 
-func clientIPFromRequest(r *http.Request) string {
+// clientIP extracts the best-guess client IP for this request. When the
+// operator has set TrustXFF we consult X-Forwarded-For / X-Real-Ip first
+// (stripping port numbers and whitespace). Otherwise we fall back to the
+// TCP-layer RemoteAddr so a client can't spoof the source IP by adding a
+// header. Using net.SplitHostPort handles IPv6 correctly (the previous
+// LastIndexByte shortcut broke on `[::1]:12345`).
+func (t *Tracker) clientIP(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if idx := strings.Index(xff, ","); idx != -1 {
-			return strings.TrimSpace(xff[:idx])
+	if t != nil && t.trustXFF.Load() {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// Left-most value is the original client per RFC 7239.
+			if idx := strings.Index(xff, ","); idx != -1 {
+				return strings.TrimSpace(xff[:idx])
+			}
+			return strings.TrimSpace(xff)
 		}
-		return strings.TrimSpace(xff)
+		if xri := r.Header.Get("X-Real-Ip"); xri != "" {
+			return strings.TrimSpace(xri)
+		}
 	}
-	if xri := r.Header.Get("X-Real-Ip"); xri != "" {
-		return strings.TrimSpace(xri)
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
+		return host
 	}
-	host := r.RemoteAddr
-	if colon := strings.LastIndexByte(host, ':'); colon > 0 {
-		host = host[:colon]
-	}
-	return host
+	return r.RemoteAddr
 }

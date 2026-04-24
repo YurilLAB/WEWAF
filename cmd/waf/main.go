@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"wewaf/internal/audit"
 	"wewaf/internal/bruteforce"
 	"wewaf/internal/config"
 	"wewaf/internal/connection"
@@ -125,6 +126,7 @@ func main() {
 		Enabled:            cfg.SessionTrackingEnabled,
 		RequestRateCeiling: cfg.SessionRequestRateCeiling,
 		PathCountCeiling:   cfg.SessionPathCountCeiling,
+		TrustXFF:           cfg.TrustXFF,
 	})
 	defer sessionTracker.Stop()
 
@@ -140,13 +142,14 @@ func main() {
 		}
 	}
 	gqlValidator, gqlErr := graphql.New(graphql.Config{
-		Enabled:        cfg.GraphQLEnabled,
-		MaxDepth:       cfg.GraphQLMaxDepth,
-		MaxAliases:     cfg.GraphQLMaxAliases,
-		MaxFields:      cfg.GraphQLMaxFields,
-		SchemaSDL:      gqlSchemaSDL,
-		RequireRoleHdr: cfg.GraphQLRoleHeader,
-		BlockOnError:   cfg.GraphQLBlockOnError,
+		Enabled:            cfg.GraphQLEnabled,
+		MaxDepth:           cfg.GraphQLMaxDepth,
+		MaxAliases:         cfg.GraphQLMaxAliases,
+		MaxFields:          cfg.GraphQLMaxFields,
+		SchemaSDL:          gqlSchemaSDL,
+		RequireRoleHdr:     cfg.GraphQLRoleHeader,
+		BlockOnError:       cfg.GraphQLBlockOnError,
+		BlockSubscriptions: cfg.GraphQLBlockSubscriptions,
 	})
 	if gqlErr != nil {
 		log.Printf("graphql: schema parse failed, running structural-only: %v", gqlErr)
@@ -158,6 +161,26 @@ func main() {
 	}
 	wp.AttachSessionTracker(sessionTracker)
 	wp.AttachGraphQLValidator(gqlValidator)
+
+	// Tamper-evident audit log. Failure to open the chain is non-fatal —
+	// we degrade to in-memory-only and surface a log line so operators
+	// can see their disk setup is wrong without losing the WAF itself.
+	var auditChain *audit.Chain
+	if cfg.AuditEnabled {
+		ch, aerr := audit.New(audit.Config{
+			Secret:   cfg.AuditSecret,
+			FilePath: cfg.AuditFilePath,
+			RingSize: cfg.AuditRingSize,
+		})
+		if aerr != nil {
+			log.Printf("audit: could not open chain (%v); falling back to in-memory ring", aerr)
+			ch, _ = audit.New(audit.Config{Secret: cfg.AuditSecret, RingSize: cfg.AuditRingSize})
+		}
+		auditChain = ch
+		defer func() { _ = auditChain.Close() }()
+		wp.AttachAuditChain(auditChain)
+		_, _ = auditChain.Append("startup", "system", "WEWAF daemon starting", "")
+	}
 
 	// Background telemetry collectors.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
@@ -268,6 +291,7 @@ func main() {
 		Proxy:          wp,
 		SessionTracker: sessionTracker,
 		GraphQL:        gqlValidator,
+		Audit:          auditChain,
 		MeshEnabled:    cfg.MeshEnabled,
 		MeshPeers:      cfg.MeshPeers,
 		MeshAPIKey:     cfg.MeshAPIKey,

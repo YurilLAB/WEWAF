@@ -32,6 +32,13 @@ restarts and stays searchable by time range.
 | Operational       | Rotating SQLite history store (time-sliced, WAL)          | enabled  |
 | Operational       | Egress proxy with DNS cache, allowlist, SSRF guards       | opt-in   |
 | Operational       | Zero-trust per-path policies (CIDR, country, mTLS, time)  | opt-in   |
+| App integrity     | Signed-cookie session tracker + risk scoring              | opt-in   |
+| App integrity     | Browser integrity JS challenge (no CAPTCHA)               | opt-in   |
+| App integrity     | GraphQL schema-aware validator + depth/alias/field caps   | opt-in   |
+| Response headers  | HSTS (Strict-Transport-Security) on HTTPS backends        | opt-in   |
+| Egress            | Outbound response exfil detection (CC + token patterns)   | opt-in   |
+| App integrity     | Deep packet inspection: gRPC frames + WebSocket           | opt-in   |
+| Operational       | Tamper-evident audit log (HMAC-SHA256 chain)              | opt-in   |
 
 ## What makes WEWAF different
 
@@ -123,6 +130,74 @@ hostname is attacker-controlled and aliased. Each destination host gets
 its own token-bucket rate limit so a single noisy dependency can't flood
 a third party. CONNECT tunnels half-close on either direction's copy
 ending so an idle peer cannot leak the other goroutine.
+
+**Per-session anomaly scoring.** A dedicated tracker issues an
+HMAC-signed `__wewaf_sid` cookie on first contact and accumulates
+per-session signals over the life of the conversation: request rate
+against a ceiling, distinct-path count, user-agent and source-IP drift,
+block ratio, and whether the session has cleared the browser integrity
+challenge. Weights are explainable additive values — no opaque ML — so
+every score bump is debuggable in the admin UI during an incident.
+Scoring is observe-only by default; flipping `session_block_threshold`
+to a non-zero value turns it into a real enforcement knob without
+changing a single rule. The tracker honours the same `trust_xff` flag
+as the proxy so hostile clients can't spoof source IPs past the drift
+detector. Sessions live in-memory with an LRU cap and idle TTL; the
+HMAC secret auto-generates per-restart so a stolen ID stops working the
+moment you bounce the daemon.
+
+**Browser integrity challenge, no CAPTCHA.** A sub-2 KB JS probe served
+at `/api/browser-challenge.js` checks a handful of high-signal browser
+properties — `navigator.webdriver`, plugin count against the reported
+UA family, `window.chrome` on Chromium, languages array, hardware
+concurrency, screen geometry, touch support, fire-time delta — and
+reports them via `navigator.sendBeacon`. The server scores the signals
+and, on pass, issues a signed `__wewaf_bc` cookie **and rotates the
+session ID** (classic fixation defence — any pre-challenge ID an
+attacker may have planted becomes invalid). Canvas/audio/WebGL
+fingerprints were deliberately left out because they false-positive
+across GPU drivers and ad blockers; six boring checks plus beacon-based
+activity detection is enough to separate real browsers from headless
+automation without CAPTCHA UX friction.
+
+**GraphQL schema-aware validation.** Beyond the signature rules that
+catch obvious introspection probes, WEWAF can parse every incoming
+GraphQL query against a loaded SDL schema and reject operations whose
+AST exceeds the configured depth / alias / field caps — the DoS shape
+that depth-only limits miss when you stack 500 aliases at depth 3.
+When a schema is loaded, the validator also enforces field-level
+`@requires(role: "...")` directives: requests hitting an admin-only
+field without the matching role header are blocked before the resolver
+ever runs. Subscription operations can be rejected outright (WebSocket
+frames bypass most HTTP WAFs anyway), and malformed queries are
+forwarded unchanged so the WAF never becomes a stricter syntax checker
+than the origin. Observe-only by default.
+
+**Deep packet inspection for gRPC and WebSocket.** Classic HTTP-body
+WAFs see gRPC as opaque binary and WebSocket as a tunnel. WEWAF has
+native inspectors for both. The gRPC inspector parses length-prefixed
+Protobuf frames, bounds per-frame and per-body resource use, and
+extracts UTF-8 string runs so the existing XSS/SQLi/RCE signatures
+match against protobuf string fields without needing a `.proto`
+descriptor. The WebSocket inspector rejects handshakes whose Origin,
+subprotocol, or extensions header is off-policy before the upgrade
+completes, and includes an RFC 6455 frame parser (masking handled, 64-
+bit length cap enforced, reserved opcodes rejected, control-frame size
+limit) that callers can wrap around a hijacked connection for full
+frame-by-frame inspection. Both are observe-only by default — block
+flags are separate so operators can tune first, enforce later.
+
+**Tamper-evident audit log.** Every block, WebSocket rejection, and
+operator config change writes an HMAC-SHA256-chained entry to an
+append-only file. Each record's MAC covers the previous record's MAC,
+so an attacker who gains write access can't silently delete, reorder,
+or edit a historical entry: the `/api/audit/verify` endpoint walks the
+chain from seq 1 and surfaces the first bad index. A truncated trailing
+line (power-loss during write) is tolerated — the chain resumes cleanly
+from the last good entry on restart. Secrets in memory are the
+trust-root; operators supplying a fixed `audit_secret` get verifiable
+cross-restart audit trails, otherwise the key auto-rotates per restart
+(good for defence-in-depth during active incidents).
 
 **Zero-trust policies on paths, before the rule engine.** The rule engine
 answers "does this request look malicious?" — zero-trust answers "should
@@ -384,6 +459,82 @@ in `internal/config/config.go` for reference.
 | `ban_backoff_window_sec`           | `86400`  | Window inside which repeats count as the same offender.          |
 | `max_ban_duration_sec`             | `604800` | Upper cap so backoff doesn't grow without bound.                 |
 
+### Session tracking, browser challenge, GraphQL
+
+| Field                              | Default         | Purpose                                                              |
+|------------------------------------|-----------------|----------------------------------------------------------------------|
+| `session_tracking_enabled`         | `false`         | Issue `__wewaf_sid` cookie and accumulate per-session signals.       |
+| `session_max_sessions`             | `200000`        | LRU cap on live sessions (random-drop eviction at the cap).          |
+| `session_idle_ttl_sec`             | `1800`          | Evict sessions idle longer than this.                                |
+| `session_request_rate_ceiling`     | `600`           | Requests/minute above which scoring starts penalising.               |
+| `session_path_count_ceiling`       | `40`            | Distinct paths per session above which scoring starts penalising.    |
+| `session_block_threshold`          | `0` (off)       | Score at which requests for that session are blocked. `0` = observe. |
+| `session_cookie_secret`            | auto-generated  | HMAC key for cookie signing. Auto if blank (rotates on restart).     |
+| `browser_challenge_enabled`        | `false`         | Serve the JS integrity probe and accept verify POSTs.                |
+| `browser_challenge_block`          | `false`         | If on, a failed challenge blocks the request outright.               |
+| `graphql_enabled`                  | `false`         | Parse GraphQL requests and enforce structural limits.                |
+| `graphql_block_on_error`           | `false`         | If off, violations are counted but the request still proxies.        |
+| `graphql_max_depth`                | `7`             | Max AST depth. Typical SPAs sit at 4–5.                              |
+| `graphql_max_aliases`              | `10`            | Max aliased fields per operation (amplification defence).            |
+| `graphql_max_fields`               | `200`           | Max total fields per operation (resource exhaustion defence).        |
+| `graphql_schema_file`              | `""`            | Path to SDL file. Enables `@requires(role:"…")` enforcement.         |
+| `graphql_role_header`              | `X-User-Role`   | Header the validator reads for the requester's role claim.           |
+| `graphql_block_subscriptions`      | `false`         | Reject `subscription` operations outright (useful if unused).        |
+
+### Deep packet inspection
+
+| Field                            | Default | Purpose                                                                                                 |
+|----------------------------------|---------|---------------------------------------------------------------------------------------------------------|
+| `grpc_inspect`                   | `false` | Parse length-prefixed Protobuf frames on `application/grpc*` requests.                                 |
+| `grpc_block_on_error`            | `false` | Block when frame count / size caps are exceeded. Default is observe + extract scan targets.            |
+| `grpc_max_frames`                | `1024`  | Hard cap on frames per body.                                                                           |
+| `grpc_max_frame_bytes`           | `1 MiB` | Per-frame payload cap.                                                                                 |
+| `websocket_inspect`              | `false` | Run the upgrade-gate on WebSocket handshakes.                                                          |
+| `websocket_require_subprotocol`  | `false` | Reject upgrades that don't advertise any `Sec-WebSocket-Protocol`.                                     |
+| `websocket_origin_allowlist`     | `[]`    | Permitted `Origin` values. Supports `*.example.com` subdomain wildcards.                               |
+| `websocket_subprotocol_allowlist`| `[]`    | Permitted `Sec-WebSocket-Protocol` values. Match is case-insensitive.                                 |
+
+### Tamper-evident audit log
+
+| Field              | Default       | Purpose                                                                                          |
+|--------------------|---------------|--------------------------------------------------------------------------------------------------|
+| `audit_enabled`    | `false`       | Turn on the HMAC-chained append-only log.                                                        |
+| `audit_file_path`  | `audit.log`   | Where the chain persists on disk. Empty string means in-memory ring only.                        |
+| `audit_secret`     | auto-gen      | HMAC key. Leave empty and you get a fresh per-restart key — which invalidates the chain on reboot. Production deployments should mount a fixed secret. |
+| `audit_ring_size`  | `256`         | In-memory tail available at `/api/audit/tail?n=…`.                                              |
+
+Admin endpoints:
+
+- `GET /api/audit/verify` — walks the whole chain and returns
+  `{ok, bad_seq, total, appends, verify_fails}`. Run this periodically
+  (or on demand during an incident) to confirm the log hasn't been
+  altered.
+- `GET /api/audit/tail?n=100` — newest entries from the in-memory ring.
+- `GET /api/dpi/stats` — `grpc_requests`, `grpc_blocked`,
+  `ws_upgrades`, `ws_rejected` counters plus the live DPI config.
+
+### Egress response inspection
+
+| Field                      | Default  | Purpose                                                                                                                                |
+|----------------------------|----------|----------------------------------------------------------------------------------------------------------------------------------------|
+| `egress_exfil_inspect`     | `false`  | Scan the first 256 KiB of each outbound response for credit-card numbers (Luhn-verified) and cloud-provider secret prefixes.           |
+| `egress_exfil_block`       | `false`  | Block when a pattern matches. Default is observe-only: log + increment `exfil_detected` so operators can tune before enforcing.        |
+
+Allowlist hostnames are pre-resolved into the DNS cache at startup so
+the first real egress request doesn't block five seconds on LookupIP.
+Resolution happens on a background goroutine — startup never stalls on
+DNS even if the network is flaky.
+
+### Response headers
+
+| Field                       | Default     | Purpose                                                                                                                                           |
+|-----------------------------|-------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+| `security_headers_enabled`  | `true`      | Inject `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`; strip `Server` and `X-Powered-By`.                   |
+| `hsts_enabled`              | `false`     | Emit `Strict-Transport-Security`. Only injected when the backend is HTTPS — setting HSTS on plain HTTP is spec-non-compliant and browsers ignore it. |
+| `hsts_max_age_sec`          | `15552000`  | 180 days. Safe starting value before ratcheting up to two years and `preload`.                                                                    |
+| `hsts_include_subdomains`   | `true`      | Append `; includeSubDomains` to the HSTS header.                                                                                                  |
+| `hsts_preload`              | `false`     | Append `; preload`. Only tick once you are ready to submit to `hstspreload.org` — removal is manual and slow.                                     |
+
 Other sections (egress proxy, history rotation, rule engine mode,
 paranoia level, SSL manager, mesh gossip) keep the same JSON tags as
 before — see `internal/config/config.go` for the full list.
@@ -422,6 +573,18 @@ important ones to know about beyond the obvious `/api/health`,
   URL and block reason.
 - `/api/history/events?from=&to=&limit=` — time-ranged block query
   across every rotated SQLite file.
+- `/api/sessions?limit=N` / `/api/sessions/<id>` — live list of tracked
+  sessions with risk scores, or one session's full view.
+- `/api/browser-challenge.js` / `/api/browser-beacon.js` — served
+  public; the SPA or your own origin can load them to opt in to the
+  integrity probe and activity beacon.
+- `/api/browser-challenge/verify` (POST) — the JS probe posts
+  collected signals here; on pass you receive the `__wewaf_bc` cookie
+  and a rotated session ID.
+- `/api/session/beacon` (POST) — mouse/keyboard/time-on-page deltas.
+- `/api/graphql/stats` / `/api/graphql/recent` — per-operation
+  counters, subscription totals, and a ring buffer of recent
+  validated operations with depth/alias/field counts.
 
 All routes honour CORS and the optional API key.
 
@@ -471,6 +634,12 @@ live under `tests/integration/`.
 | `internal/bruteforce`           | Window expiry, reset, race safety.                        |
 | `internal/core`                 | BanList expiry, cleanup, exponential-backoff math.        |
 | `internal/engine`               | Canonicalise, path traversal, homoglyph fold, obfuscated Transfer-Encoding. |
+| `internal/session`              | Cookie HMAC round-trip, tamper rejection, challenge cookie, score-rises-with-blocks. |
+| `internal/graphql`              | Depth / alias / field limits, observe vs block, schema-aware `@requires(role)` enforcement, full-batch inspection, subscription guard. |
+| `internal/proxy` (exfil + hsts) | Luhn-verified card match, AWS / GitHub / Stripe / Slack / JWT patterns, secret masking before logging, HSTS emission on HTTPS only. |
+| `internal/ddos`                 | Botnet threshold trips at configured unique-IP count; fresh-count optimisation actually prunes stale entries. |
+| `internal/dpi`                  | gRPC frame parser (bomb / count / truncation), WebSocket upgrade allowlist, RFC 6455 frame reader (masking, 64-bit length cap, reserved-opcode rejection). |
+| `internal/audit`                | HMAC chain roundtrip + detect edit / delete / reorder / wrong-secret / truncated-tail cases. |
 | `tests/integration`             | End-to-end: allow + block + per-rule counters + Prometheus exposition. |
 
 ## Hot-reload
@@ -492,6 +661,10 @@ internal/rules/       — built-in signatures + regex compilation
 internal/proxy/       — reverse proxy + egress proxy with DNS cache and per-dest RL
 internal/ddos/        — volumetric + conn-rate + slow-read detector
 internal/zerotrust/   — per-path access policies (auth, mTLS, CIDR, country)
+internal/session/     — signed-cookie session tracker, risk scoring, JS challenge assets
+internal/graphql/     — schema-aware GraphQL validator (depth / alias / field / auth)
+internal/dpi/         — deep packet inspection for gRPC frames + WebSocket (RFC 6455)
+internal/audit/       — tamper-evident HMAC-chained append-only audit log
 internal/limits/      — semaphore + token bucket + circuit breaker + buffer pool
 internal/telemetry/   — in-memory counters, ring buffers, persister hook
 internal/history/     — rotating SQLite store + batched writer

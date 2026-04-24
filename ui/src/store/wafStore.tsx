@@ -165,6 +165,8 @@ export interface WAFSettings {
   egressAddr: string;
   egressAllowlist: string;
   egressBlockPrivateIPs: boolean;
+  egressExfilInspect: boolean;
+  egressExfilBlock: boolean;
   meshEnabled: boolean;
   meshPeers: string;
   meshGossipIntervalSec: number;
@@ -173,6 +175,11 @@ export interface WAFSettings {
   securityHeadersEnabled: boolean;
   cspEnabled: boolean;
   cspPolicy: string;
+  trustXFF: boolean;
+  hstsEnabled: boolean;
+  hstsMaxAgeSec: number;
+  hstsIncludeSubdomains: boolean;
+  hstsPreload: boolean;
 }
 
 export interface HostMachineStats {
@@ -372,6 +379,8 @@ const defaultSettings: WAFSettings = {
   egressAddr: ':8081',
   egressAllowlist: '',
   egressBlockPrivateIPs: true,
+  egressExfilInspect: false,
+  egressExfilBlock: false,
   meshEnabled: false,
   meshPeers: '',
   meshGossipIntervalSec: 60,
@@ -380,6 +389,11 @@ const defaultSettings: WAFSettings = {
   securityHeadersEnabled: true,
   cspEnabled: false,
   cspPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'",
+  trustXFF: false,
+  hstsEnabled: false,
+  hstsMaxAgeSec: 15552000,
+  hstsIncludeSubdomains: true,
+  hstsPreload: false,
 };
 
 const defaultDDoS: DDoSConfig = {

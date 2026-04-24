@@ -89,12 +89,19 @@ export default function SettingsPage() {
       if (typeof cfg.egress_addr === 'string') updates.egressAddr = cfg.egress_addr;
       if (Array.isArray(cfg.egress_allowlist)) updates.egressAllowlist = cfg.egress_allowlist.join(', ');
       if (typeof cfg.egress_block_private_ips === 'boolean') updates.egressBlockPrivateIPs = cfg.egress_block_private_ips;
+      if (typeof cfg.egress_exfil_inspect === 'boolean') updates.egressExfilInspect = cfg.egress_exfil_inspect;
+      if (typeof cfg.egress_exfil_block === 'boolean') updates.egressExfilBlock = cfg.egress_exfil_block;
       if (typeof cfg.mesh_enabled === 'boolean') updates.meshEnabled = cfg.mesh_enabled;
       if (Array.isArray(cfg.mesh_peers)) updates.meshPeers = cfg.mesh_peers.join(', ');
       if (typeof cfg.mesh_gossip_interval_sec === 'number') updates.meshGossipIntervalSec = cfg.mesh_gossip_interval_sec;
       if (typeof cfg.mesh_sync_timeout_sec === 'number') updates.meshSyncTimeoutSec = cfg.mesh_sync_timeout_sec;
       if (typeof cfg.mesh_api_key === 'string') updates.meshAPIKey = cfg.mesh_api_key;
       if (typeof cfg.security_headers_enabled === 'boolean') updates.securityHeadersEnabled = cfg.security_headers_enabled;
+      if (typeof cfg.trust_xff === 'boolean') updates.trustXFF = cfg.trust_xff;
+      if (typeof cfg.hsts_enabled === 'boolean') updates.hstsEnabled = cfg.hsts_enabled;
+      if (typeof cfg.hsts_max_age_sec === 'number') updates.hstsMaxAgeSec = cfg.hsts_max_age_sec;
+      if (typeof cfg.hsts_include_subdomains === 'boolean') updates.hstsIncludeSubdomains = cfg.hsts_include_subdomains;
+      if (typeof cfg.hsts_preload === 'boolean') updates.hstsPreload = cfg.hsts_preload;
       if (Object.keys(updates).length > 0) {
         setForm((prev) => ({ ...prev, ...updates }));
         dispatch({ type: 'UPDATE_SETTINGS', payload: updates });
@@ -145,12 +152,19 @@ export default function SettingsPage() {
         egress_addr: form.egressAddr,
         egress_allowlist: form.egressAllowlist.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
         egress_block_private_ips: form.egressBlockPrivateIPs,
+        egress_exfil_inspect: form.egressExfilInspect,
+        egress_exfil_block: form.egressExfilBlock,
         mesh_enabled: form.meshEnabled,
         mesh_peers: form.meshPeers.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
         mesh_gossip_interval_sec: form.meshGossipIntervalSec,
         mesh_sync_timeout_sec: form.meshSyncTimeoutSec,
         mesh_api_key: form.meshAPIKey,
         security_headers_enabled: form.securityHeadersEnabled,
+        trust_xff: form.trustXFF,
+        hsts_enabled: form.hstsEnabled,
+        hsts_max_age_sec: form.hstsMaxAgeSec,
+        hsts_include_subdomains: form.hstsIncludeSubdomains,
+        hsts_preload: form.hstsPreload,
       });
       if (res) {
         dispatch({ type: 'UPDATE_SETTINGS', payload: { ...form } });
@@ -706,6 +720,14 @@ export default function SettingsPage() {
                 <input type="checkbox" checked={form.egressBlockPrivateIPs} onChange={(e) => setForm({ ...form, egressBlockPrivateIPs: e.target.checked })} className="rounded border-waf-border" />
                 Block requests to private IPs / localhost (SSRF protection)
               </label>
+              <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+                <input type="checkbox" checked={form.egressExfilInspect} onChange={(e) => setForm({ ...form, egressExfilInspect: e.target.checked })} className="rounded border-waf-border" />
+                Inspect outbound response bodies for credit-card numbers and cloud-provider secrets (first 256 KiB)
+              </label>
+              <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer pl-6">
+                <input type="checkbox" disabled={!form.egressExfilInspect} checked={form.egressExfilBlock} onChange={(e) => setForm({ ...form, egressExfilBlock: e.target.checked })} className="rounded border-waf-border" />
+                Block the response (default: observe-only — count + log)
+              </label>
               <div className="grid grid-cols-2 gap-4 pt-2">
                 <div className="bg-waf-elevated border border-waf-border rounded-lg p-3">
                   <div className="text-[10px] text-waf-dim uppercase tracking-wider">Blocked</div>
@@ -789,6 +811,35 @@ export default function SettingsPage() {
               <textarea value={form.cspPolicy} onChange={(e) => setForm({ ...form, cspPolicy: e.target.value })} rows={3} className="w-full bg-waf-elevated border border-waf-border rounded-lg px-3 py-2 text-sm text-waf-text focus:outline-none focus:border-waf-orange" placeholder="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" />
             </motion.div>
           )}
+
+          <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+            <input type="checkbox" checked={form.hstsEnabled} onChange={(e) => setForm({ ...form, hstsEnabled: e.target.checked })} className="rounded border-waf-border" />
+            Enable HSTS (Strict-Transport-Security) — only emitted when backend is HTTPS
+          </label>
+          {form.hstsEnabled && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="grid grid-cols-1 md:grid-cols-3 gap-3 pl-6">
+              <div>
+                <label className="text-xs text-waf-muted mb-1 block">Max-age (seconds)</label>
+                <input type="number" min={0} max={315360000} value={form.hstsMaxAgeSec}
+                  onChange={(e) => setForm({ ...form, hstsMaxAgeSec: Math.max(0, Number(e.target.value) || 0) })}
+                  className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                <p className="text-[10px] text-waf-dim mt-1">15552000 = 180 days (safe starting value).</p>
+              </div>
+              <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer mt-4">
+                <input type="checkbox" checked={form.hstsIncludeSubdomains} onChange={(e) => setForm({ ...form, hstsIncludeSubdomains: e.target.checked })} className="rounded border-waf-border" />
+                includeSubDomains
+              </label>
+              <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer mt-4">
+                <input type="checkbox" checked={form.hstsPreload} onChange={(e) => setForm({ ...form, hstsPreload: e.target.checked })} className="rounded border-waf-border" />
+                preload (only tick once ready to submit to hstspreload.org)
+              </label>
+            </motion.div>
+          )}
+
+          <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+            <input type="checkbox" checked={form.trustXFF} onChange={(e) => setForm({ ...form, trustXFF: e.target.checked })} className="rounded border-waf-border" />
+            Trust X-Forwarded-For / X-Real-Ip (only enable when the WAF sits behind a trusted reverse proxy)
+          </label>
         </div>
       </motion.div>
 

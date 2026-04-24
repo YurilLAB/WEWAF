@@ -55,6 +55,12 @@ type Config struct {
 	EgressAllowlist       []string `json:"egress_allowlist"`
 	EgressBlockPrivateIPs bool     `json:"egress_block_private_ips"`
 	EgressMaxBodyBytes    int64    `json:"egress_max_body_bytes"`
+	// Outbound response inspection: scan the first 256 KiB of each
+	// forwarded response for credit-card numbers (Luhn-verified) and
+	// common cloud-provider secret formats. Block rather than forward
+	// when EgressExfilBlock is true; default is observe-only.
+	EgressExfilInspect bool `json:"egress_exfil_inspect"`
+	EgressExfilBlock   bool `json:"egress_exfil_block"`
 
 	// Distributed threat mesh
 	MeshEnabled           bool     `json:"mesh_enabled"`
@@ -65,6 +71,13 @@ type Config struct {
 
 	// Response hardening
 	SecurityHeadersEnabled bool `json:"security_headers_enabled"`
+	// HSTS (Strict-Transport-Security). Only emitted when the backend is
+	// reached over HTTPS; browsers ignore HSTS on plain HTTP anyway and
+	// setting it on an http:// response is spec-non-compliant.
+	HSTSEnabled         bool `json:"hsts_enabled"`
+	HSTSMaxAgeSec       int  `json:"hsts_max_age_sec"`
+	HSTSIncludeSubdoms  bool `json:"hsts_include_subdomains"`
+	HSTSPreload         bool `json:"hsts_preload"`
 
 	// Failsafe behaviour when the engine panics or the backend is unhealthy.
 	// "closed" (default) returns 503 to fail secure; "open" forwards the
@@ -146,14 +159,34 @@ type Config struct {
 	BrowserChallengeBlock     bool   `json:"browser_challenge_block"` // if true, failed challenge blocks; else score-only
 	SessionBlockThreshold     int    `json:"session_block_threshold"` // risk score at/above which to block; 0 = never
 
+	// Deep packet inspection — gRPC + WebSocket. When enabled, the
+	// proxy pre-parses protocol framing before handing payloads to the
+	// rule engine. Block-on-violation is separate so operators can
+	// observe-first, enforce-second.
+	GRPCInspect            bool `json:"grpc_inspect"`
+	GRPCBlockOnError       bool `json:"grpc_block_on_error"`
+	GRPCMaxFrames          int  `json:"grpc_max_frames"`
+	GRPCMaxFrameBytes      int  `json:"grpc_max_frame_bytes"`
+	WebSocketInspect       bool     `json:"websocket_inspect"`
+	WebSocketRequireSubproto bool   `json:"websocket_require_subprotocol"`
+	WebSocketOriginAllowlist []string `json:"websocket_origin_allowlist"`
+	WebSocketSubprotoAllowlist []string `json:"websocket_subprotocol_allowlist"`
+
+	// Tamper-evident audit log — HMAC-chained, append-only.
+	AuditEnabled  bool   `json:"audit_enabled"`
+	AuditFilePath string `json:"audit_file_path"`
+	AuditSecret   string `json:"audit_secret"`
+	AuditRingSize int    `json:"audit_ring_size"`
+
 	// GraphQL schema-aware validation.
-	GraphQLEnabled       bool   `json:"graphql_enabled"`
-	GraphQLBlockOnError  bool   `json:"graphql_block_on_error"`
-	GraphQLMaxDepth      int    `json:"graphql_max_depth"`
-	GraphQLMaxAliases    int    `json:"graphql_max_aliases"`
-	GraphQLMaxFields     int    `json:"graphql_max_fields"`
-	GraphQLSchemaFile    string `json:"graphql_schema_file"`
-	GraphQLRoleHeader    string `json:"graphql_role_header"`
+	GraphQLEnabled            bool   `json:"graphql_enabled"`
+	GraphQLBlockOnError       bool   `json:"graphql_block_on_error"`
+	GraphQLMaxDepth           int    `json:"graphql_max_depth"`
+	GraphQLMaxAliases         int    `json:"graphql_max_aliases"`
+	GraphQLMaxFields          int    `json:"graphql_max_fields"`
+	GraphQLSchemaFile         string `json:"graphql_schema_file"`
+	GraphQLRoleHeader         string `json:"graphql_role_header"`
+	GraphQLBlockSubscriptions bool   `json:"graphql_block_subscriptions"`
 
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 	// mu protects runtime mutation of any non-atomic field (admin API POST
@@ -204,11 +237,19 @@ func Default() *Config {
 		EgressAllowlist:          []string{},
 		EgressBlockPrivateIPs:    true,
 		EgressMaxBodyBytes:       10 * 1024 * 1024,
+		EgressExfilInspect:       false,
+		EgressExfilBlock:         false,
 		MeshEnabled:              false,
 		MeshPeers:                []string{},
 		MeshGossipIntervalSec:    60,
 		MeshSyncTimeoutSec:       10,
 		SecurityHeadersEnabled:   true,
+		// HSTS defaults: opt-in. 180 days is the safe starting value most
+		// guides recommend before ratcheting up to 2 years and preload.
+		HSTSEnabled:        false,
+		HSTSMaxAgeSec:      15552000,
+		HSTSIncludeSubdoms: true,
+		HSTSPreload:        false,
 
 		FailsafeMode:               "closed",
 		BreakerConsecutiveFailures: 10,
@@ -263,12 +304,26 @@ func Default() *Config {
 		BrowserChallengeBlock:     false,
 		SessionBlockThreshold:     0, // disabled by default — observe first
 
-		GraphQLEnabled:      false,
-		GraphQLBlockOnError: false,
-		GraphQLMaxDepth:     7,
-		GraphQLMaxAliases:   10,
-		GraphQLMaxFields:    200,
-		GraphQLRoleHeader:   "X-User-Role",
+		GRPCInspect:            false,
+		GRPCBlockOnError:       false,
+		GRPCMaxFrames:          1024,
+		GRPCMaxFrameBytes:      1 << 20,
+		WebSocketInspect:       false,
+		WebSocketRequireSubproto: false,
+		WebSocketOriginAllowlist: []string{},
+		WebSocketSubprotoAllowlist: []string{},
+
+		AuditEnabled:  false,
+		AuditFilePath: "audit.log",
+		AuditRingSize: 256,
+
+		GraphQLEnabled:            false,
+		GraphQLBlockOnError:       false,
+		GraphQLMaxDepth:           7,
+		GraphQLMaxAliases:         10,
+		GraphQLMaxFields:          200,
+		GraphQLRoleHeader:         "X-User-Role",
+		GraphQLBlockSubscriptions: false,
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -496,12 +551,18 @@ func (c *Config) Snapshot() *Config {
 		EgressAllowlist:          make([]string, len(c.EgressAllowlist)),
 		EgressBlockPrivateIPs:    c.EgressBlockPrivateIPs,
 		EgressMaxBodyBytes:       c.EgressMaxBodyBytes,
+		EgressExfilInspect:       c.EgressExfilInspect,
+		EgressExfilBlock:         c.EgressExfilBlock,
 		MeshEnabled:              c.MeshEnabled,
 		MeshPeers:                make([]string, len(c.MeshPeers)),
 		MeshGossipIntervalSec:    c.MeshGossipIntervalSec,
 		MeshAPIKey:               c.MeshAPIKey,
 		MeshSyncTimeoutSec:       c.MeshSyncTimeoutSec,
 		SecurityHeadersEnabled:   c.SecurityHeadersEnabled,
+		HSTSEnabled:              c.HSTSEnabled,
+		HSTSMaxAgeSec:            c.HSTSMaxAgeSec,
+		HSTSIncludeSubdoms:       c.HSTSIncludeSubdoms,
+		HSTSPreload:              c.HSTSPreload,
 
 		FailsafeMode:                c.FailsafeMode,
 		BreakerConsecutiveFailures:  c.BreakerConsecutiveFailures,
@@ -552,13 +613,28 @@ func (c *Config) Snapshot() *Config {
 		BrowserChallengeBlock:     c.BrowserChallengeBlock,
 		SessionBlockThreshold:     c.SessionBlockThreshold,
 
-		GraphQLEnabled:      c.GraphQLEnabled,
-		GraphQLBlockOnError: c.GraphQLBlockOnError,
-		GraphQLMaxDepth:     c.GraphQLMaxDepth,
-		GraphQLMaxAliases:   c.GraphQLMaxAliases,
-		GraphQLMaxFields:    c.GraphQLMaxFields,
-		GraphQLSchemaFile:   c.GraphQLSchemaFile,
-		GraphQLRoleHeader:   c.GraphQLRoleHeader,
+		GRPCInspect:              c.GRPCInspect,
+		GRPCBlockOnError:         c.GRPCBlockOnError,
+		GRPCMaxFrames:            c.GRPCMaxFrames,
+		GRPCMaxFrameBytes:        c.GRPCMaxFrameBytes,
+		WebSocketInspect:         c.WebSocketInspect,
+		WebSocketRequireSubproto: c.WebSocketRequireSubproto,
+		WebSocketOriginAllowlist: append([]string(nil), c.WebSocketOriginAllowlist...),
+		WebSocketSubprotoAllowlist: append([]string(nil), c.WebSocketSubprotoAllowlist...),
+
+		AuditEnabled:  c.AuditEnabled,
+		AuditFilePath: c.AuditFilePath,
+		AuditSecret:   c.AuditSecret,
+		AuditRingSize: c.AuditRingSize,
+
+		GraphQLEnabled:            c.GraphQLEnabled,
+		GraphQLBlockOnError:       c.GraphQLBlockOnError,
+		GraphQLMaxDepth:           c.GraphQLMaxDepth,
+		GraphQLMaxAliases:         c.GraphQLMaxAliases,
+		GraphQLMaxFields:          c.GraphQLMaxFields,
+		GraphQLSchemaFile:         c.GraphQLSchemaFile,
+		GraphQLRoleHeader:         c.GraphQLRoleHeader,
+		GraphQLBlockSubscriptions: c.GraphQLBlockSubscriptions,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	copy(cp.EgressAllowlist, c.EgressAllowlist)

@@ -18,10 +18,12 @@ import (
 	"syscall"
 	"time"
 
+	"wewaf/internal/audit"
 	"wewaf/internal/bruteforce"
 	"wewaf/internal/config"
 	"wewaf/internal/core"
 	"wewaf/internal/ddos"
+	"wewaf/internal/dpi"
 	"wewaf/internal/engine"
 	"wewaf/internal/graphql"
 	"wewaf/internal/limits"
@@ -47,6 +49,13 @@ type WAFProxy struct {
 	shaper    *shaper.Shaper
 	sessions  *session.Tracker
 	gql       *graphql.Validator
+	audit     *audit.Chain
+
+	// DPI counters exposed via admin API.
+	grpcRequests atomic.Uint64
+	grpcBlocked  atomic.Uint64
+	wsUpgrades   atomic.Uint64
+	wsRejected   atomic.Uint64
 	// shaperAttack tracks the shaper's "tightened" state so Tighten/Relax
 	// are only invoked at the state-transition edge. Calling them on every
 	// request was an unnecessary mutex acquisition per hit.
@@ -69,6 +78,67 @@ func (wp *WAFProxy) AttachGraphQLValidator(v *graphql.Validator) {
 		return
 	}
 	wp.gql = v
+}
+
+// AttachAuditChain gives the proxy a handle to the tamper-evident audit
+// log so blocks can be recorded with a MAC-chained paper trail. Nil =
+// disabled; audit failures are logged and never block the request.
+func (wp *WAFProxy) AttachAuditChain(c *audit.Chain) {
+	if wp == nil {
+		return
+	}
+	wp.audit = c
+}
+
+// applyHeadersForTest mirrors the response-header injection path for
+// unit tests. Keeping it here (package-private) rather than exported
+// on a public API means we're testing the exact branches the real hot
+// path takes, not a parallel implementation.
+func (wp *WAFProxy) applyHeadersForTest(res *http.Response) {
+	if wp.cfg.SecurityHeadersEnabled {
+		res.Header.Set("X-Content-Type-Options", "nosniff")
+		res.Header.Set("X-Frame-Options", "DENY")
+		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		res.Header.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+	}
+	if wp.cfg.HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
+		maxAge := wp.cfg.HSTSMaxAgeSec
+		if maxAge <= 0 {
+			maxAge = 15552000
+		}
+		v := fmt.Sprintf("max-age=%d", maxAge)
+		if wp.cfg.HSTSIncludeSubdoms {
+			v += "; includeSubDomains"
+		}
+		if wp.cfg.HSTSPreload {
+			v += "; preload"
+		}
+		res.Header.Set("Strict-Transport-Security", v)
+	}
+}
+
+// auditWrite is a fire-and-forget helper that writes a tamper-evident
+// audit entry. Audit failures are logged but never block the caller.
+func (wp *WAFProxy) auditWrite(kind, actor, message, meta string) {
+	if wp == nil || wp.audit == nil {
+		return
+	}
+	if _, err := wp.audit.Append(kind, actor, message, meta); err != nil {
+		wp.eng.LogError("audit: append failed (%s): %v", kind, err)
+	}
+}
+
+// DPIStats surfaces deep-packet-inspection counters for the admin API.
+func (wp *WAFProxy) DPIStats() map[string]uint64 {
+	if wp == nil {
+		return map[string]uint64{}
+	}
+	return map[string]uint64{
+		"grpc_requests": wp.grpcRequests.Load(),
+		"grpc_blocked":  wp.grpcBlocked.Load(),
+		"ws_upgrades":   wp.wsUpgrades.Load(),
+		"ws_rejected":   wp.wsRejected.Load(),
+	}
 }
 
 // ShaperStats returns the admission controller's counters.
@@ -287,6 +357,26 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if totalHeaderSize > 64*1024 {
 		http.Error(w, "Request Header Fields Too Large", http.StatusRequestHeaderFieldsTooLarge)
 		return
+	}
+
+	// WebSocket upgrade gate — runs before session / shaper because
+	// rejecting a bad handshake is cheaper than admitting it. When the
+	// feature is off we skip the detection entirely so a plain HTTP
+	// request costs nothing here.
+	if wp.cfg.WebSocketInspect && dpi.WSUpgradeRequest(r) {
+		wp.wsUpgrades.Add(1)
+		verdict := dpi.CheckWSUpgrade(r, dpi.WSUpgradeConfig{
+			OriginAllowlist:      wp.cfg.WebSocketOriginAllowlist,
+			SubprotocolAllowlist: wp.cfg.WebSocketSubprotoAllowlist,
+			RequireSubprotocol:   wp.cfg.WebSocketRequireSubproto,
+		})
+		if !verdict.Allow {
+			wp.wsRejected.Add(1)
+			wp.metrics.RecordBlock(getClientIP(r, wp.cfg.TrustXFF), r.Method, r.URL.Path, "WS-UPGRADE", verdict.Reason, 0)
+			wp.auditWrite("ws_reject", getClientIP(r, wp.cfg.TrustXFF), verdict.Reason, "")
+			http.Error(w, "Forbidden: "+verdict.Reason, http.StatusForbidden)
+			return
+		}
 	}
 
 	// Session tracking — issues a cookie on first contact, accumulates
@@ -512,6 +602,48 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// gRPC deep inspection — parses length-prefixed frames before the
+	// rule engine sees the body so oversized / bomb payloads get a
+	// clean block reason, and string-like fields are surfaced for rule
+	// matching. Runs only when both the feature is on and the content
+	// type identifies the request as gRPC.
+	if wp.cfg.GRPCInspect && dpi.IsGRPCRequest(r) {
+		wp.grpcRequests.Add(1)
+		res := dpi.InspectGRPCBody(body, dpi.GRPCLimits{
+			MaxFrames:     wp.cfg.GRPCMaxFrames,
+			MaxFrameBytes: wp.cfg.GRPCMaxFrameBytes,
+		})
+		if res.Blocked && wp.cfg.GRPCBlockOnError {
+			wp.grpcBlocked.Add(1)
+			intr := &core.Interruption{
+				Action:  core.ActionBlock,
+				Status:  http.StatusBadRequest,
+				Message: "gRPC: " + res.Reason,
+			}
+			tx.SetBlocked(core.PhaseRequestBody)
+			tx.AddMatch(core.Match{
+				RuleID:    "GRPC-DPI",
+				RuleName:  "gRPC frame limit",
+				Phase:     core.PhaseRequestBody,
+				Target:    "body",
+				Value:     res.Reason,
+				Score:     100,
+				Action:    core.ActionBlock,
+				Message:   res.Reason,
+				Timestamp: time.Now().UTC(),
+			})
+			wp.auditWrite("grpc_block", clientIP, res.Reason, "")
+			wp.handleBlock(w, tx, intr)
+			return
+		}
+		// Even in observe mode, feed extracted strings into the rule
+		// engine via the transaction metadata so existing XSS / SQLi
+		// signatures get a chance to fire on protobuf string fields.
+		if len(res.ScanTargets) > 0 {
+			tx.SetMetadata("grpc_targets", res.ScanTargets)
+		}
+	}
+
 	// GraphQL schema-aware validation runs *before* the general body
 	// rule engine so that malformed / over-complex queries get a clean
 	// reason code and metrics row rather than a generic XSS/SQLi false
@@ -692,6 +824,23 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		res.Header.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
 	}
+	// HSTS — only emit on HTTPS backends. Setting Strict-Transport-Security
+	// on http:// is spec-non-compliant and most browsers ignore it anyway,
+	// so we silently skip rather than mis-advertise transport guarantees.
+	if wp.cfg.HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
+		maxAge := wp.cfg.HSTSMaxAgeSec
+		if maxAge <= 0 {
+			maxAge = 15552000
+		}
+		v := fmt.Sprintf("max-age=%d", maxAge)
+		if wp.cfg.HSTSIncludeSubdoms {
+			v += "; includeSubDomains"
+		}
+		if wp.cfg.HSTSPreload {
+			v += "; preload"
+		}
+		res.Header.Set("Strict-Transport-Security", v)
+	}
 	res.Header.Del("Server")
 	res.Header.Del("X-Powered-By")
 
@@ -738,6 +887,11 @@ func (wp *WAFProxy) handleBlock(w http.ResponseWriter, tx *core.Transaction, int
 	}
 	ruleID, _ := primaryMatch(intr)
 	wp.metrics.RecordBlock(tx.ClientIP, tx.Request.Method, tx.Request.URL.Path, ruleID, intr.Message, tx.ScoreSnapshot())
+	// Record the block to the tamper-evident audit log. Meta carries the
+	// rule id + path so post-incident review has enough context without
+	// having to cross-reference the history store.
+	wp.auditWrite("block", tx.ClientIP, intr.Message,
+		fmt.Sprintf(`{"rule_id":%q,"path":%q,"method":%q}`, ruleID, tx.Request.URL.Path, tx.Request.Method))
 	wp.writeBlock(w, intr, tx.ID)
 	wp.eng.ProcessLogging(tx)
 }
@@ -949,11 +1103,17 @@ type EgressProxy struct {
 	client   *http.Client
 	dnsCache *egressDNSCache
 	rl       *egressRateLimiter
+
+	// Exfiltration counters — surfaced to /api/metrics-style readers. We
+	// use atomics rather than a mutex because every egress response bumps
+	// them and the mutex would serialise unrelated flows.
+	exfilDetected atomic.Uint64
+	exfilBlocked  atomic.Uint64
 }
 
 // NewEgressProxy creates an egress inspection proxy.
 func NewEgressProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metrics, banList *core.BanList) *EgressProxy {
-	return &EgressProxy{
+	ep := &EgressProxy{
 		cfg:     cfg,
 		eng:     eng,
 		metrics: metrics,
@@ -977,6 +1137,11 @@ func NewEgressProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.M
 		dnsCache: newEgressDNSCache(60*time.Second, 4096),
 		rl:       newEgressRateLimiter(50, 100),
 	}
+	// Pre-resolve allowlisted hosts into the DNS cache so the first
+	// real outbound request doesn't spend 5s waiting on LookupIP.
+	// Background goroutine — never blocks startup.
+	ep.dnsCache.Warm(cfg.EgressAllowlist)
+	return ep
 }
 
 func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -1129,12 +1294,6 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
 	// Cap the forwarded response size at the configured egress body limit so
 	// a huge / slow upstream can't stream megabytes through a rule that was
 	// only supposed to relay API results. Without this the request-side
@@ -1143,7 +1302,65 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if respLimit <= 0 {
 		respLimit = 10 * 1024 * 1024
 	}
+
+	// Optional exfiltration inspection: read up to exfilMaxInspectBytes of
+	// the response into memory, scan for credit-card / secret patterns,
+	// decide block vs forward, then continue streaming the rest. Kept
+	// opt-in because it costs one extra buffer allocation per response
+	// and not every operator wants egress mirroring semantics.
+	var inspected []byte
+	if ep.cfg.EgressExfilInspect {
+		n := int64(exfilMaxInspectBytes)
+		if n > respLimit {
+			n = respLimit
+		}
+		buf := make([]byte, n)
+		read, _ := io.ReadFull(resp.Body, buf)
+		inspected = buf[:read]
+		if findings := inspectEgressResponseBody(inspected); len(findings) > 0 {
+			ep.exfilDetected.Add(1)
+			kinds := make([]string, 0, len(findings))
+			for _, f := range findings {
+				kinds = append(kinds, f.Kind+"="+f.Sample)
+			}
+			ep.eng.LogError("egress: exfil patterns matched on %s: %s", targetURL, strings.Join(kinds, ", "))
+			if ep.cfg.EgressExfilBlock {
+				ep.exfilBlocked.Add(1)
+				ep.recordEgressBlock(targetURL, "exfil patterns in response")
+				http.Error(w, "Forbidden: exfil patterns in response", http.StatusForbidden)
+				return
+			}
+		}
+	}
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	if len(inspected) > 0 {
+		if _, err := w.Write(inspected); err != nil {
+			return
+		}
+		// Account for what we already consumed so the remaining copy
+		// doesn't exceed respLimit.
+		remaining := respLimit - int64(len(inspected))
+		if remaining > 0 {
+			_, _ = io.Copy(w, io.LimitReader(resp.Body, remaining))
+		}
+		return
+	}
 	_, _ = io.Copy(w, io.LimitReader(resp.Body, respLimit))
+}
+
+// ExfilStats returns the cumulative detection and block counters for
+// admin telemetry. Zero-valued when exfiltration inspection is disabled.
+func (ep *EgressProxy) ExfilStats() (detected, blocked uint64) {
+	if ep == nil {
+		return 0, 0
+	}
+	return ep.exfilDetected.Load(), ep.exfilBlocked.Load()
 }
 
 func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {

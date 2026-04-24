@@ -11,6 +11,7 @@ type Form = {
   graphql_max_aliases: number;
   graphql_max_fields: number;
   graphql_role_header: string;
+  graphql_block_subscriptions: boolean;
 };
 
 export default function GraphQLPage() {
@@ -23,6 +24,7 @@ export default function GraphQLPage() {
     graphql_max_aliases: 10,
     graphql_max_fields: 200,
     graphql_role_header: 'X-User-Role',
+    graphql_block_subscriptions: false,
   });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -43,6 +45,7 @@ export default function GraphQLPage() {
           graphql_max_aliases: resp.max_aliases ?? prev.graphql_max_aliases,
           graphql_max_fields: resp.max_fields ?? prev.graphql_max_fields,
           graphql_role_header: resp.role_header || prev.graphql_role_header,
+          graphql_block_subscriptions: !!resp.block_subscriptions,
         }));
       }).catch(() => {
         if (!cancelled) setError('Failed to fetch GraphQL stats.');
@@ -77,6 +80,7 @@ export default function GraphQLPage() {
         graphql_max_aliases: form.graphql_max_aliases,
         graphql_max_fields: form.graphql_max_fields,
         graphql_role_header: form.graphql_role_header,
+        graphql_block_subscriptions: form.graphql_block_subscriptions,
       });
       if (!res) setError('Save failed.');
       else {
@@ -130,6 +134,21 @@ export default function GraphQLPage() {
               </p>
             </div>
           </label>
+          <label className="flex items-start gap-2 cursor-pointer p-3 rounded-lg bg-waf-elevated border border-waf-border md:col-span-2">
+            <input type="checkbox" checked={form.graphql_block_subscriptions}
+              disabled={!form.graphql_enabled}
+              onChange={(e) => setForm((f) => ({ ...f, graphql_block_subscriptions: e.target.checked }))}
+              className="mt-0.5 accent-waf-orange" />
+            <div>
+              <div className="text-sm text-waf-text font-medium">Reject subscription operations</div>
+              <p className="text-[11px] text-waf-dim mt-0.5">
+                GraphQL subscriptions usually arrive over WebSocket frames a classic HTTP WAF
+                can't inspect. Turn this on when the backend doesn't use subscriptions — it
+                closes off a whole class of amplification attacks. Counted and surfaced even
+                when blocking is off.
+              </p>
+            </div>
+          </label>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-4">
@@ -172,7 +191,7 @@ export default function GraphQLPage() {
         </div>
       </motion.div>
 
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-9 gap-3">
         {[
           { label: 'Requests', v: s?.requests ?? 0 },
           { label: 'Blocked', v: s?.blocked ?? 0, color: 'text-red-500' },
@@ -181,6 +200,8 @@ export default function GraphQLPage() {
           { label: 'Field fails', v: s?.field_fails ?? 0 },
           { label: 'Auth fails', v: s?.auth_fails ?? 0 },
           { label: 'Parse fails', v: s?.parse_fails ?? 0 },
+          { label: 'Subscriptions', v: s?.subscriptions ?? 0 },
+          { label: 'Sub blocks', v: s?.subscription_blocks ?? 0, color: 'text-red-500' },
         ].map((c) => (
           <div key={c.label} className="bg-waf-panel border border-waf-border rounded-xl p-3">
             <p className="text-waf-muted text-xs mb-1">{c.label}</p>

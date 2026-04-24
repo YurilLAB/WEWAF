@@ -3,11 +3,19 @@ package proxy
 import (
 	"context"
 	"net"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"wewaf/internal/limits"
 )
+
+// mustRegexp compiles pat or panics at init — the regex literals below
+// are all source-controlled, so a compile failure is a programming bug.
+func mustRegexp(pat string) *regexp.Regexp {
+	return regexp.MustCompile(pat)
+}
 
 // egressDNSCache memoises hostname lookups so a long-running egress workload
 // doesn't hit the resolver for every request. Entries carry a TTL that the
@@ -84,6 +92,35 @@ func (c *egressDNSCache) Lookup(ctx context.Context, host string) ([]net.IP, err
 	return ips, err
 }
 
+// Warm resolves each allowlist host asynchronously so the first real
+// egress request doesn't stall on a five-second LookupIP. Errors are
+// swallowed — a host that fails to resolve at startup will retry on
+// demand, exactly the same way an uncached cache-miss would. We budget
+// only a short timeout per host to avoid tying up startup if DNS is
+// misconfigured entirely.
+func (c *egressDNSCache) Warm(hosts []string) {
+	if c == nil || len(hosts) == 0 {
+		return
+	}
+	go func() {
+		defer func() { _ = recover() }()
+		for _, h := range hosts {
+			h = strings.TrimSpace(h)
+			if h == "" || net.ParseIP(h) != nil {
+				continue
+			}
+			// Drop leading "*." used by subdomain wildcards; only the
+			// right-hand host is resolvable.
+			if strings.HasPrefix(h, "*.") {
+				h = h[2:]
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, _ = c.Lookup(ctx, h)
+			cancel()
+		}
+	}()
+}
+
 func (c *egressDNSCache) evictOldestLocked() {
 	var oldestKey string
 	var oldest time.Time
@@ -121,4 +158,129 @@ func (e *egressRateLimiter) Allow(host string) bool {
 		return true
 	}
 	return e.rl.Allow(host)
+}
+
+// --- Response-body exfiltration detection ------------------------------
+
+// exfilMaxInspectBytes is how much of an outbound response we scan. The
+// typical leak shape (dump-of-a-users-table-as-JSON) shows in the first
+// tens of KB; scanning more than this burns CPU on API payloads that are
+// legitimately large. The rest of the response still forwards fine.
+const exfilMaxInspectBytes = 256 * 1024
+
+// Precompiled patterns. Kept conservative to minimise false positives:
+//   - credit card: 15-19 consecutive digits, validated with Luhn
+//   - secret envelopes: AKIA-prefixed AWS access keys, "ghp_"/"gho_"/"ghs_"
+//     GitHub tokens, "AIza" Google API keys, "sk-live_" / "sk_live_" Stripe
+//     live keys. Each is a strict prefix pattern so benign text doesn't trip.
+var (
+	exfilDigitRun   = mustRegexp(`[0-9]{13,19}`)
+	exfilAWSKey     = mustRegexp(`\bAKIA[0-9A-Z]{16}\b`)
+	exfilGitHubTok  = mustRegexp(`\bgh[pousr]_[A-Za-z0-9]{36,251}\b`)
+	exfilGoogleKey  = mustRegexp(`\bAIza[0-9A-Za-z\-_]{35}\b`)
+	exfilStripeKey  = mustRegexp(`\bsk_live_[0-9A-Za-z]{20,}\b`)
+	exfilSlackToken = mustRegexp(`\bxox[baprs]-[0-9A-Za-z\-]{10,}\b`)
+	exfilJWT        = mustRegexp(`\beyJ[A-Za-z0-9_\-]{5,}\.eyJ[A-Za-z0-9_\-]{5,}\.[A-Za-z0-9_\-]{5,}\b`)
+)
+
+// exfilFinding captures one detection. Callers aggregate these into a
+// single egress-exfil counter bump + audit log line, not a per-pattern
+// avalanche of alerts.
+type exfilFinding struct {
+	Kind   string
+	Sample string
+}
+
+// inspectEgressResponseBody returns findings for the first chunk of a
+// response body. `sample` is assumed to already be capped at exactly
+// exfilMaxInspectBytes. Callers pass body already read into memory so we
+// don't have to do our own io plumbing here.
+//
+// Defensive: never panics on malformed input; returns an empty slice if
+// the body isn't scannable. The caller decides whether findings should
+// block, log, or both — the detector's job is just "did we see it".
+func inspectEgressResponseBody(sample []byte) []exfilFinding {
+	if len(sample) == 0 {
+		return nil
+	}
+	var findings []exfilFinding
+	// Credit-card: Luhn-verify each digit run so phone numbers, tracking
+	// IDs, and invoice numbers don't trigger a false alarm.
+	for _, m := range exfilDigitRun.FindAll(sample, -1) {
+		if luhnValid(m) {
+			findings = append(findings, exfilFinding{
+				Kind:   "credit_card",
+				Sample: maskDigits(string(m)),
+			})
+			break // one is enough to flag; don't spam
+		}
+	}
+	tryPattern := func(kind string, pat interface{ Find([]byte) []byte }) {
+		if m := pat.Find(sample); m != nil {
+			findings = append(findings, exfilFinding{
+				Kind:   kind,
+				Sample: maskSecret(string(m)),
+			})
+		}
+	}
+	tryPattern("aws_access_key", exfilAWSKey)
+	tryPattern("github_token", exfilGitHubTok)
+	tryPattern("google_api_key", exfilGoogleKey)
+	tryPattern("stripe_live_key", exfilStripeKey)
+	tryPattern("slack_token", exfilSlackToken)
+	tryPattern("jwt", exfilJWT)
+	return findings
+}
+
+// luhnValid implements the standard credit-card checksum over an ASCII
+// digit run. Bounded by the regex to 13-19 digits, so this is O(1).
+func luhnValid(digits []byte) bool {
+	if len(digits) < 13 || len(digits) > 19 {
+		return false
+	}
+	sum := 0
+	alt := false
+	for i := len(digits) - 1; i >= 0; i-- {
+		c := digits[i]
+		if c < '0' || c > '9' {
+			return false
+		}
+		n := int(c - '0')
+		if alt {
+			n *= 2
+			if n > 9 {
+				n -= 9
+			}
+		}
+		sum += n
+		alt = !alt
+	}
+	return sum%10 == 0
+}
+
+// maskDigits returns a hint like "4xxxxxxxxxxx1234" instead of the raw
+// card number — important so audit logs don't themselves become the
+// exfil surface we were trying to prevent.
+func maskDigits(s string) string {
+	if len(s) <= 4 {
+		return "****"
+	}
+	out := make([]byte, len(s))
+	for i := range out {
+		if i == 0 || i >= len(out)-4 {
+			out[i] = s[i]
+		} else {
+			out[i] = 'x'
+		}
+	}
+	return string(out)
+}
+
+// maskSecret truncates a token to its prefix so operators can see which
+// vendor leaked without seeing the whole secret in logs.
+func maskSecret(s string) string {
+	if len(s) <= 8 {
+		return "***"
+	}
+	return s[:8] + "***"
 }
