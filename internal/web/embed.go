@@ -22,6 +22,7 @@ import (
 	"wewaf/internal/history"
 	"wewaf/internal/host"
 	"wewaf/internal/limits"
+	"wewaf/internal/pow"
 	"wewaf/internal/proxy"
 	"wewaf/internal/session"
 	"wewaf/internal/setup"
@@ -50,6 +51,7 @@ type Server struct {
 	sessions   *session.Tracker
 	graphql    *graphql.Validator
 	audit      *audit.Chain
+	pow        *pow.Issuer
 
 	meshEnabled  bool
 	meshPeers    []string
@@ -126,6 +128,7 @@ type Deps struct {
 	SessionTracker *session.Tracker
 	GraphQL        *graphql.Validator
 	Audit          *audit.Chain
+	PoW            *pow.Issuer
 
 	MeshEnabled bool
 	MeshPeers   []string
@@ -149,6 +152,7 @@ func NewServer(d Deps) *Server {
 		sessions:   d.SessionTracker,
 		graphql:    d.GraphQL,
 		audit:      d.Audit,
+		pow:        d.PoW,
 		errBufCap:  200,
 		errBuf:     make([]ErrorEvent, 0, 200),
 
@@ -250,6 +254,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Session tracking + browser integrity (authenticated admin endpoints).
 	api.HandleFunc("/api/dpi/stats", safeSessionHandler("dpi-stats", s.handleDPIStats))
+	api.HandleFunc("/api/ja3/stats", safeSessionHandler("ja3-stats", s.handleJA3Stats))
+	api.HandleFunc("/api/pow/stats", safeSessionHandler("pow-stats", s.handlePoWStats))
 	api.HandleFunc("/api/audit/verify", safeSessionHandler("audit-verify", s.handleAuditVerify))
 	api.HandleFunc("/api/audit/tail", safeSessionHandler("audit-tail", s.handleAuditTail))
 	api.HandleFunc("/api/sessions", safeSessionHandler("sessions", s.handleSessions))
@@ -273,6 +279,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/browser-beacon.js", safeSessionHandler("beacon-js", s.handleBrowserBeaconJS))
 	mux.HandleFunc("/api/browser-challenge/verify", safeSessionHandler("challenge-verify", s.handleBrowserChallengeVerify))
 	mux.HandleFunc("/api/session/beacon", safeSessionHandler("session-beacon", s.handleSessionBeacon))
+	// Proof-of-work challenge — public, no auth, served on the protected
+	// origin like the browser-challenge assets.
+	mux.HandleFunc("/api/pow.js", safeSessionHandler("pow-js", s.handlePowJS))
+	mux.HandleFunc("/api/pow/verify", safeSessionHandler("pow-verify", s.handlePowVerify))
 
 	// Serve the embedded SPA.
 	spaFS, err := fs.Sub(distFS, "dist")
@@ -442,6 +452,18 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			HSTSMaxAgeSec      int   `json:"hsts_max_age_sec"`
 			HSTSIncludeSubdoms *bool `json:"hsts_include_subdomains"`
 			HSTSPreload        *bool `json:"hsts_preload"`
+
+			JA3Enabled        *bool    `json:"ja3_enabled"`
+			JA3HardBlock      *bool    `json:"ja3_hard_block"`
+			JA3Header         *string  `json:"ja3_header"`
+			JA3TrustedSources []string `json:"ja3_trusted_sources"`
+
+			PoWEnabled       *bool `json:"pow_enabled"`
+			PoWTriggerScore  *int  `json:"pow_trigger_score"`
+			PoWMinDifficulty *int  `json:"pow_min_difficulty"`
+			PoWMaxDifficulty *int  `json:"pow_max_difficulty"`
+			PoWTokenTTLSec   *int  `json:"pow_token_ttl_sec"`
+			PoWCookieTTLSec  *int  `json:"pow_cookie_ttl_sec"`
 		}
 		// Bounded reader so a malicious request can't OOM us with a 1 GB JSON.
 		// 64 KiB is generous — every legitimate config payload is under 8 KiB.
@@ -658,6 +680,36 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.HSTSPreload != nil {
 			s.cfg.HSTSPreload = *payload.HSTSPreload
+		}
+		if payload.JA3Enabled != nil {
+			s.cfg.JA3Enabled = *payload.JA3Enabled
+		}
+		if payload.JA3HardBlock != nil {
+			s.cfg.JA3HardBlock = *payload.JA3HardBlock
+		}
+		if payload.JA3Header != nil {
+			s.cfg.JA3Header = *payload.JA3Header
+		}
+		if payload.JA3TrustedSources != nil {
+			s.cfg.JA3TrustedSources = append([]string(nil), payload.JA3TrustedSources...)
+		}
+		if payload.PoWEnabled != nil {
+			s.cfg.PoWEnabled = *payload.PoWEnabled
+		}
+		if payload.PoWTriggerScore != nil && *payload.PoWTriggerScore > 0 && *payload.PoWTriggerScore <= 100 {
+			s.cfg.PoWTriggerScore = *payload.PoWTriggerScore
+		}
+		if payload.PoWMinDifficulty != nil && *payload.PoWMinDifficulty >= 8 && *payload.PoWMinDifficulty <= 32 {
+			s.cfg.PoWMinDifficulty = *payload.PoWMinDifficulty
+		}
+		if payload.PoWMaxDifficulty != nil && *payload.PoWMaxDifficulty >= 8 && *payload.PoWMaxDifficulty <= 32 {
+			s.cfg.PoWMaxDifficulty = *payload.PoWMaxDifficulty
+		}
+		if payload.PoWTokenTTLSec != nil && *payload.PoWTokenTTLSec >= 30 && *payload.PoWTokenTTLSec <= 600 {
+			s.cfg.PoWTokenTTLSec = *payload.PoWTokenTTLSec
+		}
+		if payload.PoWCookieTTLSec != nil && *payload.PoWCookieTTLSec >= 60 && *payload.PoWCookieTTLSec <= 86400 {
+			s.cfg.PoWCookieTTLSec = *payload.PoWCookieTTLSec
 		}
 		// Push updated ban-list backoff to the live object so changes take
 		// effect without a restart. Capture values under the write lock so

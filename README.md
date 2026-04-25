@@ -535,9 +535,72 @@ DNS even if the network is flaky.
 | `hsts_include_subdomains`   | `true`      | Append `; includeSubDomains` to the HSTS header.                                                                                                  |
 | `hsts_preload`              | `false`     | Append `; preload`. Only tick once you are ready to submit to `hstspreload.org` — removal is manual and slow.                                     |
 
-Other sections (egress proxy, history rotation, rule engine mode,
-paranoia level, SSL manager, mesh gossip) keep the same JSON tags as
-before — see `internal/config/config.go` for the full list.
+### JA3 TLS fingerprinting
+
+JA3 catches automation that passes the JS browser-integrity check by
+fingerprinting the TLS ClientHello. WEWAF supports two capture paths:
+
+- **Native** — when WEWAF terminates TLS itself, the proxy installs a
+  `GetConfigForClient` hook and computes the fingerprint per handshake.
+  Cached by remote address with a short TTL.
+- **Edge-fed** — when WEWAF runs behind a TLS terminator that exports
+  the JA3 hash via header (Cloudflare's `Cf-Ja3-Hash`, AWS, custom
+  edges), the value is honoured **only when the source IP is in
+  `ja3_trusted_sources`**. Any other client setting that header is
+  silently ignored — there is no spoofing path.
+
+Detection is layered: a curated list of well-known automation
+fingerprints (curl, Go's net/http, Python urllib3, headless Chrome)
+adds **+15 to the session risk score** by default. Operators can flip
+`ja3_hard_block` to refuse the request outright. A "good" list of
+real-browser hashes suppresses the bump in the rare case of a curated
+collision.
+
+| Field                  | Default | Purpose                                                                                          |
+|------------------------|---------|--------------------------------------------------------------------------------------------------|
+| `ja3_enabled`          | `false` | Master switch.                                                                                   |
+| `ja3_hard_block`       | `false` | If true, "bad" verdicts return 403 directly. Default just bumps the session score.               |
+| `ja3_header`           | `""`    | Header that carries the JA3 hash from a trusted edge. Empty = native-only mode.                  |
+| `ja3_trusted_sources`  | `[]`    | CIDRs allowed to set `ja3_header`. Bare IPs are widened to /32 (IPv4) or /128 (IPv6).            |
+| `ja3_cache_capacity`   | `4096`  | Bounded entries in the per-handshake fingerprint cache.                                          |
+| `ja3_cache_ttl_sec`    | `30`    | TTL for cached fingerprints. Long enough to cover a Keep-Alive connection, short enough to bound memory. |
+
+GREASE values (RFC 8701) are stripped before hashing so real Chrome
+produces a stable fingerprint across handshakes.
+
+### Proof-of-work for high-risk sessions
+
+When a session's risk score crosses `pow_trigger_score`, WEWAF returns
+a small HTML page that runs a hashcash-style PoW solver in JavaScript.
+The browser hashes `SHA-256(salt || nonce)` until the prefix has the
+configured number of leading zero bits, then POSTs the nonce to
+`/api/pow/verify`. On pass the WAF sets a signed cookie (HMAC-SHA256
+truncated to 12 bytes), records the pass on the session, and caps the
+visible score at 49 for one hour so the user isn't immediately
+re-challenged.
+
+| Field                | Default | Purpose                                                                                                        |
+|----------------------|---------|----------------------------------------------------------------------------------------------------------------|
+| `pow_enabled`        | `false` | Master switch.                                                                                                 |
+| `pow_trigger_score`  | `60`    | Session risk-score threshold above which the PoW gate fires.                                                   |
+| `pow_min_difficulty` | `18`    | Bits at the trigger score. ~250 ms–1 s on a modern phone.                                                      |
+| `pow_max_difficulty` | `24`    | Hard ceiling. ~5–15 s on desktop.                                                                              |
+| `pow_token_ttl_sec`  | `120`   | Server-issued challenge validity. Plenty for a slow client; bounds replay window if cookies leak.              |
+| `pow_cookie_ttl_sec` | `3600`  | Pass-cookie lifetime once verified.                                                                            |
+| `pow_secret`         | auto    | HMAC key. Auto-generated per restart unless explicitly set — restart invalidates outstanding solves, by design. |
+
+Token verification is constant-time (HMAC compare via
+`crypto/subtle`), replay-protected via a TTL'd seen-set, and
+panic-recovered. If a client lacks `crypto.subtle` (very old browser,
+locked-down enterprise mode), the page falls through to the existing
+JS browser challenge — high-risk sessions still get gated, just by
+the lighter mechanism.
+
+### Other sections
+
+Egress proxy, history rotation, rule engine mode, paranoia level, SSL
+manager, mesh gossip keep the same JSON tags as before — see
+`internal/config/config.go` for the full list.
 
 Set `WAF_API_KEY` in the environment to require an API key on every
 `/api/*` request. Clients present it via `X-API-Key` header or
@@ -582,6 +645,9 @@ important ones to know about beyond the obvious `/api/health`,
   collected signals here; on pass you receive the `__wewaf_bc` cookie
   and a rotated session ID.
 - `/api/session/beacon` (POST) — mouse/keyboard/time-on-page deltas.
+- `/api/pow.js` — proof-of-work solver served on the protected origin.
+- `/api/pow/verify` (POST) — accepts `(token, nonce)`, sets the
+  `__wewaf_pow` pass cookie on success.
 - `/api/graphql/stats` / `/api/graphql/recent` — per-operation
   counters, subscription totals, and a ring buffer of recent
   validated operations with depth/alias/field counts.

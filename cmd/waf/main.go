@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"flag"
 	"io"
@@ -24,7 +25,9 @@ import (
 	"wewaf/internal/graphql"
 	"wewaf/internal/history"
 	"wewaf/internal/host"
+	"wewaf/internal/ja3"
 	"wewaf/internal/limits"
+	"wewaf/internal/pow"
 	"wewaf/internal/proxy"
 	"wewaf/internal/rules"
 	"wewaf/internal/session"
@@ -182,6 +185,52 @@ func main() {
 		_, _ = auditChain.Append("startup", "system", "WEWAF daemon starting", "")
 	}
 
+	// JA3 fingerprinter. Cache is always created when the feature is on
+	// (so future TLS termination wiring picks it up automatically); the
+	// detector + trust + header path is also wired so edge deployments
+	// behind a TLS-terminating proxy work out of the box.
+	if cfg.JA3Enabled {
+		jaCache := ja3.NewCache(cfg.JA3CacheCapacity, time.Duration(cfg.JA3CacheTTLSec)*time.Second)
+		jaDetector := ja3.NewDetector()
+		jaDetector.SetHardBlock(cfg.JA3HardBlock)
+		jaTrust := ja3.NewTrustChecker(cfg.JA3TrustedSources)
+		wp.AttachJA3(jaCache, jaDetector, jaTrust, cfg.JA3Header)
+		log.Printf("ja3: enabled (header=%q trusted_sources=%d hard_block=%v)",
+			cfg.JA3Header, len(cfg.JA3TrustedSources), cfg.JA3HardBlock)
+	}
+
+	// Proof-of-work issuer. If no secret was supplied, generate one and
+	// keep it in-memory only — restarting the WAF invalidates outstanding
+	// PoW cookies, which is the desired security posture during incidents.
+	var powIssuer *pow.Issuer
+	if cfg.PoWEnabled {
+		secret := []byte(cfg.PoWSecret)
+		if len(secret) == 0 {
+			b := make([]byte, 32)
+			if _, rerr := cryptorand.Read(b); rerr != nil {
+				log.Printf("pow: rand failed (%v); using fallback secret — restart will rotate it", rerr)
+				b = []byte(time.Now().UTC().String())
+			}
+			secret = b
+			cfg.PoWSecret = string(secret) // share with web layer for cookie signing
+		}
+		issuer, perr := pow.NewIssuer(
+			secret,
+			uint8(cfg.PoWMinDifficulty),
+			uint8(cfg.PoWMaxDifficulty),
+			time.Duration(cfg.PoWTokenTTLSec)*time.Second,
+		)
+		if perr != nil {
+			log.Printf("pow: disabled — invalid configuration: %v", perr)
+		} else {
+			powIssuer = issuer
+			wp.AttachPoW(powIssuer)
+			log.Printf("pow: enabled (difficulty=%d-%d trigger_score=%d ttl=%ds)",
+				cfg.PoWMinDifficulty, cfg.PoWMaxDifficulty,
+				cfg.PoWTriggerScore, cfg.PoWTokenTTLSec)
+		}
+	}
+
 	// Background telemetry collectors.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
@@ -292,6 +341,7 @@ func main() {
 		SessionTracker: sessionTracker,
 		GraphQL:        gqlValidator,
 		Audit:          auditChain,
+		PoW:            powIssuer,
 		MeshEnabled:    cfg.MeshEnabled,
 		MeshPeers:      cfg.MeshPeers,
 		MeshAPIKey:     cfg.MeshAPIKey,

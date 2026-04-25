@@ -188,6 +188,28 @@ type Config struct {
 	GraphQLRoleHeader         string `json:"graphql_role_header"`
 	GraphQLBlockSubscriptions bool   `json:"graphql_block_subscriptions"`
 
+	// JA3 TLS fingerprinting. Native capture requires the proxy to
+	// terminate TLS itself (TLSEnabled + cert/key). Edge mode reads the
+	// hash from a header named JA3Header but only when the request comes
+	// from a CIDR in JA3TrustedSources — anyone else's header is ignored.
+	JA3Enabled         bool     `json:"ja3_enabled"`
+	JA3HardBlock       bool     `json:"ja3_hard_block"`
+	JA3Header          string   `json:"ja3_header"`           // e.g. "Cf-Ja3-Hash"
+	JA3TrustedSources  []string `json:"ja3_trusted_sources"`  // CIDRs allowed to set JA3Header
+	JA3CacheCapacity   int      `json:"ja3_cache_capacity"`
+	JA3CacheTTLSec     int      `json:"ja3_cache_ttl_sec"`
+
+	// Proof-of-work challenge for high-risk sessions. When the session
+	// risk score reaches PoWTriggerScore and no valid PoW cookie is
+	// present, the WAF returns the PoW gate page.
+	PoWEnabled        bool   `json:"pow_enabled"`
+	PoWTriggerScore   int    `json:"pow_trigger_score"`   // session score that triggers PoW
+	PoWMinDifficulty  int    `json:"pow_min_difficulty"`  // bits, default 18
+	PoWMaxDifficulty  int    `json:"pow_max_difficulty"`  // bits, default 24
+	PoWTokenTTLSec    int    `json:"pow_token_ttl_sec"`   // server-issued challenge TTL
+	PoWCookieTTLSec   int    `json:"pow_cookie_ttl_sec"`  // client-pass cookie TTL
+	PoWSecret         string `json:"pow_secret"`          // HMAC key for PoW tokens (auto-generated if empty)
+
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 	// mu protects runtime mutation of any non-atomic field (admin API POST
 	// /api/config edits, config watcher hot-reloads). Snapshot() takes an
@@ -324,6 +346,23 @@ func Default() *Config {
 		GraphQLMaxFields:          200,
 		GraphQLRoleHeader:         "X-User-Role",
 		GraphQLBlockSubscriptions: false,
+
+		// JA3 + PoW default to OFF. Both are heavy-hammer features that
+		// need operator review of trust boundaries (JA3 edge header) and
+		// UX impact (PoW solve time) before they're switched on.
+		JA3Enabled:        false,
+		JA3HardBlock:      false,
+		JA3Header:         "",
+		JA3TrustedSources: []string{},
+		JA3CacheCapacity:  4096,
+		JA3CacheTTLSec:    30,
+
+		PoWEnabled:       false,
+		PoWTriggerScore:  60, // 60 ≈ "high risk" per scoring.go — same line in the sand
+		PoWMinDifficulty: 18,
+		PoWMaxDifficulty: 24,
+		PoWTokenTTLSec:   120,
+		PoWCookieTTLSec:  3600,
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -510,6 +549,50 @@ func (c *Config) Validate() error {
 	if c.GraphQLRoleHeader == "" {
 		c.GraphQLRoleHeader = "X-User-Role"
 	}
+
+	// JA3 clamping. Out-of-range cache values get the defaults; an empty
+	// header with a non-empty trust list is a config typo (the operator
+	// turned on edge mode but didn't name the header) so we leave it
+	// alone — the runtime treats empty header as "edge mode disabled".
+	if c.JA3CacheCapacity <= 0 {
+		c.JA3CacheCapacity = 4096
+	}
+	if c.JA3CacheCapacity > 1_000_000 {
+		// Cap to avoid silent OOM if someone fat-fingers the config.
+		c.JA3CacheCapacity = 1_000_000
+	}
+	if c.JA3CacheTTLSec <= 0 {
+		c.JA3CacheTTLSec = 30
+	}
+	if c.JA3CacheTTLSec > 3600 {
+		c.JA3CacheTTLSec = 3600
+	}
+
+	// PoW clamping. We enforce difficulty bounds here so the proxy
+	// doesn't have to re-check on every Issue call. The 32-bit hard cap
+	// is a UX safeguard — at 32 bits, mobile clients would solve in
+	// minutes and abandon the page.
+	if c.PoWMinDifficulty < 8 {
+		c.PoWMinDifficulty = 18
+	}
+	if c.PoWMaxDifficulty < c.PoWMinDifficulty {
+		c.PoWMaxDifficulty = c.PoWMinDifficulty
+	}
+	if c.PoWMaxDifficulty > 32 {
+		c.PoWMaxDifficulty = 32
+	}
+	if c.PoWTriggerScore <= 0 {
+		c.PoWTriggerScore = 60
+	}
+	if c.PoWTriggerScore > 100 {
+		c.PoWTriggerScore = 100
+	}
+	if c.PoWTokenTTLSec <= 0 {
+		c.PoWTokenTTLSec = 120
+	}
+	if c.PoWCookieTTLSec <= 0 {
+		c.PoWCookieTTLSec = 3600
+	}
 	return nil
 }
 
@@ -635,6 +718,21 @@ func (c *Config) Snapshot() *Config {
 		GraphQLSchemaFile:         c.GraphQLSchemaFile,
 		GraphQLRoleHeader:         c.GraphQLRoleHeader,
 		GraphQLBlockSubscriptions: c.GraphQLBlockSubscriptions,
+
+		JA3Enabled:        c.JA3Enabled,
+		JA3HardBlock:      c.JA3HardBlock,
+		JA3Header:         c.JA3Header,
+		JA3TrustedSources: append([]string(nil), c.JA3TrustedSources...),
+		JA3CacheCapacity:  c.JA3CacheCapacity,
+		JA3CacheTTLSec:    c.JA3CacheTTLSec,
+
+		PoWEnabled:       c.PoWEnabled,
+		PoWTriggerScore:  c.PoWTriggerScore,
+		PoWMinDifficulty: c.PoWMinDifficulty,
+		PoWMaxDifficulty: c.PoWMaxDifficulty,
+		PoWTokenTTLSec:   c.PoWTokenTTLSec,
+		PoWCookieTTLSec:  c.PoWCookieTTLSec,
+		PoWSecret:        c.PoWSecret,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	copy(cp.EgressAllowlist, c.EgressAllowlist)

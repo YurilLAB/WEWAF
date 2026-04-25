@@ -32,10 +32,16 @@ func (t *Tracker) Score(id string) int {
 	if t == nil || id == "" || !t.enabled.Load() {
 		return 0
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	// Read-lock for the bulk of the scoring math so multiple admin-UI /
+	// hot-path callers can compute scores in parallel. The result is
+	// written back to the session struct under a brief write lock at
+	// the end. The previous unconditional write lock serialised every
+	// scoring call against every other tracker mutation, which made
+	// the admin /api/sessions page contend with live request scoring.
+	t.mu.RLock()
 	s, ok := t.sessions[id]
 	if !ok {
+		t.mu.RUnlock()
 		return 0
 	}
 	score := 0
@@ -119,10 +125,40 @@ func (t *Tracker) Score(id string) int {
 		}
 	}
 
+	// JA3 — a curated-bad fingerprint adds a fixed bump. We do NOT block
+	// on JA3 alone in the scoring path; that's the operator's choice via
+	// the hard-block flag in the JA3 detector. A "good" verdict is purely
+	// suppressive (no bump), never negative — score is monotonic.
+	if s.JA3Verdict == "bad" {
+		score += 15
+	}
+
 	if score > 100 {
 		score = 100
 	}
+
+	// PoW cap — if this session has cleared the proof-of-work gate within
+	// the last hour, bound the visible score at 49. This prevents a
+	// Sisyphean loop where a high-risk session solves PoW, immediately
+	// trips the threshold again on the next request, and gets challenged
+	// repeatedly. The full underlying signal is still available to
+	// admin-UI introspection (see SessionView).
+	if !s.PowPassedAt.IsZero() && now.Sub(s.PowPassedAt) < time.Hour {
+		if score > 49 {
+			score = 49
+		}
+	}
+	t.mu.RUnlock()
+
+	// Promote to write lock just long enough to record the result. Skip
+	// the write entirely when nothing changed so a steady-state session
+	// doesn't fight other mutators for the lock.
+	if s.RiskScore == score {
+		return score
+	}
+	t.mu.Lock()
 	s.RiskScore = score
 	s.LastScoreBump = now
+	t.mu.Unlock()
 	return score
 }

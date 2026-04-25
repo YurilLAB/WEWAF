@@ -180,6 +180,20 @@ export interface WAFSettings {
   hstsMaxAgeSec: number;
   hstsIncludeSubdomains: boolean;
   hstsPreload: boolean;
+
+  // JA3 TLS fingerprinting.
+  ja3Enabled: boolean;
+  ja3HardBlock: boolean;
+  ja3Header: string;
+  ja3TrustedSources: string;
+
+  // Proof-of-work for high-risk sessions.
+  powEnabled: boolean;
+  powTriggerScore: number;
+  powMinDifficulty: number;
+  powMaxDifficulty: number;
+  powTokenTTLSec: number;
+  powCookieTTLSec: number;
 }
 
 export interface HostMachineStats {
@@ -394,6 +408,16 @@ const defaultSettings: WAFSettings = {
   hstsMaxAgeSec: 15552000,
   hstsIncludeSubdomains: true,
   hstsPreload: false,
+  ja3Enabled: false,
+  ja3HardBlock: false,
+  ja3Header: '',
+  ja3TrustedSources: '',
+  powEnabled: false,
+  powTriggerScore: 60,
+  powMinDifficulty: 18,
+  powMaxDifficulty: 24,
+  powTokenTTLSec: 120,
+  powCookieTTLSec: 3600,
 };
 
 const defaultDDoS: DDoSConfig = {

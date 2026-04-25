@@ -272,3 +272,70 @@ func TestScoreReturnsZeroWhenDisabled(t *testing.T) {
 		}
 	}
 }
+
+// TestJA3BadVerdictBumpsScore proves the JA3 weight is wired into the
+// scoring formula. We compute a baseline score, then attach a "bad" JA3
+// verdict and re-score — the second value must be at least 15 higher
+// (the documented JA3 weight).
+func TestJA3BadVerdictBumpsScore(t *testing.T) {
+	tr := NewTracker(Config{Enabled: true})
+	defer tr.Stop()
+
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	s := tr.EnsureSession(w, r)
+	if s == nil {
+		t.Fatal("session not created")
+	}
+	// Drive a few blocks so the baseline score is > 0 and observable.
+	for i := 0; i < 5; i++ {
+		tr.RecordBlock(s.ID)
+		tr.touchSession(s.ID, r)
+	}
+	baseline := tr.Score(s.ID)
+
+	tr.RecordJA3(s.ID, "deadbeef", "bad", "curl 7.x default")
+	bumped := tr.Score(s.ID)
+
+	if bumped-baseline < 15 {
+		t.Fatalf("expected JA3 bad to add ≥15 points; baseline=%d after-bump=%d", baseline, bumped)
+	}
+
+	// "good" verdict overrides the bump path — re-tag and confirm.
+	tr.RecordJA3(s.ID, "feedface", "good", "Chrome stable")
+	good := tr.Score(s.ID)
+	if good-baseline >= 15 {
+		t.Fatalf("'good' verdict shouldn't add ≥15 points; baseline=%d good=%d", baseline, good)
+	}
+}
+
+// TestPowPassCapsVisibleScore — once a session has cleared PoW the score
+// MUST cap so the proxy doesn't immediately re-challenge on the next
+// request. Without this the user gets stuck in a solve-loop.
+func TestPowPassCapsVisibleScore(t *testing.T) {
+	tr := NewTracker(Config{Enabled: true})
+	defer tr.Stop()
+
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	s := tr.EnsureSession(w, r)
+	if s == nil {
+		t.Fatal("session not created")
+	}
+	// Drive heavy blocks so the underlying score blows past 49 + the
+	// baseline trigger.
+	for i := 0; i < 50; i++ {
+		tr.RecordBlock(s.ID)
+		tr.touchSession(s.ID, r)
+	}
+	rawHigh := tr.Score(s.ID)
+	if rawHigh < 50 {
+		t.Skipf("baseline score too low (%d) — adjust test setup", rawHigh)
+	}
+
+	tr.RecordPowPass(s.ID)
+	capped := tr.Score(s.ID)
+	if capped > 49 {
+		t.Fatalf("post-PoW score should be ≤49; got %d (raw was %d)", capped, rawHigh)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -26,7 +27,9 @@ import (
 	"wewaf/internal/dpi"
 	"wewaf/internal/engine"
 	"wewaf/internal/graphql"
+	"wewaf/internal/ja3"
 	"wewaf/internal/limits"
+	"wewaf/internal/pow"
 	"wewaf/internal/session"
 	"wewaf/internal/shaper"
 	"wewaf/internal/telemetry"
@@ -50,6 +53,33 @@ type WAFProxy struct {
 	sessions  *session.Tracker
 	gql       *graphql.Validator
 	audit     *audit.Chain
+
+	// JA3 fingerprinting. ja3Cache is populated by the TLS listener via
+	// GetConfigForClient. ja3Detector + ja3Trust + ja3Header drive
+	// inspection on every request. All four are nil-tolerant: if JA3 is
+	// disabled in config the proxy never touches them.
+	ja3Cache    *ja3.Cache
+	ja3Detector *ja3.Detector
+	ja3Trust    *ja3.TrustChecker
+	ja3Header   string
+
+	// Proof-of-work issuer for high-risk session challenges. Nil when
+	// disabled; threshold is read directly from cfg on each request.
+	pow *pow.Issuer
+
+	// Counters (atomic so admin-API reads don't contend with hot path).
+	ja3Inspect    atomic.Uint64
+	ja3MatchBad   atomic.Uint64
+	ja3Blocked    atomic.Uint64
+	powIssued     atomic.Uint64
+	powVerified   atomic.Uint64
+	powRejected   atomic.Uint64
+
+	// powIssueCounters guards a small per-IP fixed-window counter used
+	// to rate-limit PoW issuance. Lazily initialised in
+	// allowPoWIssuance so the map stays nil when PoW is off.
+	powIssueMu       sync.Mutex
+	powIssueCounters map[string]*powIssueCounter
 
 	// DPI counters exposed via admin API.
 	grpcRequests atomic.Uint64
@@ -88,6 +118,71 @@ func (wp *WAFProxy) AttachAuditChain(c *audit.Chain) {
 		return
 	}
 	wp.audit = c
+}
+
+// AttachJA3 wires up the JA3 fingerprinter. Pass nil for any field to
+// turn that capability off — e.g., a deployment behind Cloudflare passes
+// detector + trust + header (no native cache); a deployment terminating
+// TLS itself passes detector + cache (no header path needed).
+func (wp *WAFProxy) AttachJA3(cache *ja3.Cache, det *ja3.Detector, trust *ja3.TrustChecker, header string) {
+	if wp == nil {
+		return
+	}
+	wp.ja3Cache = cache
+	wp.ja3Detector = det
+	wp.ja3Trust = trust
+	wp.ja3Header = header
+}
+
+// AttachPoW wires up the proof-of-work issuer used to gate high-risk
+// sessions. Nil disables PoW entirely.
+func (wp *WAFProxy) AttachPoW(p *pow.Issuer) {
+	if wp == nil {
+		return
+	}
+	wp.pow = p
+}
+
+// JA3 returns the fingerprint observed for r, plus the detector verdict.
+// Returns ("","") if JA3 is disabled or no fingerprint is available
+// (handshake not seen, edge header missing/untrusted). Never panics.
+func (wp *WAFProxy) inspectJA3(r *http.Request) (hash string, verdict ja3.Verdict) {
+	if wp == nil || wp.ja3Detector == nil || r == nil {
+		return "", ja3.Verdict{}
+	}
+	defer func() {
+		// JA3 must never crash the proxy. Cache lookups touch a map under
+		// RLock so they're effectively panic-free, but the detector's
+		// list-replacement path holds a write lock and a future code
+		// change could regress that. Belt and braces.
+		if rec := recover(); rec != nil {
+			wp.eng.LogError("proxy: panic in inspectJA3: %v", rec)
+			hash, verdict = "", ja3.Verdict{}
+		}
+	}()
+	// Native: native TLS cache lookup keyed by RemoteAddr. Use the cache
+	// in priority over the trusted header — own observation is more
+	// trustworthy than anything proxied through.
+	if wp.ja3Cache != nil {
+		if fp, ok := wp.ja3Cache.Get(r.RemoteAddr); ok {
+			hash = fp.Hash
+		}
+	}
+	if hash == "" && wp.ja3Header != "" {
+		hash = ja3.HashFromHeader(r, wp.ja3Header, wp.ja3Trust)
+	}
+	if hash == "" {
+		return "", ja3.Verdict{}
+	}
+	wp.ja3Inspect.Add(1)
+	verdict = wp.ja3Detector.Evaluate(hash)
+	if verdict.Match == "bad" {
+		wp.ja3MatchBad.Add(1)
+		if verdict.Blocked {
+			wp.ja3Blocked.Add(1)
+		}
+	}
+	return hash, verdict
 }
 
 // applyHeadersForTest mirrors the response-header injection path for
@@ -138,6 +233,58 @@ func (wp *WAFProxy) DPIStats() map[string]uint64 {
 		"grpc_blocked":  wp.grpcBlocked.Load(),
 		"ws_upgrades":   wp.wsUpgrades.Load(),
 		"ws_rejected":   wp.wsRejected.Load(),
+	}
+}
+
+// JA3Stats surfaces JA3 detector + cache state for the admin API.
+// Returns a stable shape regardless of whether JA3 is configured so the
+// UI can render the card without conditional logic.
+func (wp *WAFProxy) JA3Stats() map[string]interface{} {
+	if wp == nil {
+		return map[string]interface{}{}
+	}
+	out := map[string]interface{}{
+		"inspect": wp.ja3Inspect.Load(),
+		"bad":     wp.ja3MatchBad.Load(),
+		"blocked": wp.ja3Blocked.Load(),
+	}
+	if wp.ja3Detector != nil {
+		out["detector"] = wp.ja3Detector.Stats()
+	}
+	if wp.ja3Cache != nil {
+		out["cache"] = wp.ja3Cache.Stats()
+	}
+	return out
+}
+
+// IncPoWVerified bumps the verified-counter exposed by PoWStats. The
+// web handler calls this on a successful Verify so the metric reflects
+// real verifies regardless of which package owns the verification path.
+func (wp *WAFProxy) IncPoWVerified() {
+	if wp == nil {
+		return
+	}
+	wp.powVerified.Add(1)
+}
+
+// IncPoWRejected mirrors IncPoWVerified for failed verifies (bad
+// signature, expired token, replay, malformed nonce).
+func (wp *WAFProxy) IncPoWRejected() {
+	if wp == nil {
+		return
+	}
+	wp.powRejected.Add(1)
+}
+
+// PoWStats surfaces proof-of-work counters for the admin API.
+func (wp *WAFProxy) PoWStats() map[string]uint64 {
+	if wp == nil {
+		return map[string]uint64{}
+	}
+	return map[string]uint64{
+		"issued":   wp.powIssued.Load(),
+		"verified": wp.powVerified.Load(),
+		"rejected": wp.powRejected.Load(),
 	}
 }
 
@@ -359,6 +506,21 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Bypass-hardening: cheap protocol-level checks that catch request
+	// smuggling, CR/LF header injection, double-encoded path traversal,
+	// dangerous methods, and malformed Host. Runs before any other
+	// inspection because each check is constant-time and the rejections
+	// here MUST be returned before the rule engine sees a request that
+	// looks malformed in subtle ways. Logged via metrics so operators
+	// can tune via the dashboard.
+	if v := evaluateHardening(r); v.Reject {
+		ip := getClientIP(r, wp.cfg.TrustXFF)
+		wp.metrics.RecordBlock(ip, r.Method, r.URL.Path, v.RuleID, v.Reason, 100)
+		wp.auditWrite("harden_reject", ip, v.Reason, v.RuleID)
+		http.Error(w, v.Reason, v.Status)
+		return
+	}
+
 	// WebSocket upgrade gate — runs before session / shaper because
 	// rejecting a bad handshake is cheaper than admitting it. When the
 	// feature is off we skip the detection entirely so a plain HTTP
@@ -389,6 +551,45 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s := wp.sessions.EnsureSession(w, r); s != nil {
 			sessID = s.ID
 		}
+	}
+
+	// JA3 fingerprint inspection. Runs after EnsureSession so the
+	// fingerprint can be attached to the session record. Fail-open on
+	// any error (panic/lookup miss) — JA3 is a *signal*, never the sole
+	// reason to block.
+	if wp.ja3Detector != nil {
+		if hash, verdict := wp.inspectJA3(r); hash != "" {
+			if sessID != "" {
+				wp.sessions.RecordJA3(sessID, hash, verdict.Match, verdict.Reason)
+			}
+			if verdict.Blocked {
+				ip := getClientIP(r, wp.cfg.TrustXFF)
+				reason := "JA3 hard-block: " + verdict.Reason
+				wp.metrics.RecordBlock(ip, r.Method, r.URL.Path, "JA3:"+hash, reason, 100)
+				wp.auditWrite("ja3_block", ip, reason, hash)
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			// Score-only path: still emit a log-only event so operators
+			// can see the bump in the SQLite history and the dashboard's
+			// Security Events tab. Score 0 + a "ja3" category keeps it
+			// out of the block totals.
+			if verdict.Match == "bad" {
+				ip := getClientIP(r, wp.cfg.TrustXFF)
+				wp.metrics.RecordBlockWithCategory(ip, r.Method, r.URL.Path,
+					"JA3-FLAG:"+hash, "ja3", "ja3 fingerprint match: "+verdict.Reason, 0)
+			}
+		}
+	}
+
+	// Proof-of-work gate. Runs after JA3 (so a JA3 bump can push the
+	// session over the threshold) but before any expensive inspection.
+	// Skipped for the PoW assets themselves, the verify endpoint, and
+	// anything served by the WAF's own admin/challenge surface — those
+	// MUST always pass through.
+	if wp.shouldGateWithPoW(r, scoreFor(wp, sessID)) && !isPoWBypassPath(r.URL.Path) {
+		wp.servePoWChallenge(w, r, scoreFor(wp, sessID))
+		return
 	}
 
 	// Pre-WAF admission control: if the shaper is enabled and the global
@@ -453,6 +654,19 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"distributed attack pattern on sensitive path", 80)
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 		return
+	}
+
+	// Cache-buster detector: same IP rotating querystrings on one path
+	// to defeat CDN caching. Cheap no-op when there's no querystring,
+	// which is the dominant case for non-API traffic.
+	if r.URL != nil && r.URL.RawQuery != "" {
+		if cbv := wp.ddos.RecordCacheBuster(clientIP, r.URL.Path, r.URL.RawQuery); cbv == ddos.VerdictCacheBuster {
+			w.Header().Set("Retry-After", "60")
+			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-CACHE-BUSTER",
+				"querystring rotation flooding cache key", 70)
+			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+			return
+		}
 	}
 
 	if !wp.rl.Allow(clientIP) {

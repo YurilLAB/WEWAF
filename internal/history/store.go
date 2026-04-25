@@ -126,6 +126,13 @@ type Store struct {
 	stopCh    chan struct{}
 	doneCh    chan struct{}
 	startedRun atomic.Bool // true after Start has launched the writer goroutine
+	// stopping is set BEFORE stopCh is closed so producers can short-
+	// circuit their enqueues. Without this, the writer goroutine's drain
+	// loop and the producers race: a producer enqueues into eventsCh
+	// just after the drain fires its `default` branch, and the event is
+	// lost. Reading the flag is a single atomic load, free in the
+	// non-shutdown hot path.
+	stopping atomic.Bool
 
 	droppedEvents atomic.Uint64
 	writtenEvents atomic.Uint64
@@ -216,6 +223,11 @@ func (s *Store) SetRotation(d time.Duration) {
 func (s *Store) Close() error {
 	var err error
 	s.stopOnce.Do(func() {
+		// Mark stopping FIRST so producers stop enqueueing. Then close
+		// stopCh so the writer goroutine begins its drain. Without the
+		// flag-then-close sequencing a producer could win the race with
+		// the drain's default branch and leak its event.
+		s.stopping.Store(true)
 		close(s.stopCh)
 		if s.startedRun.Load() {
 			<-s.doneCh
@@ -236,7 +248,7 @@ func (s *Store) Close() error {
 // EnqueueBlock queues a block event for durable storage. Non-blocking:
 // if the buffer is full the event is dropped and a counter incremented.
 func (s *Store) EnqueueBlock(e BlockEvent) {
-	if s == nil {
+	if s == nil || s.stopping.Load() {
 		return
 	}
 	ev := event{kind: kindBlock, block: e}
@@ -250,7 +262,7 @@ func (s *Store) EnqueueBlock(e BlockEvent) {
 // EnqueueRequest updates ip_activity for a single observed request.
 // blocked=true increments the block counter as well.
 func (s *Store) EnqueueRequest(ip string, blocked bool) {
-	if s == nil || ip == "" {
+	if s == nil || ip == "" || s.stopping.Load() {
 		return
 	}
 	ev := event{kind: kindRequest, ip: ip, blocked: blocked}
@@ -263,7 +275,7 @@ func (s *Store) EnqueueRequest(ip string, blocked bool) {
 
 // EnqueueTrafficPoint persists a traffic graph sample.
 func (s *Store) EnqueueTrafficPoint(p TrafficPoint) {
-	if s == nil {
+	if s == nil || s.stopping.Load() {
 		return
 	}
 	ev := event{kind: kindTrafficPoint, point: p}

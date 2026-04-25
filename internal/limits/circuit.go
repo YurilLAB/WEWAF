@@ -84,11 +84,15 @@ func (b *Breaker) Allow() bool {
 		return true
 	case BreakerOpen:
 		// Check whether the cool-down has elapsed; if so, try a single probe.
+		// Note we re-read openedAt under the lock — RecordFailure can have
+		// written a fresh value between our unlocked check and the locked
+		// re-check, and using the stale value would let us issue a probe
+		// against a breaker that has just re-opened.
 		opened := time.Unix(0, b.openedAt.Load())
 		if time.Since(opened) >= b.openTimeout {
 			b.mu.Lock()
-			// Re-read under lock to avoid double-transition races.
-			if BreakerState(b.state.Load()) == BreakerOpen && time.Since(opened) >= b.openTimeout {
+			openedLocked := time.Unix(0, b.openedAt.Load())
+			if BreakerState(b.state.Load()) == BreakerOpen && time.Since(openedLocked) >= b.openTimeout {
 				b.state.Store(int32(BreakerHalfOpen))
 				b.probeInFlight.Store(true) // claim the probe slot
 				b.mu.Unlock()

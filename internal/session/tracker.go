@@ -72,6 +72,18 @@ type Session struct {
 	ChallengeAt     time.Time
 	RiskScore       int
 	LastScoreBump   time.Time
+
+	// JA3 fingerprint observed for this session (32-char hash). Carried
+	// through scoring so the admin UI can render "session was flagged due
+	// to ja3=… (curl)" without an extra lookup. JA3Verdict is "good",
+	// "bad", or empty.
+	JA3        string
+	JA3Verdict string
+	JA3Reason  string
+
+	// PoW state. PowPassedAt non-zero means the proof-of-work gate was
+	// cleared and the session is allowed through even at high score.
+	PowPassedAt time.Time
 }
 
 // Snapshot returns a copy safe to expose over the admin API.
@@ -103,6 +115,9 @@ func (s *Session) Snapshot() SessionView {
 		BeaconCount:     s.BeaconCount,
 		ChallengePassed: s.ChallengePassed,
 		RiskScore:       s.RiskScore,
+		JA3:             s.JA3,
+		JA3Verdict:      s.JA3Verdict,
+		PowPassed:       !s.PowPassedAt.IsZero(),
 	}
 }
 
@@ -122,6 +137,9 @@ type SessionView struct {
 	BeaconCount     uint64    `json:"beacon_count"`
 	ChallengePassed bool      `json:"challenge_passed"`
 	RiskScore       int       `json:"risk_score"`
+	JA3             string    `json:"ja3,omitempty"`
+	JA3Verdict      string    `json:"ja3_verdict,omitempty"`
+	PowPassed       bool      `json:"pow_passed"`
 }
 
 // Tracker owns all live sessions.
@@ -330,6 +348,38 @@ func (t *Tracker) RecordBlock(id string) {
 	t.mu.Lock()
 	if s, ok := t.sessions[id]; ok {
 		s.BlockCount++
+	}
+	t.mu.Unlock()
+}
+
+// RecordJA3 attaches a JA3 fingerprint and detector verdict to the session.
+// Idempotent: writing the same hash twice is a no-op so this is cheap to
+// call on every request. Verdict and reason are overwritten on each call
+// so a list reload by the operator takes effect for in-flight sessions.
+func (t *Tracker) RecordJA3(id, hash, verdict, reason string) {
+	if t == nil || id == "" || hash == "" {
+		return
+	}
+	t.mu.Lock()
+	if s, ok := t.sessions[id]; ok {
+		s.JA3 = hash
+		s.JA3Verdict = verdict
+		s.JA3Reason = reason
+	}
+	t.mu.Unlock()
+}
+
+// RecordPowPass marks the session as having cleared the proof-of-work
+// gate. After this point Score() caps the returned value so a high-risk
+// session that solved the challenge isn't immediately re-challenged on
+// the next request.
+func (t *Tracker) RecordPowPass(id string) {
+	if t == nil || id == "" {
+		return
+	}
+	t.mu.Lock()
+	if s, ok := t.sessions[id]; ok {
+		s.PowPassedAt = time.Now().UTC()
 	}
 	t.mu.Unlock()
 }

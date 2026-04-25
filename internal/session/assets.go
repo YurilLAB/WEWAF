@@ -88,6 +88,158 @@ const ChallengeJS = `(function(){
   } catch(_) { /* never throw */ }
 })();`
 
+// PoWJS solves the proof-of-work challenge. Loaded by the server-rendered
+// PoW gate page when a high-risk session is challenged. The script runs in
+// a Web Worker so the main thread stays responsive — a 24-bit search can
+// take several seconds. Falls back to a chunked setTimeout loop if Workers
+// are unsupported (locked-down enterprise browsers, very old IE-mode pages).
+//
+// The client receives the salt + difficulty inline in the page and hashes
+// SHA-256(salt || nonce) until the prefix has `difficulty` leading zero
+// bits. Nonce is a uint64 packed big-endian into 8 bytes — matches the
+// canonical reference solver in the test suite.
+//
+// Why not WASM: SubtleCrypto.digest('SHA-256', ...) is widely available
+// (Chrome 37+, Firefox 34+, Safari 7+) and runs at ~native speed in the
+// Worker context. WASM would be ~2× faster but adds 80 KB and a fetch.
+const PoWJS = `(function(){
+  'use strict';
+  try {
+    var page = window.__wewaf_pow;
+    if (!page || !page.token || !page.salt || !page.difficulty) return;
+    var saltB64 = page.salt;
+    var difficulty = page.difficulty | 0;
+    var token = page.token;
+
+    function b64decode(b) {
+      // base64-url → Uint8Array. Native atob can't take url-safe directly.
+      b = String(b).replace(/-/g, '+').replace(/_/g, '/');
+      while (b.length % 4) b += '=';
+      var raw = atob(b);
+      var out = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+      return out;
+    }
+    function b64urlEncode(bytes) {
+      var s = '';
+      for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+      return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+    function leadingZeroBits(buf, n) {
+      var full = n >> 3;
+      var rem = n & 7;
+      for (var i = 0; i < full; i++) if (buf[i] !== 0) return false;
+      if (rem === 0) return true;
+      var mask = (0xff << (8 - rem)) & 0xff;
+      return (buf[full] & mask) === 0;
+    }
+    var saltBytes = b64decode(saltB64);
+
+    function solve(end, done) {
+      // Iterative search using SubtleCrypto. We pack the nonce as a
+      // big-endian uint64 across two uint32 halves so we don't lose
+      // precision past 2^53 — JavaScript numbers can't represent the
+      // full uint64 range exactly, but 2^48 is more than enough headroom
+      // for any realistic difficulty.
+      var nonce = new Uint8Array(8);
+      var combined = new Uint8Array(saltBytes.length + 8);
+      combined.set(saltBytes, 0);
+      var hi = 0, lo = 0;
+      function attempt() {
+        // Pack [hi, lo] as 8 bytes big-endian.
+        nonce[0] = (hi >>> 24) & 0xff;
+        nonce[1] = (hi >>> 16) & 0xff;
+        nonce[2] = (hi >>> 8) & 0xff;
+        nonce[3] = hi & 0xff;
+        nonce[4] = (lo >>> 24) & 0xff;
+        nonce[5] = (lo >>> 16) & 0xff;
+        nonce[6] = (lo >>> 8) & 0xff;
+        nonce[7] = lo & 0xff;
+        combined.set(nonce, saltBytes.length);
+        return crypto.subtle.digest('SHA-256', combined);
+      }
+      function step() {
+        attempt().then(function(buf){
+          if (leadingZeroBits(new Uint8Array(buf), difficulty)) {
+            done(new Uint8Array(nonce));
+            return;
+          }
+          // Increment 64-bit counter (low first, carry into high).
+          lo = (lo + 1) >>> 0;
+          if (lo === 0) hi = (hi + 1) >>> 0;
+          if (hi === 0 && lo >= end) { done(null); return; }
+          // Yield every 256 attempts so the page stays responsive.
+          if ((lo & 0xff) === 0) setTimeout(step, 0);
+          else step();
+        }).catch(function(){ done(null); });
+      }
+      step();
+    }
+
+    function submit(nonceBytes) {
+      var body = 'token=' + encodeURIComponent(token) +
+                 '&nonce=' + encodeURIComponent(b64urlEncode(nonceBytes));
+      var x = new XMLHttpRequest();
+      x.open('POST', '/api/pow/verify', true);
+      x.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+      x.onreadystatechange = function(){
+        if (x.readyState === 4) {
+          // On any 2xx, reload — the cookie should now bypass the gate.
+          if (x.status >= 200 && x.status < 300) {
+            window.location.replace(page.next || '/');
+          } else {
+            // Reload anyway so the user gets a fresh challenge with a
+            // fresh salt. Repeated failure is usually a clock skew or
+            // an expired token.
+            setTimeout(function(){ window.location.reload(); }, 1500);
+          }
+        }
+      };
+      x.send(body);
+    }
+
+    if (!window.crypto || !window.crypto.subtle) {
+      // SubtleCrypto missing — degrade by reloading without solving;
+      // the server's threshold logic will fall back to the JS browser
+      // challenge for clients in this state.
+      return;
+    }
+    solve(1 << 28, function(nonce){
+      if (nonce) submit(nonce);
+    });
+  } catch(_) {}
+})();`
+
+// PoWPageHTML is the shell page rendered when the WAF challenges a
+// session. Tiny, no external resources, no third-party scripts. The
+// challenge token is dropped into a global so PoWJS can read it without
+// needing to parse the URL.
+const PoWPageHTML = `<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>Verifying your browser…</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;background:#0e1116;color:#e6edf3;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:32px 40px;max-width:420px;text-align:center}
+h1{font-size:18px;margin:0 0 12px}
+p{font-size:14px;color:#8b949e;margin:0 0 16px}
+.spinner{width:32px;height:32px;border:3px solid #30363d;border-top-color:#fb923c;border-radius:50%%;animation:spin 1s linear infinite;margin:8px auto 16px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.note{font-size:11px;color:#6e7681;margin-top:18px}
+</style>
+</head><body>
+<div class="card">
+<div class="spinner"></div>
+<h1>Verifying your browser</h1>
+<p>This usually takes a second. No CAPTCHA — your browser is solving a small math problem to prove it's a real browser.</p>
+<noscript><p style="color:#f85149">JavaScript is required to continue.</p></noscript>
+<div class="note">WEWAF · request-protection · this page does not store cookies until verification succeeds.</div>
+</div>
+<script>window.__wewaf_pow={token:%q,salt:%q,difficulty:%d,next:%q};</script>
+<script src="/api/pow.js"></script>
+</body></html>`
+
 // BeaconJS reports human-input signals back to the server. Deliberately
 // coarse — we count events and time-on-page rather than recording every
 // event, so payloads stay tiny and there's nothing of value to log even

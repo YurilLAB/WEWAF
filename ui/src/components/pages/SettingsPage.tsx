@@ -102,6 +102,16 @@ export default function SettingsPage() {
       if (typeof cfg.hsts_max_age_sec === 'number') updates.hstsMaxAgeSec = cfg.hsts_max_age_sec;
       if (typeof cfg.hsts_include_subdomains === 'boolean') updates.hstsIncludeSubdomains = cfg.hsts_include_subdomains;
       if (typeof cfg.hsts_preload === 'boolean') updates.hstsPreload = cfg.hsts_preload;
+      if (typeof cfg.ja3_enabled === 'boolean') updates.ja3Enabled = cfg.ja3_enabled;
+      if (typeof cfg.ja3_hard_block === 'boolean') updates.ja3HardBlock = cfg.ja3_hard_block;
+      if (typeof cfg.ja3_header === 'string') updates.ja3Header = cfg.ja3_header;
+      if (Array.isArray(cfg.ja3_trusted_sources)) updates.ja3TrustedSources = cfg.ja3_trusted_sources.join(', ');
+      if (typeof cfg.pow_enabled === 'boolean') updates.powEnabled = cfg.pow_enabled;
+      if (typeof cfg.pow_trigger_score === 'number') updates.powTriggerScore = cfg.pow_trigger_score;
+      if (typeof cfg.pow_min_difficulty === 'number') updates.powMinDifficulty = cfg.pow_min_difficulty;
+      if (typeof cfg.pow_max_difficulty === 'number') updates.powMaxDifficulty = cfg.pow_max_difficulty;
+      if (typeof cfg.pow_token_ttl_sec === 'number') updates.powTokenTTLSec = cfg.pow_token_ttl_sec;
+      if (typeof cfg.pow_cookie_ttl_sec === 'number') updates.powCookieTTLSec = cfg.pow_cookie_ttl_sec;
       if (Object.keys(updates).length > 0) {
         setForm((prev) => ({ ...prev, ...updates }));
         dispatch({ type: 'UPDATE_SETTINGS', payload: updates });
@@ -165,6 +175,16 @@ export default function SettingsPage() {
         hsts_max_age_sec: form.hstsMaxAgeSec,
         hsts_include_subdomains: form.hstsIncludeSubdomains,
         hsts_preload: form.hstsPreload,
+        ja3_enabled: form.ja3Enabled,
+        ja3_hard_block: form.ja3HardBlock,
+        ja3_header: form.ja3Header,
+        ja3_trusted_sources: form.ja3TrustedSources.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
+        pow_enabled: form.powEnabled,
+        pow_trigger_score: form.powTriggerScore,
+        pow_min_difficulty: form.powMinDifficulty,
+        pow_max_difficulty: form.powMaxDifficulty,
+        pow_token_ttl_sec: form.powTokenTTLSec,
+        pow_cookie_ttl_sec: form.powCookieTTLSec,
       });
       if (res) {
         dispatch({ type: 'UPDATE_SETTINGS', payload: { ...form } });
@@ -840,6 +860,65 @@ export default function SettingsPage() {
             <input type="checkbox" checked={form.trustXFF} onChange={(e) => setForm({ ...form, trustXFF: e.target.checked })} className="rounded border-waf-border" />
             Trust X-Forwarded-For / X-Real-Ip (only enable when the WAF sits behind a trusted reverse proxy)
           </label>
+
+          {/* JA3 TLS fingerprinting */}
+          <div className="border-t border-waf-border pt-3 mt-3">
+            <p className="text-xs text-waf-text font-medium mb-2">JA3 TLS Fingerprinting</p>
+            <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+              <input type="checkbox" checked={form.ja3Enabled} onChange={(e) => setForm({ ...form, ja3Enabled: e.target.checked })} className="rounded border-waf-border" />
+              Enable JA3 fingerprinting (catches headless automation that passes the browser challenge)
+            </label>
+            {form.ja3Enabled && (
+              <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="space-y-2 pl-6 mt-2">
+                <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+                  <input type="checkbox" checked={form.ja3HardBlock} onChange={(e) => setForm({ ...form, ja3HardBlock: e.target.checked })} className="rounded border-waf-border" />
+                  Hard-block on known-bad fingerprints (default = score-only)
+                </label>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Edge JA3 header (e.g. <code>Cf-Ja3-Hash</code>) — leave blank for native TLS only</label>
+                  <input type="text" value={form.ja3Header} onChange={(e) => setForm({ ...form, ja3Header: e.target.value })} placeholder="Cf-Ja3-Hash" className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Trusted source CIDRs (comma or newline separated) — only sources in this list may set the JA3 header</label>
+                  <textarea value={form.ja3TrustedSources} onChange={(e) => setForm({ ...form, ja3TrustedSources: e.target.value })} rows={2} placeholder="173.245.48.0/20, 103.21.244.0/22" className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+              </motion.div>
+            )}
+          </div>
+
+          {/* Proof-of-work */}
+          <div className="border-t border-waf-border pt-3 mt-3">
+            <p className="text-xs text-waf-text font-medium mb-2">Proof-of-Work Challenge</p>
+            <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+              <input type="checkbox" checked={form.powEnabled} onChange={(e) => setForm({ ...form, powEnabled: e.target.checked })} className="rounded border-waf-border" />
+              Enable PoW challenge for high-risk sessions (no CAPTCHA — browser solves a small math problem)
+            </label>
+            {form.powEnabled && (
+              <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="grid grid-cols-2 md:grid-cols-3 gap-3 pl-6 mt-2">
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Trigger Score (0–100)</label>
+                  <input type="number" min={1} max={100} value={form.powTriggerScore} onChange={(e) => setForm({ ...form, powTriggerScore: Math.max(1, Math.min(100, Number(e.target.value) || 60)) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Min Difficulty (bits)</label>
+                  <input type="number" min={8} max={32} value={form.powMinDifficulty} onChange={(e) => setForm({ ...form, powMinDifficulty: Math.max(8, Math.min(32, Number(e.target.value) || 18)) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Max Difficulty (bits)</label>
+                  <input type="number" min={8} max={32} value={form.powMaxDifficulty} onChange={(e) => setForm({ ...form, powMaxDifficulty: Math.max(8, Math.min(32, Number(e.target.value) || 24)) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Challenge TTL (s)</label>
+                  <input type="number" min={30} max={600} value={form.powTokenTTLSec} onChange={(e) => setForm({ ...form, powTokenTTLSec: Math.max(30, Math.min(600, Number(e.target.value) || 120)) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Pass Cookie TTL (s)</label>
+                  <input type="number" min={60} max={86400} value={form.powCookieTTLSec} onChange={(e) => setForm({ ...form, powCookieTTLSec: Math.max(60, Math.min(86400, Number(e.target.value) || 3600)) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <p className="text-[10px] text-waf-dim col-span-full">18 bits ≈ 1s on a phone, 24 bits ≈ 5–15s. Difficulty scales linearly with score above the trigger.</p>
+              </motion.div>
+            )}
+          </div>
         </div>
       </motion.div>
 

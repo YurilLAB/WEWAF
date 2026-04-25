@@ -562,6 +562,16 @@ export const api = {
     hsts_max_age_sec?: number;
     hsts_include_subdomains?: boolean;
     hsts_preload?: boolean;
+    ja3_enabled?: boolean;
+    ja3_hard_block?: boolean;
+    ja3_header?: string;
+    ja3_trusted_sources?: string[];
+    pow_enabled?: boolean;
+    pow_trigger_score?: number;
+    pow_min_difficulty?: number;
+    pow_max_difficulty?: number;
+    pow_token_ttl_sec?: number;
+    pow_cookie_ttl_sec?: number;
   }) =>
     post<ConfigResponse & { status: string }>('/config', payload),
   getRuleCounters: () => get<{ counters: Record<string, number> }>('/rules/counters'),

@@ -115,12 +115,20 @@ type Detector struct {
 	botMu    sync.Mutex
 	botPaths map[string]map[string]int64
 
+	// Cache-buster detection: per-IP unique query strings on the same
+	// path within a short window. A handful is fine (search filters,
+	// timestamp params); hundreds in a minute is a CDN-exhaustion
+	// attack. Bounded by cbMaxIPs.
+	cbMu  sync.Mutex
+	cbMap map[string]*cacheBusterEntry
+
 	// Counters exposed via StatsSnapshot.
 	totalRequests    atomic.Uint64
 	flaggedVolume    atomic.Uint64
 	flaggedConnRate  atomic.Uint64
 	flaggedSlow      atomic.Uint64
 	flaggedBotnet    atomic.Uint64
+	flaggedCB        atomic.Uint64
 	underAttack      atomic.Bool
 	lastAttackAtUnix atomic.Int64
 }
@@ -133,6 +141,7 @@ const (
 	VerdictVolumetric         // global RPS has spiked; slow everyone
 	VerdictConnRate           // this IP is opening connections too fast
 	VerdictBotnet             // distributed attack shape on a sensitive path
+	VerdictCacheBuster        // single IP hammering one path with rotating querystrings
 )
 
 // New returns a configured detector with defaults filled in.
@@ -220,6 +229,18 @@ func (d *Detector) RecordRequest(ip, path string) Verdict {
 		}
 	}
 	return VerdictOK
+}
+
+// RecordCacheBuster is the entry point for the cache-buster detector.
+// Called by the proxy with the request's path and raw query so we can
+// count distinct query strings per (ip,path). Returns VerdictCacheBuster
+// when the threshold trips. Cheap when the request has no querystring
+// (the common case): we early-return without locking.
+func (d *Detector) RecordCacheBuster(ip, path, rawQuery string) Verdict {
+	if d == nil || rawQuery == "" {
+		return VerdictOK
+	}
+	return d.checkCacheBuster(ip, path, rawQuery)
 }
 
 // RecordSlowRead is called when a body read finishes with the total bytes
@@ -313,23 +334,22 @@ func (d *Detector) checkBotnet(ip, path string) Verdict {
 	defer d.botMu.Unlock()
 
 	if len(d.botPaths) >= d.cfg.BotnetMaxPaths {
-		// Drop the path with the oldest most-recent hit.
-		var oldestPath string
-		var oldestTS int64 = now + 1
-		for p, ips := range d.botPaths {
-			var latest int64
-			for _, ts := range ips {
-				if ts > latest {
-					latest = ts
-				}
-			}
-			if latest < oldestTS {
-				oldestTS = latest
-				oldestPath = p
-			}
+		// Random-drop eviction. The previous "scan every path × every
+		// IP for the oldest" approach is O(P×IPs) under botMu — at the
+		// configured 2048 paths × ~200 IPs each, that's ~400k ops per
+		// eviction on the hot path during the exact attack we're meant
+		// to mitigate. Go map iteration is randomised, so dropping a
+		// few arbitrary entries gives an unbiased sample with O(1) cost.
+		dropBudget := d.cfg.BotnetMaxPaths / 64
+		if dropBudget < 4 {
+			dropBudget = 4
 		}
-		if oldestPath != "" {
-			delete(d.botPaths, oldestPath)
+		for p := range d.botPaths {
+			delete(d.botPaths, p)
+			dropBudget--
+			if dropBudget <= 0 {
+				break
+			}
 		}
 	}
 
@@ -487,6 +507,7 @@ func (d *Detector) StatsSnapshot() map[string]interface{} {
 		"flagged_conn_rate":   d.flaggedConnRate.Load(),
 		"flagged_slow_read":   d.flaggedSlow.Load(),
 		"flagged_botnet":      d.flaggedBotnet.Load(),
+		"flagged_cache_buster": d.flaggedCB.Load(),
 		"under_attack":        d.underAttack.Load(),
 		"last_attack_unix":    d.lastAttackAtUnix.Load(),
 		"adaptive_baseline":   ema,
@@ -494,4 +515,112 @@ func (d *Detector) StatsSnapshot() map[string]interface{} {
 		"spike_windows_req":   d.cfg.SpikeWindowsRequired,
 		"min_absolute_rps":    d.cfg.MinAbsoluteRPS,
 	}
+}
+
+// -----------------------------------------------------------------------------
+// Cache-buster detection
+//
+// A "cache-buster" attack defeats CDN edge caching by appending a random
+// query string to every request. Each request is a unique cache key, so
+// the CDN has to forward to origin — bypassing its primary defence and
+// shifting cost back to the protected service. This is one of the most
+// common low-budget DDoS techniques because the attacker doesn't need a
+// botnet — a single host issuing 100 RPS with `?cb=<random>` overwhelms
+// origins that planned for caching to absorb the load.
+//
+// Detection: per-IP, count distinct querystrings observed against the
+// same path in the last 60 s. Any request with an empty querystring is
+// ignored — that's normal cached traffic. We count distinct rather than
+// total because an attacker rotates the buster every request; legitimate
+// users with `?page=2`, `?sort=asc` etc. plateau at low single digits.
+//
+// Threshold: 60 distinct querystrings on one path/IP/minute. This is
+// well above any reasonable browser session (a search-heavy SPA might
+// produce ~10) and well below what an attacker needs to be effective.
+
+const (
+	cbMaxIPs           = 50_000 // hard cap on per-IP entries (random-drop on overflow)
+	cbMaxPathsPerIP    = 8      // cap on tracked paths per IP
+	cbWindowSeconds    = 60
+	cbDistinctThreshold = 60
+)
+
+type cacheBusterEntry struct {
+	// path -> set of querystrings -> last-seen unix seconds. Bounded:
+	// at cbDistinctThreshold + 1 we reject; pruning happens on each
+	// observation so the set size tracks what's recent.
+	paths map[string]map[string]int64
+}
+
+// checkCacheBuster returns VerdictCacheBuster when the source IP has
+// exceeded cbDistinctThreshold distinct querystrings on a single path
+// within cbWindowSeconds. Bounded memory; safe under high concurrency
+// thanks to a single mutex (operations are O(P + Q) where Q ≤ threshold).
+func (d *Detector) checkCacheBuster(ip, path, query string) Verdict {
+	if d == nil || ip == "" || path == "" || query == "" {
+		return VerdictOK
+	}
+	now := time.Now().Unix()
+	cutoff := now - int64(cbWindowSeconds)
+
+	d.cbMu.Lock()
+	defer d.cbMu.Unlock()
+
+	if d.cbMap == nil {
+		d.cbMap = make(map[string]*cacheBusterEntry, 1024)
+	}
+	if len(d.cbMap) >= cbMaxIPs {
+		// Random-drop eviction matches the rest of the detector's
+		// approach. Map iteration is randomised so this is unbiased.
+		drop := cbMaxIPs / 64
+		for k := range d.cbMap {
+			delete(d.cbMap, k)
+			drop--
+			if drop <= 0 {
+				break
+			}
+		}
+	}
+	ent, ok := d.cbMap[ip]
+	if !ok {
+		ent = &cacheBusterEntry{paths: make(map[string]map[string]int64, 2)}
+		d.cbMap[ip] = ent
+	}
+	if len(ent.paths) >= cbMaxPathsPerIP {
+		// Drop the oldest path (cheap given small cap).
+		var oldestPath string
+		var oldestMax int64 = now + 1
+		for p, qs := range ent.paths {
+			var maxTS int64
+			for _, ts := range qs {
+				if ts > maxTS {
+					maxTS = ts
+				}
+			}
+			if maxTS < oldestMax {
+				oldestMax = maxTS
+				oldestPath = p
+			}
+		}
+		if oldestPath != "" {
+			delete(ent.paths, oldestPath)
+		}
+	}
+	qs, ok := ent.paths[path]
+	if !ok {
+		qs = make(map[string]int64, 4)
+		ent.paths[path] = qs
+	}
+	// Prune stale entries before counting fresh.
+	for q, ts := range qs {
+		if ts < cutoff {
+			delete(qs, q)
+		}
+	}
+	qs[query] = now
+	if len(qs) > cbDistinctThreshold {
+		d.flaggedCB.Add(1)
+		return VerdictCacheBuster
+	}
+	return VerdictOK
 }
