@@ -145,7 +145,7 @@ func TestRotateSessionMovesStateToNewID(t *testing.T) {
 	old := s.ID
 
 	w2 := httptest.NewRecorder()
-	newID := tr.RotateSession(w2, old)
+	newID := tr.RotateSession(w2, old, false)
 	if newID == old {
 		t.Fatal("rotate should produce a new ID")
 	}
@@ -193,7 +193,7 @@ func TestChallengeCookieRoundTrip(t *testing.T) {
 	tr := NewTracker(Config{Enabled: true})
 	defer tr.Stop()
 
-	c, value := tr.IssueChallengeCookie()
+	c, value := tr.IssueChallengeCookie(false)
 	if c.Name != ChallengeCookieName {
 		t.Fatalf("wrong cookie name: %q", c.Name)
 	}

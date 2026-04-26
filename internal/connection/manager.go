@@ -13,6 +13,7 @@ package connection
 
 import (
 	"context"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -187,6 +188,13 @@ func (m *Manager) Probe(ctx context.Context) Status {
 		if err == nil {
 			resp, err := client.Do(req)
 			if err == nil {
+				// Drain before close: HTTP/2 (and keep-alive HTTP/1.1) only
+				// reuses the connection when the response body has been
+				// consumed. A 200 with a 1 KB body that we never read
+				// leaves a dangling RST that fires on the next probe,
+				// flapping the gauge. Bound the drain at 4 KB so a
+				// misbehaving backend can't tarpit us.
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 				resp.Body.Close()
 				// Any response — even a 5xx — means the backend is reachable.
 				ok = true

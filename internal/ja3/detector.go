@@ -78,6 +78,55 @@ func (d *Detector) SetLists(bad, good map[string]string) {
 	}
 }
 
+// MergeBad adds entries to the bad list without touching the good list.
+// Used by the intel-feed package to layer external sources on top of the
+// curated defaults. Existing entries with the same hash are kept (the
+// curated default reason wins over a feed's terse description).
+func (d *Detector) MergeBad(entries map[string]string) int {
+	if d == nil || len(entries) == 0 {
+		return 0
+	}
+	added := 0
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for k, v := range entries {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k == "" {
+			continue
+		}
+		if _, exists := d.bad[k]; exists {
+			continue
+		}
+		d.bad[k] = v
+		added++
+	}
+	return added
+}
+
+// MergeGood is the dual of MergeBad for the allow-list. Important for FP
+// minimization — feeds (or operator overrides) can add known-good
+// fingerprints without rewriting the curated defaults.
+func (d *Detector) MergeGood(entries map[string]string) int {
+	if d == nil || len(entries) == 0 {
+		return 0
+	}
+	added := 0
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for k, v := range entries {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k == "" {
+			continue
+		}
+		if _, exists := d.good[k]; exists {
+			continue
+		}
+		d.good[k] = v
+		added++
+	}
+	return added
+}
+
 // Evaluate returns a verdict for the given hash. Empty hash returns a
 // no-op verdict so callers can pass through cleanly when a fingerprint
 // wasn't available. The "good" list takes precedence so a legitimate
@@ -106,6 +155,77 @@ func (d *Detector) Evaluate(hash string) Verdict {
 	}
 	d.mu.RUnlock()
 	return Verdict{Hash: hash}
+}
+
+// EvaluateAll evaluates every fingerprint variant on the same Fingerprint
+// (JA3, JA3N, JA4) against the curated lists. Priority order:
+//
+//  1. ANY "good" match short-circuits to Match=good (we never bump score
+//     on a known-good client even if one of its variants collides with
+//     a bad hash — the false-positive cost dominates here).
+//  2. Otherwise return the first "bad" match found, with the matched
+//     hash variant noted in Hash and the reason annotated with the
+//     variant name (e.g. "ja4: curl 8.x default").
+//  3. Otherwise no match.
+//
+// This is the recommended entry point for proxy code; Evaluate(hash) is
+// retained for callers that only have one variant.
+func (d *Detector) EvaluateAll(fp Fingerprint) Verdict {
+	if d == nil {
+		return Verdict{}
+	}
+	d.checks.Add(1)
+	variants := [...]struct {
+		hash string
+		tag  string
+	}{
+		{strings.ToLower(fp.Hash), "ja3"},
+		{strings.ToLower(fp.JA3N), "ja3n"},
+		{strings.ToLower(fp.JA4), "ja4"},
+	}
+
+	d.mu.RLock()
+	// Pass 1: any good wins.
+	for _, v := range variants {
+		if v.hash == "" {
+			continue
+		}
+		if reason, ok := d.good[v.hash]; ok {
+			d.mu.RUnlock()
+			d.matchOK.Add(1)
+			return Verdict{Hash: v.hash, Match: "good", Reason: v.tag + ": " + reason}
+		}
+	}
+	// Pass 2: first bad.
+	for _, v := range variants {
+		if v.hash == "" {
+			continue
+		}
+		if reason, ok := d.bad[v.hash]; ok {
+			d.mu.RUnlock()
+			d.matchBad.Add(1)
+			ver := Verdict{Hash: v.hash, Match: "bad", Reason: v.tag + ": " + reason}
+			if d.hardBlock.Load() {
+				ver.Blocked = true
+				d.blocked.Add(1)
+			}
+			return ver
+		}
+	}
+	d.mu.RUnlock()
+
+	// Return the most useful "no match" hash — prefer JA4, then JA3N, then JA3.
+	for _, v := range variants[2:] {
+		if v.hash != "" {
+			return Verdict{Hash: v.hash}
+		}
+	}
+	for _, v := range variants[1:2] {
+		if v.hash != "" {
+			return Verdict{Hash: v.hash}
+		}
+	}
+	return Verdict{Hash: variants[0].hash}
 }
 
 // DetectorStats is the snapshot returned to the admin UI.

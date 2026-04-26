@@ -98,8 +98,9 @@ type Chain struct {
 	ringSize  int // populated slots, up to ringMax
 
 	// Stats — surfaced to the admin API.
-	statsAppends atomic.Uint64
+	statsAppends     atomic.Uint64
 	statsVerifyFails atomic.Uint64
+	firstBadSeq      atomic.Uint64 // 0 = clean chain
 }
 
 // Config tunes a Chain. Zero/empty fields get sane defaults.
@@ -165,7 +166,12 @@ func New(cfg Config) (*Chain, error) {
 // can, and sets c.seq / c.prevMAC so further Appends land on the right
 // link. A truncated trailing line is tolerated (power-loss during write
 // is a real scenario); a bad MAC mid-stream is surfaced via
-// statsVerifyFails so operators see it on the admin UI.
+// statsVerifyFails AND firstBadSeq so operators see it on the admin UI.
+//
+// Note: after the first MAC mismatch, every subsequent entry will also
+// fail (the chain is broken once tampered) — we still scan to the end
+// so the in-memory ring is populated, but only the FIRST bad seq is
+// recorded so it stands out cleanly in the dashboard.
 func (c *Chain) resume(f *os.File) error {
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -177,6 +183,7 @@ func (c *Chain) resume(f *os.File) error {
 		lastSeq uint64
 		lastMAC string
 		prev    string
+		seenBad bool
 	)
 	for sc.Scan() {
 		var e Entry
@@ -188,11 +195,11 @@ func (c *Chain) resume(f *os.File) error {
 		// Verify against the prev we've tracked so far.
 		want := c.computeMAC(&e, prev)
 		if !hmac.Equal([]byte(want), []byte(e.MAC)) {
+			if !seenBad {
+				c.firstBadSeq.Store(e.Seq)
+				seenBad = true
+			}
 			c.statsVerifyFails.Add(1)
-			// Don't halt resume — keep reading so statsVerifyFails
-			// accumulates across the whole file. But prev still has
-			// to advance along the stored chain or everything after
-			// the bad entry would also fail.
 		}
 		c.pushRing(e)
 		lastSeq = e.Seq
@@ -235,30 +242,35 @@ func (c *Chain) computeMAC(e *Entry, prev string) string {
 }
 
 // Append writes a new entry. Never returns an error for the MAC
-// computation itself; a returned error means the file write failed. The
-// Entry is still recorded in the in-memory ring in that case so the
-// admin UI tail endpoint reflects reality.
+// computation itself; a returned error means the file write failed.
+//
+// IMPORTANT: c.seq and c.prevMAC are only committed after a successful
+// disk write (or when running in memory-only mode). Without this, a
+// failed write would leave the in-memory chain pointing past an entry
+// that doesn't exist on disk — causing every subsequent entry's PrevMAC
+// to mis-link against the on-disk record. The cost is one extra write
+// of the previous values into local variables; the safety win is
+// clean-recovery from a transient I/O error.
 func (c *Chain) Append(kind, actor, message, metaJSON string) (Entry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.seq++
+	prevSeq := c.seq
+	prevMAC := c.prevMAC
 	e := Entry{
-		Seq:       c.seq,
+		Seq:       prevSeq + 1,
 		Timestamp: time.Now().UTC(),
 		Kind:      kind,
 		Actor:     actor,
 		Message:   message,
 		Meta:      metaJSON,
-		PrevMAC:   c.prevMAC,
+		PrevMAC:   prevMAC,
 	}
-	e.MAC = c.computeMAC(&e, c.prevMAC)
-	c.prevMAC = e.MAC
-	c.pushRingLocked(e)
-	c.statsAppends.Add(1)
+	e.MAC = c.computeMAC(&e, prevMAC)
 
 	if c.bw != nil {
 		buf, err := json.Marshal(&e)
 		if err != nil {
+			// State unchanged — a retry will reuse the same seq + prevMAC.
 			return e, fmt.Errorf("audit: marshal: %w", err)
 		}
 		buf = append(buf, '\n')
@@ -271,6 +283,12 @@ func (c *Chain) Append(kind, actor, message, metaJSON string) (Entry, error) {
 			return e, fmt.Errorf("audit: flush: %w", err)
 		}
 	}
+
+	// Commit chain state only after a successful write (or when memory-only).
+	c.seq = e.Seq
+	c.prevMAC = e.MAC
+	c.pushRingLocked(e)
+	c.statsAppends.Add(1)
 	return e, nil
 }
 
@@ -331,14 +349,24 @@ func (c *Chain) verifyFromFileLocked() (ok bool, badSeq uint64, total uint64) {
 }
 
 func (c *Chain) verifyFromRingLocked() (ok bool, badSeq uint64, total uint64) {
-	var prev string
-	// Iterate in seq order — the ring is circular, so the oldest slot
-	// follows the newest one modulo capacity.
 	count := c.ringSize
 	if count == 0 {
 		return true, 0, 0
 	}
+	// Iterate in seq order — the ring is circular, so the oldest slot
+	// follows the newest one modulo capacity. Once the ring has wrapped
+	// past seq 1 the oldest entry's PrevMAC is whatever came before it
+	// on disk; we can't recompute that here, so bootstrap `prev` from
+	// the oldest visible entry's stored PrevMAC. We still verify each
+	// entry's MAC matches its declared payload + PrevMAC and that the
+	// chain links forward consistently — what the in-memory verifier
+	// can soundly check. A tamperer who edits an entry inside the ring
+	// is still caught by the MAC mismatch on the entry they touched.
+	// Without this bootstrap, a clean wrapped ring was reported as
+	// corrupt because the loop started prev="" while the oldest
+	// entry's PrevMAC was the MAC of the (already evicted) prior seq.
 	start := (c.ringHead - count + c.ringMax) % c.ringMax
+	prev := c.ring[start].PrevMAC
 	for i := 0; i < count; i++ {
 		e := c.ring[(start+i)%c.ringMax]
 		total++
@@ -377,6 +405,13 @@ func (c *Chain) Tail(n int) []Entry {
 // Stats returns cumulative counters.
 func (c *Chain) Stats() (appends uint64, verifyFails uint64) {
 	return c.statsAppends.Load(), c.statsVerifyFails.Load()
+}
+
+// FirstBadSeq returns the seq number of the first entry that failed MAC
+// validation during resume(), or 0 if the chain was clean. Surfaced via
+// the admin /api/audit/stats so operators can audit corruption windows.
+func (c *Chain) FirstBadSeq() uint64 {
+	return c.firstBadSeq.Load()
 }
 
 // Close flushes + closes the backing file. Safe to call multiple times.

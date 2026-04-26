@@ -572,8 +572,27 @@ export const api = {
     pow_max_difficulty?: number;
     pow_token_ttl_sec?: number;
     pow_cookie_ttl_sec?: number;
+    pow_adaptive_enabled?: boolean;
+    pow_adaptive_tier2_failures?: number;
+    pow_adaptive_tier2_penalty_bits?: number;
+    multi_limit_enabled?: boolean;
+    multi_limit_window_sec?: number;
+    multi_limit_ip_rpm?: number;
+    multi_limit_ja4_rpm?: number;
+    multi_limit_cookie_rpm?: number;
+    multi_limit_cookie_name?: string;
+    multi_limit_query_rpm?: number;
+    multi_limit_max_entries?: number;
+    intel_feeds_enabled?: boolean;
+    intel_feeds_cache_dir?: string;
+    intel_feeds_learning_hours?: number;
+    intel_feeds_allow_sources?: string[];
   }) =>
     post<ConfigResponse & { status: string }>('/config', payload),
+  // Threat-intel feed health, multi-limiter, adaptive PoW stats.
+  getIntelStats: () => get<{ enabled: boolean; learning_hours?: number; total_fetches?: number; total_failures?: number; total_entries?: number; sources?: Array<{ name: string; url: string; confidence: string; license: string; last_fetch: string; last_success: string; last_error?: string; total_fetches: number; total_success: number; total_failures: number; consecutive_failures: number; last_entries: number; last_bytes: number }> }>('/intel/stats'),
+  getMultiLimitStats: () => get<{ enabled: boolean; window_sec?: number; tracked?: number; cap?: number; checks?: number; allowed?: number; blocked?: number; dropped?: number; blocked_by_dim?: Record<string, number>; budgets?: Record<string, number>; cookie_name?: string }>('/multilimit/stats'),
+  getPoWAdaptiveStats: () => get<{ enabled: boolean; ips_tracked?: number; tier_bumps?: number; total_queries?: number; load_hint?: number; tier2_failures?: number; tier2_penalty_bits?: number }>('/pow/adaptive'),
   getRuleCounters: () => get<{ counters: Record<string, number> }>('/rules/counters'),
 
   // Sessions + browser integrity.

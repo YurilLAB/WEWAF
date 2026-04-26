@@ -5,6 +5,7 @@ package ssl
 
 import (
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -136,6 +137,15 @@ func (m *Manager) Upload(req UploadRequest) (Certificate, error) {
 	if req.Domain == "" || req.CertPEM == "" || req.KeyPEM == "" {
 		return Certificate{}, errors.New("ssl: domain, cert_pem, and key_pem are required")
 	}
+	// Bound the inputs so a typo or malicious admin can't write a 1 GB
+	// "key" file to disk and parse it. A real PEM cert/key chain is at
+	// most a few KB; 256 KB is a generous ceiling.
+	if len(req.CertPEM) > 256*1024 || len(req.KeyPEM) > 256*1024 {
+		return Certificate{}, errors.New("ssl: cert_pem / key_pem too large")
+	}
+	if len(req.Domain) > 253 {
+		return Certificate{}, errors.New("ssl: domain too long")
+	}
 	block, _ := pem.Decode([]byte(req.CertPEM))
 	if block == nil {
 		return Certificate{}, errors.New("ssl: cert_pem is not valid PEM")
@@ -144,10 +154,25 @@ func (m *Manager) Upload(req UploadRequest) (Certificate, error) {
 	if err != nil {
 		return Certificate{}, fmt.Errorf("ssl: parse cert: %w", err)
 	}
+	// Validate the key by parsing it AND confirm it matches the cert.
+	// The previous code wrote the key bytes verbatim with no checks,
+	// meaning an admin could store arbitrary content (or, more likely,
+	// a mismatched key from a different cert) and the failure would
+	// only surface much later when the TLS listener loaded the pair.
+	keyBlock, _ := pem.Decode([]byte(req.KeyPEM))
+	if keyBlock == nil {
+		return Certificate{}, errors.New("ssl: key_pem is not valid PEM")
+	}
+	if _, err := tls.X509KeyPair([]byte(req.CertPEM), []byte(req.KeyPEM)); err != nil {
+		return Certificate{}, fmt.Errorf("ssl: cert and key do not match: %w", err)
+	}
+	if err := x.VerifyHostname(req.Domain); err != nil {
+		return Certificate{}, fmt.Errorf("ssl: cert does not cover domain %q: %w", req.Domain, err)
+	}
 	sum := sha256.Sum256(x.Raw)
 	fp := hex.EncodeToString(sum[:])
 	cert := Certificate{
-		ID:          fp[:16],
+		ID:          fp, // full fingerprint as ID — 64-bit truncation invited collisions
 		Domain:      req.Domain,
 		Issuer:      x.Issuer.CommonName,
 		NotBefore:   x.NotBefore,

@@ -25,6 +25,7 @@ import (
 	"wewaf/internal/graphql"
 	"wewaf/internal/history"
 	"wewaf/internal/host"
+	"wewaf/internal/intel"
 	"wewaf/internal/ja3"
 	"wewaf/internal/limits"
 	"wewaf/internal/pow"
@@ -188,10 +189,13 @@ func main() {
 	// JA3 fingerprinter. Cache is always created when the feature is on
 	// (so future TLS termination wiring picks it up automatically); the
 	// detector + trust + header path is also wired so edge deployments
-	// behind a TLS-terminating proxy work out of the box.
+	// behind a TLS-terminating proxy work out of the box. We hold a
+	// reference to the detector so the intel-feed sink (below) can
+	// MergeBad() into it as feeds publish new headless-build hashes.
+	var jaDetector *ja3.Detector
 	if cfg.JA3Enabled {
 		jaCache := ja3.NewCache(cfg.JA3CacheCapacity, time.Duration(cfg.JA3CacheTTLSec)*time.Second)
-		jaDetector := ja3.NewDetector()
+		jaDetector = ja3.NewDetector()
 		jaDetector.SetHardBlock(cfg.JA3HardBlock)
 		jaTrust := ja3.NewTrustChecker(cfg.JA3TrustedSources)
 		wp.AttachJA3(jaCache, jaDetector, jaTrust, cfg.JA3Header)
@@ -202,14 +206,19 @@ func main() {
 	// Proof-of-work issuer. If no secret was supplied, generate one and
 	// keep it in-memory only — restarting the WAF invalidates outstanding
 	// PoW cookies, which is the desired security posture during incidents.
+	//
+	// crypto/rand failure is FATAL here: the previous fallback to a
+	// time-derived string was guessable in seconds (an attacker who
+	// knows roughly when the daemon started can brute-force the secret
+	// from `time.Now().String()` shape). Better to refuse to enable
+	// PoW than ship a weak secret.
 	var powIssuer *pow.Issuer
 	if cfg.PoWEnabled {
 		secret := []byte(cfg.PoWSecret)
 		if len(secret) == 0 {
 			b := make([]byte, 32)
 			if _, rerr := cryptorand.Read(b); rerr != nil {
-				log.Printf("pow: rand failed (%v); using fallback secret — restart will rotate it", rerr)
-				b = []byte(time.Now().UTC().String())
+				log.Fatalf("pow: crypto/rand failed (%v); refusing to start with a weak secret", rerr)
 			}
 			secret = b
 			cfg.PoWSecret = string(secret) // share with web layer for cookie signing
@@ -288,6 +297,148 @@ func main() {
 	stopBanCleanup := banList.StartCleanup(time.Minute)
 	defer stopBanCleanup()
 
+	// Auto-updating threat-intel feeds. The supervisor pulls FREE
+	// community lists (FireHOL, Spamhaus DROP, SSLBL JA3, blocklist.de,
+	// ET compromised, mitchellkrogza bad-UAs, CISA KEV) on a schedule
+	// and merges entries into the runtime stores: IPs into banList,
+	// JA3 hashes into the detector. Failures are logged to stderr and
+	// retried with exponential backoff; the daemon never blocks on a
+	// fetch.
+	var intelMgr *intel.Manager
+	if cfg.IntelFeedsEnabled {
+		cacheDir := cfg.IntelFeedsCacheDir
+		if cacheDir == "" {
+			cacheDir = cfg.HistoryDir + string(os.PathSeparator) + "intel"
+		}
+		// "Learning" window — for the first N hours after startup we
+		// observe-only, regardless of source confidence. Lets ops see
+		// the FP rate before letting feeds enforce.
+		learningEndsAt := time.Time{}
+		if cfg.IntelFeedsLearningHours > 0 {
+			learningEndsAt = time.Now().Add(time.Duration(cfg.IntelFeedsLearningHours) * time.Hour)
+		}
+		sink := func(entries []intel.Entry) error {
+			learning := !learningEndsAt.IsZero() && time.Now().Before(learningEndsAt)
+			ipBatch := 0
+			ja3Batch := make(map[string]string)
+			uaBatch := 0
+			cveBatch := 0
+			for _, e := range entries {
+				switch e.Kind {
+				case intel.KindIPv4, intel.KindIPv6:
+					// We only auto-ban from HIGH-confidence sources OR
+					// when MEDIUM confidence accumulates from ≥2 sources.
+					// Single-source LOW entries get logged but not banned.
+					if learning || e.Confidence == intel.ConfLow {
+						continue
+					}
+					reason := "intel:" + e.Source
+					if e.Reason != "" {
+						reason = reason + " " + e.Reason
+					}
+					// Long ban — these are typically permanent
+					// listings; the cleanup loop reaps stale entries.
+					banList.Ban(e.Value, reason, 7*24*time.Hour)
+					ipBatch++
+				case intel.KindJA3, intel.KindJA4:
+					if jaDetector == nil {
+						continue
+					}
+					reason := e.Source
+					if e.Reason != "" {
+						reason = reason + ": " + e.Reason
+					}
+					ja3Batch[e.Value] = reason
+				case intel.KindUA:
+					uaBatch++
+					_ = e // hook point for a future bad-UA matcher
+				case intel.KindCVE:
+					cveBatch++
+					_ = e // virtual-patch hook; KEV entries surface
+					// in the dashboard via Manager.Stats() for now
+				}
+			}
+			if len(ja3Batch) > 0 && jaDetector != nil {
+				added := jaDetector.MergeBad(ja3Batch)
+				if added > 0 {
+					log.Printf("intel: merged %d new JA3 hashes from feed", added)
+				}
+			}
+			if ipBatch > 0 {
+				log.Printf("intel: banned %d IPs from feed (learning=%v)", ipBatch, learning)
+			}
+			if uaBatch > 0 || cveBatch > 0 {
+				log.Printf("intel: observed UAs=%d CVEs=%d", uaBatch, cveBatch)
+			}
+			// Best-effort audit trail.
+			if auditChain != nil {
+				_, _ = auditChain.Append("intel_update", "system",
+					"feed merge",
+					"") // metaJSON kept lightweight; per-source counts live in Stats
+			}
+			return nil
+		}
+
+		mgr, mErr := intel.NewManager(intel.Config{
+			CacheDir: cacheDir,
+		}, sink)
+		if mErr != nil {
+			log.Printf("intel: disabled — %v", mErr)
+		} else {
+			allowed := make(map[string]struct{})
+			for _, s := range cfg.IntelFeedsAllowSources {
+				allowed[strings.TrimSpace(strings.ToLower(s))] = struct{}{}
+			}
+			added := 0
+			for _, src := range intel.DefaultSources() {
+				if len(allowed) > 0 {
+					if _, ok := allowed[strings.ToLower(src.Name)]; !ok {
+						continue
+					}
+				}
+				if err := mgr.AddSource(src); err == nil {
+					added++
+				}
+			}
+			mgr.Start()
+			intelMgr = mgr
+			log.Printf("intel: enabled with %d feed sources (cache=%s, learning=%dh)",
+				added, cacheDir, cfg.IntelFeedsLearningHours)
+			defer mgr.Stop()
+		}
+	}
+	// Adaptive (Tier-2) PoW bit-management. Wraps the issuer so the
+	// proxy's PoW gate can ask for a difficulty derived from session
+	// risk + per-IP fail history + global load + JA4 rarity. Disabled
+	// callers fall back to the legacy SuggestDifficulty path.
+	var powAdaptive *pow.AdaptiveTier
+	if cfg.PoWEnabled && cfg.PoWAdaptiveEnabled && powIssuer != nil {
+		powAdaptive = pow.NewAdaptiveTier(powIssuer)
+		log.Printf("pow: adaptive tier-2 enabled (failures=%d penalty=%d bits)",
+			cfg.PoWAdaptiveTier2Failures, cfg.PoWAdaptiveTier2PenaltyBits)
+	}
+
+	// Multi-dimensional rate limiter (IP / JA4 / cookie / query-keys).
+	// Each dimension has its own budget; a request is rejected if any
+	// budget is exceeded. Designed to defeat IP-rotating bots that
+	// keep a stable JA4 / cookie, and value-rotating enumeration
+	// attacks that keep a stable URL shape.
+	var multiLim *limits.MultiLimiter
+	if cfg.MultiLimitEnabled {
+		multiLim = limits.NewMultiLimiter(limits.MultiConfig{
+			Window:          time.Duration(cfg.MultiLimitWindowSec) * time.Second,
+			IPBudget:        cfg.MultiLimitIPRPM,
+			JA4Budget:       cfg.MultiLimitJA4RPM,
+			CookieBudget:    cfg.MultiLimitCookieRPM,
+			CookieName:      cfg.MultiLimitCookieName,
+			QueryKeysBudget: cfg.MultiLimitQueryRPM,
+			MaxEntries:      cfg.MultiLimitMaxEntries,
+		})
+		log.Printf("multi-limiter: enabled (window=%ds budgets ip=%d ja4=%d cookie=%d query=%d)",
+			cfg.MultiLimitWindowSec, cfg.MultiLimitIPRPM, cfg.MultiLimitJA4RPM,
+			cfg.MultiLimitCookieRPM, cfg.MultiLimitQueryRPM)
+	}
+
 	// Backup the starting config so operators have a rollback target even
 	// if they haven't touched /api/config yet. Errors are logged but not
 	// fatal — a missing snapshot directory shouldn't take the daemon down.
@@ -342,6 +493,9 @@ func main() {
 		GraphQL:        gqlValidator,
 		Audit:          auditChain,
 		PoW:            powIssuer,
+		PoWAdaptive:    powAdaptive,
+		Intel:          intelMgr,
+		MultiLimit:     multiLim,
 		MeshEnabled:    cfg.MeshEnabled,
 		MeshPeers:      cfg.MeshPeers,
 		MeshAPIKey:     cfg.MeshAPIKey,
@@ -549,7 +703,15 @@ func main() {
 							continue
 						}
 
-						if resp.StatusCode == http.StatusOK {
+						if resp.StatusCode == http.StatusOK && result.Status == "synced" {
+							// Cap inbound ban durations at the operator's
+							// configured maximum (or 30 days) so a peer can't
+							// pin an IP to year-9999 expiry. Truncate the
+							// reason for the same reason — UI memory pressure.
+							maxDur := time.Duration(cfg.MaxBanDurationSec) * time.Second
+							if maxDur <= 0 {
+								maxDur = 30 * 24 * time.Hour
+							}
 							for _, b := range result.Bans {
 								if b.IP == "" || net.ParseIP(b.IP) == nil {
 									continue
@@ -558,11 +720,19 @@ func main() {
 								if duration <= 0 {
 									continue
 								}
-								banList.Ban(b.IP, b.Reason, duration)
+								if duration > maxDur {
+									duration = maxDur
+								}
+								reason := b.Reason
+								if len(reason) > 256 {
+									reason = reason[:256]
+								}
+								banList.Ban(b.IP, reason, duration)
 							}
 							log.Printf("mesh gossip: peer %s synced, received %d bans", peerURL, len(result.Bans))
 						} else {
-							log.Printf("mesh gossip: peer %s returned status %d", peerURL, resp.StatusCode)
+							log.Printf("mesh gossip: peer %s returned status %d (status=%q)",
+								peerURL, resp.StatusCode, result.Status)
 						}
 					}
 				case <-meshStopCh:

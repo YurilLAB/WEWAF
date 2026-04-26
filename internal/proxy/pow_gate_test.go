@@ -22,7 +22,7 @@ func signCookie(secret, id string, ts int64) string {
 	body := id + "." + strconv.FormatInt(ts, 10)
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:12])
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return body + "." + sig
 }
 

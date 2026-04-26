@@ -364,6 +364,10 @@ func DefaultRules() []core.Rule {
 		// --- Headers / Cookie abuse ---
 		{ID: "HDR-001", Name: "Host Header Injection", Phase: core.PhaseRequestHeaders, Score: 50, Action: core.ActionBlock, Description: "CRLF or URL in Host header", Targets: []string{"headers.Host"}, Pattern: `[\r\n]|(?i)https?://`},
 		{ID: "HDR-002", Name: "Forwarded Header Spoof", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "Forwarded with SSRF-range host", Targets: []string{"headers.X-Forwarded-For", "headers.Forwarded"}, Pattern: `(?i)(?:127\.|0\.0\.0\.0|169\.254\.|10\.|192\.168\.|::1|localhost|metadata)`},
+		// RE2 caps {n,} at < 1000, so we chain .{1000} four times to
+		// match any value of length ≥ 4000. Explicitly NOT lowering
+		// the per-segment count below 1000 — that would push CPU into
+		// false-positive territory on legitimate large session cookies.
 		{ID: "HDR-003", Name: "Oversized Cookie Header", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Cookie header >4KB used in scanner probes", Targets: []string{"headers.Cookie"}, Pattern: `.{1000}.{1000}.{1000}.{1000}`},
 
 		// --- Path traversal / file inclusion variants ---
@@ -390,6 +394,8 @@ func DefaultRules() []core.Rule {
 		// the log. The CRS equivalent uses SecLang chaining across method +
 		// Content-Length headers, which needs engine-level support we don't
 		// have; if the structural check ever lands it should come back.
+		// As HDR-003: RE2's {n,} cap forces the chained-segment form to
+		// match a length-≥-2000 string.
 		{ID: "ANOM-002", Name: "Long URL", Phase: core.PhaseRequestHeaders, Score: 25, Action: core.ActionLog, Description: "URL longer than 2000 chars — likely fuzzing", Targets: []string{"uri"}, Pattern: `.{1000}.{1000}`},
 		{ID: "ANOM-003", Name: "Null byte in URL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Null byte in URL — parser confusion", Targets: []string{"uri", "path", "args"}, Pattern: `\x00|%00|\\x00|\\u0000`},
 

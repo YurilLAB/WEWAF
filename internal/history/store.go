@@ -292,8 +292,14 @@ func (s *Store) writerLoop(ctx context.Context) {
 	defer close(s.doneCh)
 	defer func() {
 		if rec := recover(); rec != nil {
-			// Best-effort: any panic in the writer must not take the process down.
-			_ = rec
+			// Any panic in the writer must NOT take the process down,
+			// but it MUST be visible — silently swallowing makes future
+			// "events stop arriving in the dashboard" debugging
+			// impossible. Log to stderr (the only path that's always
+			// available; the logger may be one of the things that
+			// panicked) and bump dropped so the gauge moves.
+			fmt.Fprintf(os.Stderr, "history: writer goroutine panicked: %v\n", rec)
+			s.droppedEvents.Add(1)
 		}
 	}()
 
@@ -428,24 +434,26 @@ func (s *Store) maybeRotate() {
 }
 
 func (s *Store) rotate() error {
+	// Finalise + reopen under a single lock acquisition so writeBatch
+	// never observes s.db == nil mid-rotation. The old code dropped the
+	// lock between Close and openOrCreateCurrent, which left a tiny
+	// (but real) window where a concurrent batch acquired RLock, saw
+	// s.db == nil, and dropped its events with "history: db is closed".
 	s.mu.Lock()
-	// Finalise current.
 	if s.db != nil {
 		s.finaliseMetadataLocked()
 		_ = s.db.Close()
 		s.db = nil
 	}
 	listeners := append([]RotationListener(nil), s.listeners...)
-	s.mu.Unlock()
-
-	if err := s.openOrCreateCurrent(); err != nil {
+	if err := s.openOrCreateCurrentLocked(); err != nil {
+		s.mu.Unlock()
 		return err
 	}
-	s.rotations.Add(1)
-
-	s.mu.RLock()
 	newStart := s.startedAt
-	s.mu.RUnlock()
+	s.mu.Unlock()
+
+	s.rotations.Add(1)
 	for _, fn := range listeners {
 		func() {
 			defer func() { _ = recover() }()
@@ -460,7 +468,14 @@ func (s *Store) rotate() error {
 func (s *Store) openOrCreateCurrent() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.openOrCreateCurrentLocked()
+}
 
+// openOrCreateCurrentLocked is the body of openOrCreateCurrent for callers
+// that already hold s.mu (rotate). Splitting it out lets rotate hold the
+// write lock continuously across close-and-reopen so writeBatch never
+// observes a transient nil s.db.
+func (s *Store) openOrCreateCurrentLocked() error {
 	existing, err := s.listDatabasesLocked()
 	if err == nil && len(existing) > 0 {
 		latest := existing[len(existing)-1]

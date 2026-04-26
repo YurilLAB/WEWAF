@@ -126,12 +126,15 @@ func (s *Server) handleBrowserChallengeVerify(w http.ResponseWriter, r *http.Req
 	if s.sessions != nil && s.sessions.Enabled() {
 		sess := s.sessions.EnsureSession(w, r)
 		if passed && sess != nil {
-			c, _ := s.sessions.IssueChallengeCookie()
+			secure := r.TLS != nil ||
+				strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") ||
+				strings.EqualFold(r.Header.Get("X-Forwarded-Ssl"), "on")
+			c, _ := s.sessions.IssueChallengeCookie(secure)
 			http.SetCookie(w, c)
 			// Rotate the session ID before recording the pass so any
 			// pre-challenge ID an attacker might have planted becomes
 			// invalid — classic session-fixation defence.
-			newID := s.sessions.RotateSession(w, sess.ID)
+			newID := s.sessions.RotateSession(w, sess.ID, secure)
 			s.sessions.RecordChallengePass(newID)
 		}
 	}
@@ -316,10 +319,13 @@ func (s *Server) renderPowChallenge(w http.ResponseWriter, r *http.Request) bool
 	if r.URL.RawQuery != "" {
 		next += "?" + r.URL.RawQuery
 	}
-	// %q-escapes everything we splice into the script tag, including
-	// any quote characters in the request path. Defends against XSS via
-	// the `next` URL segment.
-	fmt.Fprintf(w, session.PoWPageHTML, ser, saltB64, difficulty, next)
+	// JSON-encode each value so they're safe to inline inside a
+	// <script> tag. Go's %q does not escape the `</script>` sequence
+	// or the < > & metacharacters; an attacker controlling `next` (the
+	// reflected request path) could otherwise close the script tag and
+	// inject arbitrary JS into the gate page.
+	tokenJS, saltJS, nextJS := session.PoWPageInjectValues(ser, saltB64, next)
+	fmt.Fprintf(w, session.PoWPageHTML, tokenJS, saltJS, difficulty, nextJS)
 	return true
 }
 
@@ -377,11 +383,23 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 	// Success: emit a signed cookie that proves PoW pass for the
 	// session's natural cookie lifetime, capped at 1 hour.
 	cookieValue := signPowCookie(s.cfg.PoWSecret, verified.ID, time.Now().Unix())
+	if cookieValue == "" {
+		// PoWSecret was empty — refuse to issue rather than fall back
+		// to a hardcoded constant (the previous bug). PoWSecret is
+		// auto-generated at startup so reaching this branch indicates
+		// a serious mis-configuration.
+		http.Error(w, "pow secret not configured", http.StatusServiceUnavailable)
+		return
+	}
+	secure := r.TLS != nil ||
+		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") ||
+		strings.EqualFold(r.Header.Get("X-Forwarded-Ssl"), "on")
 	http.SetCookie(w, &http.Cookie{
 		Name:     powCookieName,
 		Value:    cookieValue,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   3600,
 	})
@@ -482,6 +500,83 @@ func (s *Server) handlePoWStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handlePoWAdaptiveStats exposes Tier-2 bit-management state. Empty
+// response (with enabled=false) when adaptive bit management is off.
+func (s *Server) handlePoWAdaptiveStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.powAdapt == nil {
+		writeJSON(w, map[string]interface{}{"enabled": false})
+		return
+	}
+	stats := s.powAdapt.Stats()
+	writeJSON(w, map[string]interface{}{
+		"enabled":          true,
+		"ips_tracked":      stats.IPsTracked,
+		"tier_bumps":       stats.TierBumps,
+		"total_queries":    stats.TotalQueries,
+		"load_hint":        stats.LoadHint,
+		"tier2_failures":   s.cfg.PoWAdaptiveTier2Failures,
+		"tier2_penalty_bits": s.cfg.PoWAdaptiveTier2PenaltyBits,
+	})
+}
+
+// handleIntelStats reports per-source health for the auto-updating
+// threat-intel feeds: last fetch / last error / record counts.
+func (s *Server) handleIntelStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.intelMgr == nil {
+		writeJSON(w, map[string]interface{}{"enabled": false})
+		return
+	}
+	stats := s.intelMgr.Stats()
+	writeJSON(w, map[string]interface{}{
+		"enabled":         true,
+		"learning_hours":  s.cfg.IntelFeedsLearningHours,
+		"total_fetches":   stats.TotalFetches,
+		"total_failures":  stats.TotalFailures,
+		"total_entries":   stats.TotalEntries,
+		"sources":         stats.Sources,
+	})
+}
+
+// handleMultiLimitStats reports the per-dimension state of the
+// multi-dimensional rate limiter.
+func (s *Server) handleMultiLimitStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.multiLim == nil {
+		writeJSON(w, map[string]interface{}{"enabled": false})
+		return
+	}
+	stats := s.multiLim.Stats()
+	writeJSON(w, map[string]interface{}{
+		"enabled":         true,
+		"window_sec":      s.cfg.MultiLimitWindowSec,
+		"tracked":         stats.Tracked,
+		"cap":             stats.Cap,
+		"checks":          stats.Checks,
+		"allowed":         stats.Allowed,
+		"blocked":         stats.Blocked,
+		"dropped":         stats.Dropped,
+		"blocked_by_dim":  stats.BlockedByDim,
+		"budgets": map[string]int{
+			"ip":        s.cfg.MultiLimitIPRPM,
+			"ja4":       s.cfg.MultiLimitJA4RPM,
+			"cookie":    s.cfg.MultiLimitCookieRPM,
+			"querykeys": s.cfg.MultiLimitQueryRPM,
+		},
+		"cookie_name": s.cfg.MultiLimitCookieName,
+	})
+}
+
 // --- DPI + audit admin endpoints ---------------------------------------
 
 func (s *Server) handleDPIStats(w http.ResponseWriter, r *http.Request) {
@@ -563,25 +658,31 @@ func parseUintCapped(s string, max uint64) uint64 {
 // We carry the issuance time so the proxy can reject cookies older than
 // the configured PoW window even if the cookie's own MaxAge is honoured
 // loosely by an old browser.
+//
+// An empty secret returns "" — callers MUST treat that as "do not issue
+// the cookie" rather than falling back to a constant string. A constant
+// fallback would be a globally-known signing key, letting any attacker
+// forge a "pow passed" cookie for any session. The previous code had
+// such a fallback ("wewaf-pow-fallback") and that has been removed.
 func signPowCookie(secret, id string, issuedAt int64) string {
 	if secret == "" {
-		// Empty secret should never happen at runtime — config layer
-		// generates one on first start. If it does, fall back to a
-		// fixed string so the cookie still round-trips (the proxy's
-		// validator uses the same string, and PoW is a *signal* layered
-		// on session/score, not a sole gate).
-		secret = "wewaf-pow-fallback"
+		return ""
 	}
 	body := id + "." + strconv.FormatInt(issuedAt, 10)
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:12])
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return body + "." + sig
 }
 
 // VerifyPowCookie returns (issuedAt, true) when the cookie value's MAC
 // validates and the timestamp is within ttl of now. Exposed at package
 // level so the proxy can call it directly without holding a Server.
+//
+// The MAC width is the full SHA-256 digest now — the previous 96-bit
+// truncation gave no benefit and made future copy-paste of the pattern
+// dangerous (a 96-bit MAC over a structured header is brute-forceable
+// in distributed time, even if the present value space is small).
 func VerifyPowCookie(secret, value string, ttl time.Duration) (time.Time, bool) {
 	if secret == "" || value == "" || len(value) > 256 {
 		return time.Time{}, false
@@ -593,7 +694,7 @@ func VerifyPowCookie(secret, value string, ttl time.Duration) (time.Time, bool) 
 	body := parts[0] + "." + parts[1]
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
-	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:12])
+	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
 		return time.Time{}, false
 	}

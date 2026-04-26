@@ -506,6 +506,18 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// X-WEWAF-Client-Cert-Verified is consumed by the zerotrust mTLS
+	// gate as a "verified by terminator" signal. When the operator has
+	// NOT opted into trusting edge headers (TrustXFF=false) we strip
+	// it on ingress so a direct attacker cannot fake mTLS. Operators
+	// running behind a trusted terminator (TrustXFF=true) should also
+	// configure the terminator to set this header AFTER stripping
+	// whatever the client sent — the same pattern used everywhere for
+	// edge-injected trust signals.
+	if !wp.cfg.TrustXFF {
+		r.Header.Del("X-WEWAF-Client-Cert-Verified")
+	}
+
 	// Bypass-hardening: cheap protocol-level checks that catch request
 	// smuggling, CR/LF header injection, double-encoded path traversal,
 	// dangerous methods, and malformed Host. Runs before any other
@@ -734,7 +746,14 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Buffer body for inspection and forwarding.
 	var body []byte
 	if r.Body != nil {
-		limited := io.LimitReader(r.Body, wp.cfg.MaxBodyBytes)
+		// Read MaxBodyBytes+1 so we can DETECT a body that exceeds the
+		// limit, instead of silently truncating it. Without the +1 a
+		// chunked / streaming request body of MaxBodyBytes+N bytes
+		// would pass through inspection with the trailing N bytes
+		// dropped — the engine would happily allow a request whose
+		// real payload is bigger than it ever saw.
+		limit := wp.cfg.MaxBodyBytes
+		limited := io.LimitReader(r.Body, limit+1)
 		var err error
 		body, err = io.ReadAll(limited)
 		if err != nil {
@@ -746,6 +765,13 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = r.Body.Close()
+		if int64(len(body)) > limit {
+			// Trim the over-read byte and reject so the rule engine
+			// sees a deterministic block rather than a partial body.
+			http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
+			wp.eng.ProcessLogging(tx)
+			return
+		}
 		// Slow-read detection: measure total request lifetime (from proxy
 		// accept, which is `start`), not just the body-read window. A true
 		// Slowloris trickles headers AND body; measuring only the body read
@@ -1547,11 +1573,12 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
+	// Strip hop-by-hop headers per RFC 7230 §6.1 before forwarding to
+	// the original requester. Forwarding Transfer-Encoding or a stale
+	// Connection header creates request-smuggling preconditions; copying
+	// Set-Cookie from an upstream domain to our domain leaks third-party
+	// session state through the WAF.
+	copyResponseHeadersFiltered(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	if len(inspected) > 0 {
 		if _, err := w.Write(inspected); err != nil {
@@ -1611,11 +1638,16 @@ func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Bidirectional pipe. When either direction ends, close both sides so
 	// the other goroutine can unblock instead of leaking for io.Copy's
-	// lifetime (which was previously unbounded).
+	// lifetime (which was previously unbounded). A panic in io.Copy would
+	// previously have been swallowed silently — log it so a peer
+	// triggering pathological state shows up in operator dashboards
+	// instead of disappearing into thin air.
 	done := make(chan struct{}, 2)
 	pipe := func(dst, src net.Conn) {
 		defer func() {
-			_ = recover()
+			if rec := recover(); rec != nil && ep.eng != nil {
+				ep.eng.LogError("egress: panic in CONNECT copy: %v", rec)
+			}
 			done <- struct{}{}
 		}()
 		_, _ = io.Copy(dst, src)
@@ -1779,4 +1811,50 @@ func classifyIP(ip net.IP) string {
 // isPrivateHost is retained for legacy callers. Prefer resolvedDangerReason.
 func isPrivateHost(host string) bool {
 	return resolvedDangerReason(host) != ""
+}
+
+// hopByHopHeaders is the RFC 7230 §6.1 list of headers that MUST NOT be
+// forwarded by intermediaries. We add Set-Cookie because forwarding it
+// from an arbitrary upstream onto our response surface is a credential-
+// scope violation: the cookie would carry our domain rather than the
+// upstream's, effectively letting the upstream set cookies for us.
+var hopByHopHeaders = map[string]struct{}{
+	"Connection":          {},
+	"Proxy-Connection":    {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
+	"Set-Cookie":          {},
+}
+
+// copyResponseHeadersFiltered copies src into dst, dropping hop-by-hop
+// headers and any header listed in src's "Connection" header (also per
+// RFC 7230). Header keys are matched in canonical MIME form.
+func copyResponseHeadersFiltered(dst, src http.Header) {
+	dropExtra := map[string]struct{}{}
+	for _, raw := range src.Values("Connection") {
+		for _, tok := range strings.Split(raw, ",") {
+			tok = strings.TrimSpace(tok)
+			if tok == "" {
+				continue
+			}
+			dropExtra[http.CanonicalHeaderKey(tok)] = struct{}{}
+		}
+	}
+	for k, vv := range src {
+		ck := http.CanonicalHeaderKey(k)
+		if _, hop := hopByHopHeaders[ck]; hop {
+			continue
+		}
+		if _, listed := dropExtra[ck]; listed {
+			continue
+		}
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
 }

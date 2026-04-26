@@ -243,6 +243,15 @@ func ReadWSFrame(r io.Reader, maxBytes int) (WSFrame, error) {
 	if maxBytes > 0 && f.PayloadLen > uint64(maxBytes) {
 		return WSFrame{}, ErrWSFrameTooLarge
 	}
+	// Defensive ceiling for callers that pass maxBytes ≤ 0. A 16 MiB
+	// floor per frame is comfortably larger than anything legitimate
+	// (browsers cap at 64 KiB) and stops a hostile peer from
+	// allocating multi-GiB buffers on us via an inflated 64-bit
+	// payload header.
+	const wsHardCeiling = 16 * 1024 * 1024
+	if maxBytes <= 0 && f.PayloadLen > wsHardCeiling {
+		return WSFrame{}, ErrWSFrameTooLarge
+	}
 	// Control frames have a hard 125-byte limit per RFC.
 	if f.IsControl() && f.PayloadLen > 125 {
 		return WSFrame{}, ErrWSMalformed

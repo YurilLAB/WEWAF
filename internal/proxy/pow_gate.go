@@ -38,7 +38,10 @@ func (wp *WAFProxy) hasValidPoWCookie(r *http.Request) bool {
 	body := parts[0] + "." + parts[1]
 	mac := hmac.New(sha256.New, []byte(wp.cfg.PoWSecret))
 	mac.Write([]byte(body))
-	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:12])
+	// Full SHA-256 digest — must match handlers_session.go:signPowCookie.
+	// The previous truncation to 12 bytes provided no security benefit
+	// and was the one footgun shared across all our cookie signers.
+	expected := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
 		return false
 	}
@@ -115,7 +118,11 @@ func (wp *WAFProxy) servePoWChallenge(w http.ResponseWriter, r *http.Request, sc
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.WriteHeader(http.StatusServiceUnavailable)
-	fmt.Fprintf(w, session.PoWPageHTML, ser, saltB64, difficulty, next)
+	// Use JSON-safe JS string literals — Go's %q would leave "</script>"
+	// in `next` (request-controlled) intact, breaking out of the script
+	// tag and reflecting an XSS into the gate page.
+	tokenJS, saltJS, nextJS := session.PoWPageInjectValues(ser, saltB64, next)
+	fmt.Fprintf(w, session.PoWPageHTML, tokenJS, saltJS, difficulty, nextJS)
 	wp.powIssued.Add(1)
 	// Log-only history event so operators can see PoW activity in the
 	// dashboard timeline.

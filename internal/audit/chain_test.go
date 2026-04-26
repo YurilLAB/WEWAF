@@ -3,11 +3,70 @@ package audit
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// failingWriter pretends to be a healthy disk for n successful writes
+// then returns an error forever. Used to verify that an Append failure
+// does not corrupt the in-memory chain state.
+type failingWriter struct {
+	bytes int
+	cap   int
+}
+
+func (f *failingWriter) Write(p []byte) (int, error) {
+	if f.bytes+len(p) > f.cap {
+		return 0, errors.New("disk full")
+	}
+	f.bytes += len(p)
+	return len(p), nil
+}
+
+// TestChainStateRollbackOnWriteFailure proves the Append fix: when a
+// disk write fails, c.seq and c.prevMAC are NOT advanced, so a retry
+// produces a valid chain. Without the fix, a transient I/O error
+// would leave subsequent entries chained against a MAC that doesn't
+// exist on disk — verify() would then fail forever.
+func TestChainStateRollbackOnWriteFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.log")
+	c, err := New(Config{Secret: "test", FilePath: path})
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	defer c.Close()
+
+	// Drop in a writer that fails on every write to simulate a full
+	// disk. The bw wraps it so the Flush carries the failure forward.
+	c.mu.Lock()
+	c.bw = bufio.NewWriter(&failingWriter{cap: 0})
+	c.mu.Unlock()
+
+	if _, err := c.Append("test", "actor", "first", ""); err == nil {
+		t.Fatal("expected first Append to fail with disk full")
+	}
+	// Now restore a healthy writer; a retry should produce seq=1, not seq=2.
+	healthy, _ := os.OpenFile(filepath.Join(dir, "fresh.log"), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	defer healthy.Close()
+	c.mu.Lock()
+	c.bw = bufio.NewWriter(healthy)
+	c.mu.Unlock()
+
+	e, err := c.Append("test", "actor", "first", "")
+	if err != nil {
+		t.Fatalf("retry Append: %v", err)
+	}
+	if e.Seq != 1 {
+		t.Fatalf("seq should roll back to 1 after failed write; got %d", e.Seq)
+	}
+	if e.PrevMAC != "" {
+		t.Fatalf("prevMAC should be empty for the first real entry; got %q", e.PrevMAC)
+	}
+}
 
 func TestChainAppendAndVerifyRoundtrip(t *testing.T) {
 	c, err := New(Config{Secret: "test-secret-do-not-use-in-prod"})

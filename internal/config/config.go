@@ -209,6 +209,34 @@ type Config struct {
 	PoWTokenTTLSec    int    `json:"pow_token_ttl_sec"`   // server-issued challenge TTL
 	PoWCookieTTLSec   int    `json:"pow_cookie_ttl_sec"`  // client-pass cookie TTL
 	PoWSecret         string `json:"pow_secret"`          // HMAC key for PoW tokens (auto-generated if empty)
+	// Adaptive (Tier-2) bit management. When enabled, the configured
+	// min/max set the *envelope* and the AdaptiveTier picks the actual
+	// difficulty per-request from session risk + per-IP fail history +
+	// global load + JA4 rarity. Disabled = legacy fixed-suggest behaviour.
+	PoWAdaptiveEnabled bool `json:"pow_adaptive_enabled"`
+	PoWAdaptiveTier2Failures int `json:"pow_adaptive_tier2_failures"` // fails before escalation, default 5
+	PoWAdaptiveTier2PenaltyBits int `json:"pow_adaptive_tier2_penalty_bits"` // bits added during escalation, default 3
+
+	// Multi-dimensional rate limiter — runs alongside the per-IP one and
+	// applies the strictest budget across IP/JA4/cookie/query-key
+	// signature dimensions. Zero budget per dim disables that axis.
+	MultiLimitEnabled    bool   `json:"multi_limit_enabled"`
+	MultiLimitWindowSec  int    `json:"multi_limit_window_sec"`   // default 60
+	MultiLimitIPRPM      int    `json:"multi_limit_ip_rpm"`       // 0 = disabled (per-IP limiter already exists)
+	MultiLimitJA4RPM     int    `json:"multi_limit_ja4_rpm"`
+	MultiLimitCookieRPM  int    `json:"multi_limit_cookie_rpm"`
+	MultiLimitCookieName string `json:"multi_limit_cookie_name"`
+	MultiLimitQueryRPM   int    `json:"multi_limit_query_rpm"`
+	MultiLimitMaxEntries int    `json:"multi_limit_max_entries"`  // default 200000
+
+	// Auto-updating threat-intel feeds. Toggling on starts the
+	// supervisor that fetches FREE community lists (FireHOL, Spamhaus
+	// DROP, SSLBL JA3, blocklist.de, ET compromised, mitchellkrogza
+	// bad-UAs, CISA KEV) and merges entries into the runtime stores.
+	IntelFeedsEnabled       bool     `json:"intel_feeds_enabled"`
+	IntelFeedsCacheDir      string   `json:"intel_feeds_cache_dir"`       // default <history>/intel
+	IntelFeedsLearningHours int      `json:"intel_feeds_learning_hours"`  // observe-only window for new entries; default 0 (off)
+	IntelFeedsAllowSources  []string `json:"intel_feeds_allow_sources"`   // empty = all defaults; otherwise allowlist of source names
 
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 	// mu protects runtime mutation of any non-atomic field (admin API POST
@@ -363,6 +391,24 @@ func Default() *Config {
 		PoWMaxDifficulty: 24,
 		PoWTokenTTLSec:   120,
 		PoWCookieTTLSec:  3600,
+
+		PoWAdaptiveEnabled:          false,
+		PoWAdaptiveTier2Failures:    5,
+		PoWAdaptiveTier2PenaltyBits: 3,
+
+		MultiLimitEnabled:    false,
+		MultiLimitWindowSec:  60,
+		MultiLimitIPRPM:      0,
+		MultiLimitJA4RPM:     0,
+		MultiLimitCookieRPM:  0,
+		MultiLimitCookieName: "session",
+		MultiLimitQueryRPM:   0,
+		MultiLimitMaxEntries: 200000,
+
+		IntelFeedsEnabled:       false,
+		IntelFeedsCacheDir:      "",
+		IntelFeedsLearningHours: 0,
+		IntelFeedsAllowSources:  nil,
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -593,6 +639,39 @@ func (c *Config) Validate() error {
 	if c.PoWCookieTTLSec <= 0 {
 		c.PoWCookieTTLSec = 3600
 	}
+
+	if c.PoWAdaptiveTier2Failures <= 0 {
+		c.PoWAdaptiveTier2Failures = 5
+	}
+	if c.PoWAdaptiveTier2PenaltyBits <= 0 {
+		c.PoWAdaptiveTier2PenaltyBits = 3
+	}
+	if c.PoWAdaptiveTier2PenaltyBits > 10 {
+		// Adding more than 10 bits over the floor would push every
+		// escalated user past the safety cap; clamp instead of
+		// rejecting the config so a fat-finger doesn't brick the WAF.
+		c.PoWAdaptiveTier2PenaltyBits = 10
+	}
+
+	if c.MultiLimitWindowSec <= 0 {
+		c.MultiLimitWindowSec = 60
+	}
+	if c.MultiLimitMaxEntries <= 0 {
+		c.MultiLimitMaxEntries = 200000
+	}
+	if c.MultiLimitMaxEntries > 5_000_000 {
+		c.MultiLimitMaxEntries = 5_000_000
+	}
+	if c.MultiLimitCookieName == "" {
+		c.MultiLimitCookieName = "session"
+	}
+
+	if c.IntelFeedsLearningHours < 0 {
+		c.IntelFeedsLearningHours = 0
+	}
+	if c.IntelFeedsLearningHours > 24*30 {
+		c.IntelFeedsLearningHours = 24 * 30
+	}
 	return nil
 }
 
@@ -733,6 +812,24 @@ func (c *Config) Snapshot() *Config {
 		PoWTokenTTLSec:   c.PoWTokenTTLSec,
 		PoWCookieTTLSec:  c.PoWCookieTTLSec,
 		PoWSecret:        c.PoWSecret,
+
+		PoWAdaptiveEnabled:          c.PoWAdaptiveEnabled,
+		PoWAdaptiveTier2Failures:    c.PoWAdaptiveTier2Failures,
+		PoWAdaptiveTier2PenaltyBits: c.PoWAdaptiveTier2PenaltyBits,
+
+		MultiLimitEnabled:    c.MultiLimitEnabled,
+		MultiLimitWindowSec:  c.MultiLimitWindowSec,
+		MultiLimitIPRPM:      c.MultiLimitIPRPM,
+		MultiLimitJA4RPM:     c.MultiLimitJA4RPM,
+		MultiLimitCookieRPM:  c.MultiLimitCookieRPM,
+		MultiLimitCookieName: c.MultiLimitCookieName,
+		MultiLimitQueryRPM:   c.MultiLimitQueryRPM,
+		MultiLimitMaxEntries: c.MultiLimitMaxEntries,
+
+		IntelFeedsEnabled:       c.IntelFeedsEnabled,
+		IntelFeedsCacheDir:      c.IntelFeedsCacheDir,
+		IntelFeedsLearningHours: c.IntelFeedsLearningHours,
+		IntelFeedsAllowSources:  append([]string(nil), c.IntelFeedsAllowSources...),
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	copy(cp.EgressAllowlist, c.EgressAllowlist)

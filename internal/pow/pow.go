@@ -213,13 +213,11 @@ func (it *Issuer) Verify(serialised string, nonce []byte) (Token, error) {
 		return Token{}, ErrTokenExpired
 	}
 
-	// 4. Replay.
-	if it.alreadySeen(t.ID) {
-		return Token{}, ErrTokenReplay
-	}
-
-	// 5. Proof-of-work. SHA-256(salt || nonce) must have Difficulty
-	// leading zero bits.
+	// 4. Proof-of-work first. SHA-256(salt || nonce) must have
+	// Difficulty leading zero bits. We verify PoW BEFORE the replay
+	// check so a parallel attacker submitting a stolen valid token can
+	// only "win the race" by also presenting a valid solve — which
+	// they already can with the original solver.
 	h := sha256.New()
 	h.Write(t.Salt)
 	h.Write(nonce)
@@ -227,7 +225,14 @@ func (it *Issuer) Verify(serialised string, nonce []byte) (Token, error) {
 		return Token{}, ErrSolutionInvalid
 	}
 
-	it.markSeen(t.ID)
+	// 5. Atomic replay check + mark. claimSeen returns true only if
+	// this is the first thread to successfully redeem t.ID. The
+	// previous shape (alreadySeen → PoW → markSeen) had a race window
+	// where two concurrent verifies of the same valid token both
+	// passed the seen-check, both ran PoW, and both got accepted.
+	if !it.claimSeen(t.ID) {
+		return Token{}, ErrTokenReplay
+	}
 	return t, nil
 }
 
@@ -371,16 +376,18 @@ func hasLeadingZeros(b []byte, n uint8) bool {
 	return (b[full] & mask) == 0
 }
 
-func (it *Issuer) alreadySeen(id string) bool {
+// claimSeen atomically tests whether id has already been redeemed and,
+// if not, records it as redeemed. Returns true on success (caller wins
+// the redemption race), false if id was already present. This collapses
+// the previous alreadySeen + markSeen sequence into a single critical
+// section so two concurrent Verify calls on the same token can no
+// longer both succeed.
+func (it *Issuer) claimSeen(id string) bool {
 	it.seenMu.Lock()
 	defer it.seenMu.Unlock()
-	_, ok := it.seen[id]
-	return ok
-}
-
-func (it *Issuer) markSeen(id string) {
-	it.seenMu.Lock()
-	defer it.seenMu.Unlock()
+	if _, ok := it.seen[id]; ok {
+		return false
+	}
 	if len(it.seen) > 100000 {
 		// Hard ceiling — if we're here something is wrong (e.g., sweep
 		// failed). Drop in chunks to stay below the cap rather than
@@ -396,6 +403,7 @@ func (it *Issuer) markSeen(id string) {
 		}
 	}
 	it.seen[id] = time.Now()
+	return true
 }
 
 // SolveForTest is a small reference solver, used only by tests in this

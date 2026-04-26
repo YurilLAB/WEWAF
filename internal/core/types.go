@@ -264,6 +264,12 @@ type BanList struct {
 	history  map[string]banHistory // offender tracking for exponential backoff
 	stopCh   chan struct{}
 	stopOnce sync.Once
+	// cleanupStarted gates StartCleanup so repeated invocations don't
+	// each launch a fresh janitor goroutine. The previous design only
+	// guarded the returned stop function with sync.Once, so a caller
+	// that wired StartCleanup into both engine init and a watchdog
+	// re-init path leaked goroutines that no stop function could reach.
+	cleanupStarted sync.Once
 
 	// Exponential-backoff configuration. When enabled, Ban's effective
 	// duration = duration * multiplier^(offenses-1), clamped at maxDuration.
@@ -273,6 +279,15 @@ type BanList struct {
 	backoffWindow     time.Duration
 	maxDuration       time.Duration
 }
+
+// maxBanEntries caps the active-ban map. With BanList.Cleanup running on
+// a ticker, expired entries are reaped quickly, but a determined attacker
+// rotating through millions of IPs at long ban durations could otherwise
+// grow the map without bound until the process OOMs. When the cap is hit
+// new bans evict the oldest expiring entries first; if none have expired
+// we randomly drop a small budget of entries (same shape as the limiter
+// janitor's pathological-flood handling).
+const maxBanEntries = 200_000
 
 // banHistory tracks repeat-offender state outside of the active bans map so
 // it survives the TTL expiry. This is what lets a returning offender get a
@@ -293,32 +308,36 @@ func NewBanList() *BanList {
 
 // StartCleanup launches a background goroutine that evicts expired entries
 // every `interval`. Returns a stop function. Safe to call multiple times —
-// subsequent calls are no-ops. This was previously missing, so expired bans
-// stayed in memory forever under long-running daemons.
+// subsequent calls truly are no-ops now: only the first invocation spawns
+// the janitor, so a caller wired into multiple init paths cannot leak
+// goroutines (the stop function returned by every call still works because
+// they all close the same shared stopCh).
 func (bl *BanList) StartCleanup(interval time.Duration) func() {
 	if interval <= 0 {
 		interval = time.Minute
 	}
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				// Silent recovery here would lose eviction forever; the
-				// goroutine returns on panic, so at least log it so an
-				// operator can see why bans stopped being cleaned up.
-				log.Printf("core.BanList: cleanup goroutine panic: %v", r)
+	bl.cleanupStarted.Do(func() {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Silent recovery here would lose eviction forever; the
+					// goroutine returns on panic, so at least log it so an
+					// operator can see why bans stopped being cleaned up.
+					log.Printf("core.BanList: cleanup goroutine panic: %v", r)
+				}
+			}()
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					bl.Cleanup()
+				case <-bl.stopCh:
+					return
+				}
 			}
 		}()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				bl.Cleanup()
-			case <-bl.stopCh:
-				return
-			}
-		}
-	}()
+	})
 	return func() {
 		bl.stopOnce.Do(func() { close(bl.stopCh) })
 	}
@@ -399,6 +418,43 @@ func (bl *BanList) Ban(ip, reason string, duration time.Duration) {
 			dropBudget := 64
 			for k := range bl.history {
 				delete(bl.history, k)
+				dropBudget--
+				if dropBudget <= 0 {
+					break
+				}
+			}
+		}
+	}
+
+	// Bound the entries map. Without this, an attacker rotating through
+	// fresh IPs at long ban durations could grow the map until the
+	// process runs out of memory — the periodic Cleanup ticker only
+	// reaps EXPIRED entries, so a 24h ban window is plenty of time to
+	// pile up. When the cap is hit prefer evicting already-expired
+	// entries (cheap, correct), then fall back to dropping a small
+	// random sample so a sustained flood can't pin the ban list at the
+	// ceiling forever.
+	if _, exists := bl.entries[ip]; !exists && len(bl.entries) >= maxBanEntries {
+		// First pass: bounded scan for already-expired entries.
+		scanBudget := 256
+		for k, e := range bl.entries {
+			if now.After(e.ExpiresAt) {
+				delete(bl.entries, k)
+			}
+			scanBudget--
+			if scanBudget <= 0 {
+				break
+			}
+		}
+		// Still full? Random-drop a small budget so sustained pressure
+		// doesn't keep us pinned at the cap.
+		if len(bl.entries) >= maxBanEntries {
+			dropBudget := maxBanEntries / 1000 // 0.1%
+			if dropBudget < 16 {
+				dropBudget = 16
+			}
+			for k := range bl.entries {
+				delete(bl.entries, k)
 				dropBudget--
 				if dropBudget <= 0 {
 					break

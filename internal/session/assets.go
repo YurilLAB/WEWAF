@@ -1,5 +1,12 @@
 package session
 
+import "encoding/json"
+
+// jsonMarshal is an internal indirection so the export site uses the
+// stdlib JSON marshaller — kept private so callers can't bypass it
+// and accidentally feed unescaped strings into the script template.
+func jsonMarshal(v interface{}) ([]byte, error) { return json.Marshal(v) }
+
 // Client-side JS served at /api/browser-challenge.js and /api/browser-beacon.js.
 //
 // Both scripts are written as a single minification-friendly IIFE with no
@@ -236,9 +243,30 @@ p{font-size:14px;color:#8b949e;margin:0 0 16px}
 <noscript><p style="color:#f85149">JavaScript is required to continue.</p></noscript>
 <div class="note">WEWAF · request-protection · this page does not store cookies until verification succeeds.</div>
 </div>
-<script>window.__wewaf_pow={token:%q,salt:%q,difficulty:%d,next:%q};</script>
+<script>window.__wewaf_pow={token:%s,salt:%s,difficulty:%d,next:%s};</script>
 <script src="/api/pow.js"></script>
 </body></html>`
+
+// PoWPageInjectValues renders token/salt/next as JSON-safe JavaScript
+// string literals. Plain Go %q does NOT escape '<' or '>', so a
+// payload like "</script><script>alert(1)" would close the script tag
+// and execute attacker-controlled code in the PoW gate's origin —
+// classic reflected XSS via the next-URL passthrough. JSON encoding
+// produces properly escaped < / > sequences inside the
+// string literal, defusing the HTML parser path.
+func PoWPageInjectValues(token, salt, next string) (string, string, string) {
+	jsString := func(s string) string {
+		// json.Marshal escapes < > & by default at HTML safety. We also
+		// fall back to a bare empty string on the (impossible) error
+		// path so the template still produces valid JS.
+		b, err := jsonMarshal(s)
+		if err != nil {
+			return `""`
+		}
+		return string(b)
+	}
+	return jsString(token), jsString(salt), jsString(next)
+}
 
 // BeaconJS reports human-input signals back to the server. Deliberately
 // coarse — we count events and time-on-page rather than recording every

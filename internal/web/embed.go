@@ -1,6 +1,7 @@
 package web
 
 import (
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"io/fs"
@@ -21,6 +22,7 @@ import (
 	"wewaf/internal/graphql"
 	"wewaf/internal/history"
 	"wewaf/internal/host"
+	"wewaf/internal/intel"
 	"wewaf/internal/limits"
 	"wewaf/internal/pow"
 	"wewaf/internal/proxy"
@@ -52,6 +54,9 @@ type Server struct {
 	graphql    *graphql.Validator
 	audit      *audit.Chain
 	pow        *pow.Issuer
+	powAdapt   *pow.AdaptiveTier
+	intelMgr   *intel.Manager
+	multiLim   *limits.MultiLimiter
 
 	meshEnabled  bool
 	meshPeers    []string
@@ -129,6 +134,9 @@ type Deps struct {
 	GraphQL        *graphql.Validator
 	Audit          *audit.Chain
 	PoW            *pow.Issuer
+	PoWAdaptive    *pow.AdaptiveTier
+	Intel          *intel.Manager
+	MultiLimit     *limits.MultiLimiter
 
 	MeshEnabled bool
 	MeshPeers   []string
@@ -153,6 +161,9 @@ func NewServer(d Deps) *Server {
 		graphql:    d.GraphQL,
 		audit:      d.Audit,
 		pow:        d.PoW,
+		powAdapt:   d.PoWAdaptive,
+		intelMgr:   d.Intel,
+		multiLim:   d.MultiLimit,
 		errBufCap:  200,
 		errBuf:     make([]ErrorEvent, 0, 200),
 
@@ -256,6 +267,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	api.HandleFunc("/api/dpi/stats", safeSessionHandler("dpi-stats", s.handleDPIStats))
 	api.HandleFunc("/api/ja3/stats", safeSessionHandler("ja3-stats", s.handleJA3Stats))
 	api.HandleFunc("/api/pow/stats", safeSessionHandler("pow-stats", s.handlePoWStats))
+	api.HandleFunc("/api/pow/adaptive", safeSessionHandler("pow-adaptive", s.handlePoWAdaptiveStats))
+	api.HandleFunc("/api/intel/stats", safeSessionHandler("intel-stats", s.handleIntelStats))
+	api.HandleFunc("/api/multilimit/stats", safeSessionHandler("multilimit-stats", s.handleMultiLimitStats))
 	api.HandleFunc("/api/audit/verify", safeSessionHandler("audit-verify", s.handleAuditVerify))
 	api.HandleFunc("/api/audit/tail", safeSessionHandler("audit-tail", s.handleAuditTail))
 	api.HandleFunc("/api/sessions", safeSessionHandler("sessions", s.handleSessions))
@@ -313,26 +327,72 @@ func (s *Server) spaHandler(spaFS fs.FS) http.Handler {
 				http.Error(w, "UI not built. Run `npm run build` inside ui/.", http.StatusInternalServerError)
 				return
 			}
+			writeSPASecurityHeaders(w)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
 			_, _ = w.Write(data)
 			return
 		}
+		writeSPASecurityHeaders(w)
 		fileServer.ServeHTTP(w, r)
 	})
 }
 
+// writeSPASecurityHeaders adds the baseline browser-side hardening
+// headers to every admin SPA response. Without these, any future XSS
+// in the React build (or in a vulnerable transitive dep) would be
+// fully exploitable, and the dashboard could be framed by an attacker
+// site for clickjacking. The CSP allows inline styles because the
+// Vite-built SPA inlines a bootstrap stylesheet; if that's tightened
+// upstream we can drop 'unsafe-inline' for style-src.
+func writeSPASecurityHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+	// Self-only loading; same-origin connect-src lets the SPA call /api/*.
+	h.Set("Content-Security-Policy",
+		"default-src 'self'; "+
+			"script-src 'self'; "+
+			"style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data:; "+
+			"connect-src 'self'; "+
+			"font-src 'self' data:; "+
+			"frame-ancestors 'none'; "+
+			"base-uri 'self'; "+
+			"form-action 'self'")
+}
+
+// withAuth gates admin endpoints on the WAF_API_KEY environment
+// variable. When the env var is empty AND the WAF_ALLOW_NO_AUTH escape
+// hatch isn't set, we LOUDLY refuse every request rather than silently
+// falling open — silent fail-open meant a deployment that forgot to
+// set the secret had its admin API world-readable with no signal.
+//
+// We compare with subtle.ConstantTimeCompare so a remote attacker
+// can't byte-by-byte recover the key via response-time differences.
+// Header-only — accepting the key from the URL query allows reflection
+// via Referer / browser logs / CDN caches and combined with permissive
+// CORS would let a third-party page execute admin calls. The previous
+// `?api_key=` fallback has been removed.
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	expected := os.Getenv("WAF_API_KEY")
-	if expected == "" {
-		return next
-	}
+	allowNoAuth := os.Getenv("WAF_ALLOW_NO_AUTH") == "1"
+	expectedBytes := []byte(expected)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-API-Key")
-		if key == "" {
-			key = r.URL.Query().Get("api_key")
+		if expected == "" {
+			if allowNoAuth {
+				next.ServeHTTP(w, r)
+				return
+			}
+			http.Error(w, "admin api: WAF_API_KEY not set; refusing to serve. "+
+				"Set WAF_API_KEY=<32+ random bytes> or, for local dev only, "+
+				"WAF_ALLOW_NO_AUTH=1.", http.StatusServiceUnavailable)
+			return
 		}
-		if key != expected {
+		key := r.Header.Get("X-API-Key")
+		if key == "" || subtle.ConstantTimeCompare([]byte(key), expectedBytes) != 1 {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -464,6 +524,24 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			PoWMaxDifficulty *int  `json:"pow_max_difficulty"`
 			PoWTokenTTLSec   *int  `json:"pow_token_ttl_sec"`
 			PoWCookieTTLSec  *int  `json:"pow_cookie_ttl_sec"`
+
+			PoWAdaptiveEnabled          *bool `json:"pow_adaptive_enabled"`
+			PoWAdaptiveTier2Failures    *int  `json:"pow_adaptive_tier2_failures"`
+			PoWAdaptiveTier2PenaltyBits *int  `json:"pow_adaptive_tier2_penalty_bits"`
+
+			MultiLimitEnabled    *bool   `json:"multi_limit_enabled"`
+			MultiLimitWindowSec  *int    `json:"multi_limit_window_sec"`
+			MultiLimitIPRPM      *int    `json:"multi_limit_ip_rpm"`
+			MultiLimitJA4RPM     *int    `json:"multi_limit_ja4_rpm"`
+			MultiLimitCookieRPM  *int    `json:"multi_limit_cookie_rpm"`
+			MultiLimitCookieName *string `json:"multi_limit_cookie_name"`
+			MultiLimitQueryRPM   *int    `json:"multi_limit_query_rpm"`
+			MultiLimitMaxEntries *int    `json:"multi_limit_max_entries"`
+
+			IntelFeedsEnabled       *bool    `json:"intel_feeds_enabled"`
+			IntelFeedsCacheDir      *string  `json:"intel_feeds_cache_dir"`
+			IntelFeedsLearningHours *int     `json:"intel_feeds_learning_hours"`
+			IntelFeedsAllowSources  []string `json:"intel_feeds_allow_sources"`
 		}
 		// Bounded reader so a malicious request can't OOM us with a 1 GB JSON.
 		// 64 KiB is generous — every legitimate config payload is under 8 KiB.
@@ -472,6 +550,15 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Bad Request: "+err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Validate any pre-lock checks BEFORE acquiring the write lock.
+		// Returning early after Lock without Unlock leaks the mutex and
+		// deadlocks every subsequent config request — that exact bug
+		// existed here previously on the invalid-mode path.
+		if payload.Mode != "" && payload.Mode != "active" && payload.Mode != "detection" && payload.Mode != "learning" {
+			http.Error(w, "Invalid mode", http.StatusBadRequest)
+			return
+		}
+
 		// Serialise the mutation batch so a concurrent Snapshot() reader
 		// doesn't observe half-applied state. Mode still goes through its
 		// atomic setter separately. We unlock explicitly before calling
@@ -479,10 +566,6 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		// RWMutex is not reentrant.
 		s.cfg.Lock()
 		if payload.Mode != "" {
-			if payload.Mode != "active" && payload.Mode != "detection" && payload.Mode != "learning" {
-				http.Error(w, "Invalid mode", http.StatusBadRequest)
-				return
-			}
 			s.cfg.SetMode(payload.Mode)
 		}
 		if payload.HistoryRotateHours > 0 {
@@ -710,6 +793,81 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.PoWCookieTTLSec != nil && *payload.PoWCookieTTLSec >= 60 && *payload.PoWCookieTTLSec <= 86400 {
 			s.cfg.PoWCookieTTLSec = *payload.PoWCookieTTLSec
+		}
+
+		// Adaptive PoW (tier-2). Caller flips on/off live; the proxy reads
+		// the field on the next gate decision so no restart is needed.
+		if payload.PoWAdaptiveEnabled != nil {
+			s.cfg.PoWAdaptiveEnabled = *payload.PoWAdaptiveEnabled
+		}
+		if payload.PoWAdaptiveTier2Failures != nil && *payload.PoWAdaptiveTier2Failures >= 1 && *payload.PoWAdaptiveTier2Failures <= 100 {
+			s.cfg.PoWAdaptiveTier2Failures = *payload.PoWAdaptiveTier2Failures
+		}
+		if payload.PoWAdaptiveTier2PenaltyBits != nil && *payload.PoWAdaptiveTier2PenaltyBits >= 1 && *payload.PoWAdaptiveTier2PenaltyBits <= 10 {
+			s.cfg.PoWAdaptiveTier2PenaltyBits = *payload.PoWAdaptiveTier2PenaltyBits
+		}
+
+		// Multi-dimensional rate limiter.
+		if payload.MultiLimitEnabled != nil {
+			s.cfg.MultiLimitEnabled = *payload.MultiLimitEnabled
+		}
+		if payload.MultiLimitWindowSec != nil && *payload.MultiLimitWindowSec > 0 && *payload.MultiLimitWindowSec <= 3600 {
+			s.cfg.MultiLimitWindowSec = *payload.MultiLimitWindowSec
+		}
+		if payload.MultiLimitIPRPM != nil && *payload.MultiLimitIPRPM >= 0 {
+			s.cfg.MultiLimitIPRPM = *payload.MultiLimitIPRPM
+		}
+		if payload.MultiLimitJA4RPM != nil && *payload.MultiLimitJA4RPM >= 0 {
+			s.cfg.MultiLimitJA4RPM = *payload.MultiLimitJA4RPM
+		}
+		if payload.MultiLimitCookieRPM != nil && *payload.MultiLimitCookieRPM >= 0 {
+			s.cfg.MultiLimitCookieRPM = *payload.MultiLimitCookieRPM
+		}
+		if payload.MultiLimitCookieName != nil && len(*payload.MultiLimitCookieName) > 0 && len(*payload.MultiLimitCookieName) < 128 {
+			s.cfg.MultiLimitCookieName = *payload.MultiLimitCookieName
+		}
+		if payload.MultiLimitQueryRPM != nil && *payload.MultiLimitQueryRPM >= 0 {
+			s.cfg.MultiLimitQueryRPM = *payload.MultiLimitQueryRPM
+		}
+		if payload.MultiLimitMaxEntries != nil && *payload.MultiLimitMaxEntries >= 1024 {
+			s.cfg.MultiLimitMaxEntries = *payload.MultiLimitMaxEntries
+		}
+
+		// Intel feeds toggles. Adding/removing sources at runtime is a
+		// restart-required change; the toggle and learning-window ARE
+		// hot-swappable.
+		if payload.IntelFeedsEnabled != nil {
+			s.cfg.IntelFeedsEnabled = *payload.IntelFeedsEnabled
+		}
+		if payload.IntelFeedsCacheDir != nil && *payload.IntelFeedsCacheDir != "" {
+			s.cfg.IntelFeedsCacheDir = *payload.IntelFeedsCacheDir
+		}
+		if payload.IntelFeedsLearningHours != nil && *payload.IntelFeedsLearningHours >= 0 && *payload.IntelFeedsLearningHours <= 24*30 {
+			s.cfg.IntelFeedsLearningHours = *payload.IntelFeedsLearningHours
+		}
+		if payload.IntelFeedsAllowSources != nil {
+			cleaned := make([]string, 0, len(payload.IntelFeedsAllowSources))
+			for _, src := range payload.IntelFeedsAllowSources {
+				src = strings.TrimSpace(src)
+				if src != "" && len(src) <= 64 {
+					cleaned = append(cleaned, src)
+				}
+			}
+			s.cfg.IntelFeedsAllowSources = cleaned
+		}
+
+		// Push live changes to the multi-limiter if it exists, so RPS
+		// changes apply without a restart.
+		if s.multiLim != nil {
+			s.multiLim.SetConfig(limits.MultiConfig{
+				Window:          time.Duration(s.cfg.MultiLimitWindowSec) * time.Second,
+				IPBudget:        s.cfg.MultiLimitIPRPM,
+				JA4Budget:       s.cfg.MultiLimitJA4RPM,
+				CookieBudget:    s.cfg.MultiLimitCookieRPM,
+				CookieName:      s.cfg.MultiLimitCookieName,
+				QueryKeysBudget: s.cfg.MultiLimitQueryRPM,
+				MaxEntries:      s.cfg.MultiLimitMaxEntries,
+			})
 		}
 		// Push updated ban-list backoff to the live object so changes take
 		// effect without a restart. Capture values under the write lock so
@@ -982,6 +1140,13 @@ func (s *Server) handleSSLCertificates(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, map[string]interface{}{"certificates": s.ssl.List()})
 	case http.MethodPost:
+		// Bound the body envelope. The SSL Upload validator caps cert
+		// and key strings at 256 KiB each, but that check happens AFTER
+		// json.Decode allocates the whole body — without this, an
+		// authenticated attacker could feed multi-GB JSON and OOM the
+		// admin process. 1 MiB comfortably covers cert + key + JSON
+		// overhead.
+		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
 		var req ssl.UploadRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -1029,6 +1194,10 @@ func (s *Server) handleSSLConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, s.ssl.ConfigSnapshot())
 	case http.MethodPut, http.MethodPost:
+		// SSL config is a tiny set of scalars; cap aggressively so a
+		// malformed admin client (or attacker with the API key) can't
+		// allocate gigabytes through json.Decode.
+		r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 		var patch ssl.Config
 		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -1250,11 +1419,18 @@ func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// Simple shared-secret auth between peers.
-	if s.meshAPIKey != "" && r.Header.Get("X-Mesh-Key") != s.meshAPIKey {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
+	// Constant-time peer-key compare. Direct string `!=` would leak the
+	// key one byte at a time over the network — slow but real. A peer
+	// payload is never larger than a few MB of bans either way, so we
+	// also cap the body so a malicious peer can't OOM us.
+	if s.meshAPIKey != "" {
+		got := r.Header.Get("X-Mesh-Key")
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.meshAPIKey)) != 1 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var payload struct {
 		Bans []core.BanEntry `json:"bans"`
 	}
@@ -1264,6 +1440,14 @@ func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
 	}
 	// Merge incoming bans into local ban list.
 	if s.banList != nil {
+		// Cap ban duration so a malicious peer (or a peer with a bug)
+		// can't pin an IP forever. We pick the configured operator
+		// max — if they haven't set one, fall back to 30 days, which
+		// is long enough to be useful and short enough to recover.
+		maxDur := time.Duration(s.cfg.MaxBanDurationSec) * time.Second
+		if maxDur <= 0 {
+			maxDur = 30 * 24 * time.Hour
+		}
 		for _, b := range payload.Bans {
 			if b.IP == "" || stdnet.ParseIP(b.IP) == nil {
 				continue
@@ -1272,7 +1456,14 @@ func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
 			if duration <= 0 {
 				continue
 			}
-			s.banList.Ban(b.IP, b.Reason, duration)
+			if duration > maxDur {
+				duration = maxDur
+			}
+			reason := b.Reason
+			if len(reason) > 256 {
+				reason = reason[:256]
+			}
+			s.banList.Ban(b.IP, reason, duration)
 		}
 	}
 	s.meshMu.Lock()

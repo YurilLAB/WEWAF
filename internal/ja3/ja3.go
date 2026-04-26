@@ -43,9 +43,20 @@ type FingerprintInput struct {
 }
 
 // Fingerprint is the structured form of one observation.
+//
+// Hash is classic JA3 (MD5 of the canonical string); kept for
+// compatibility with public threat-intel feeds (sslbl.abuse.ch etc.)
+// which still list JA3 hashes. JA3N is the order-normalized variant —
+// stable against the random extension reorder Chrome 110+ does on
+// every handshake. JA4 is the FoxIO format and is what the rest of
+// the stack should prefer for fingerprint *matching*; classic JA3
+// remains useful for *signal correlation* with feeds that haven't
+// migrated yet.
 type Fingerprint struct {
-	Hash    string    // 32-char lowercase MD5 of String
-	String  string    // canonical JA3 string
+	Hash    string    // 32-char lowercase MD5 of String (classic JA3)
+	JA3N    string    // 32-char lowercase MD5 — JA3 with sorted ext list
+	JA4     string    // 36-char FoxIO JA4 fingerprint
+	String  string    // canonical JA3 string (for diagnostics + JA3N rederivation)
 	SeenAt  time.Time // when this entry was cached
 	Version uint16    // copied for diagnostics
 }
@@ -91,20 +102,64 @@ func Compute(in FingerprintInput) (jaString, jaHash string) {
 //
 // Even so, the resulting hash is stable per-client and that is what
 // matters for fingerprint detection.
+//
+// Returns the classic JA3 string + hash. Use FullFromClientHello when
+// the caller wants JA3N and JA4 too.
 func FromClientHello(chi *tls.ClientHelloInfo) (jaString, jaHash string) {
-	if chi == nil {
+	in := buildJA3Input(chi)
+	if in.Version == 0 && len(in.CipherSuites) == 0 {
 		return "", ""
 	}
+	return Compute(in)
+}
 
+// FullFromClientHello returns a fully-populated Fingerprint with classic
+// JA3, JA3N (sorted-ext variant), and JA4 (FoxIO format) all computed
+// from the same handshake. Cheap — the three algorithms share most of
+// their input prep.
+func FullFromClientHello(chi *tls.ClientHelloInfo) Fingerprint {
+	if chi == nil {
+		return Fingerprint{}
+	}
+	in := buildJA3Input(chi)
+	if in.Version == 0 && len(in.CipherSuites) == 0 {
+		return Fingerprint{}
+	}
+
+	jaString, jaHash := Compute(in)
+	_, jaNHash := ComputeJA3N(in)
+
+	sigSchemes := make([]uint16, 0, len(chi.SignatureSchemes))
+	for _, s := range chi.SignatureSchemes {
+		sigSchemes = append(sigSchemes, uint16(s))
+	}
+	ja4 := ComputeJA4(JA4Input{
+		Version:          in.Version,
+		HasSNI:           chi.ServerName != "",
+		CipherSuites:     in.CipherSuites,
+		Extensions:       in.Extensions,
+		SignatureSchemes: sigSchemes,
+		ALPN:             append([]string(nil), chi.SupportedProtos...),
+	})
+
+	return Fingerprint{
+		Hash:    jaHash,
+		JA3N:    jaNHash,
+		JA4:     ja4,
+		String:  jaString,
+		Version: in.Version,
+	}
+}
+
+func buildJA3Input(chi *tls.ClientHelloInfo) FingerprintInput {
+	if chi == nil {
+		return FingerprintInput{}
+	}
 	in := FingerprintInput{
 		CipherSuites:    append([]uint16(nil), chi.CipherSuites...),
 		SupportedCurves: curvesAsUint16(chi.SupportedCurves),
 		SupportedPoints: append([]uint8(nil), chi.SupportedPoints...),
 	}
-
-	// Pick the highest TLS version the client offered. ClientHello
-	// legacy_version is always 0x0303 (TLS 1.2) for any modern client,
-	// since 1.3 hides the real max in the supported_versions extension.
 	if len(chi.SupportedVersions) > 0 {
 		var max uint16
 		for _, v := range chi.SupportedVersions {
@@ -114,18 +169,10 @@ func FromClientHello(chi *tls.ClientHelloInfo) (jaString, jaHash string) {
 		}
 		in.Version = max
 	} else {
-		// No supported_versions extension means TLS 1.2-or-earlier; fall
-		// back to a sensible default.
 		in.Version = tls.VersionTLS12
 	}
-
-	// Synthesize an extension-ID list from the API surface. This will not
-	// match a wire-level packet capture exactly, but it's deterministic
-	// and stable per-client class — which is sufficient for "is this a
-	// known headless build" detection.
 	in.Extensions = synthesizeExtensions(chi)
-
-	return Compute(in)
+	return in
 }
 
 // IsGREASE returns true if v is a TLS GREASE value (RFC 8701). GREASE

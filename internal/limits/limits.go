@@ -152,7 +152,11 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	}
 
 	elapsed := now.Sub(b.last).Seconds()
-	b.tokens = min(rl.burst*2, b.tokens+elapsed*rl.rps)
+	// Cap at burst, NOT burst*2 — the latter let a long-idle client
+	// burst at 2× the configured ceiling, which surprises operators
+	// reading the config and (more importantly) breaks the
+	// rate-limit invariant the tests document.
+	b.tokens = min(rl.burst, b.tokens+elapsed*rl.rps)
 	b.last = now
 
 	if b.tokens >= 1 {
@@ -169,7 +173,13 @@ func (rl *RateLimiter) Stop() {
 	})
 }
 
-// janitor removes stale buckets every 5 minutes.
+// janitor removes stale buckets every 5 minutes. To avoid stalling
+// hot-path Allow callers on a million-entry map, the sweep is split
+// across multiple short chunks per tick with a 1ms yield between them.
+// We cap the work at maxChunksPerTick so the janitor never busy-loops
+// on a permanently-full map: any entries we miss this tick are picked
+// up next tick, which is the right trade — Go's randomised map
+// iteration is unbiased so eviction probability is uniform.
 func (rl *RateLimiter) janitor() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -181,18 +191,52 @@ func (rl *RateLimiter) janitor() {
 	for {
 		select {
 		case <-ticker.C:
-			rl.mu.Lock()
-			now := time.Now()
-			for ip, b := range rl.buckets {
-				if now.Sub(b.last) > 10*time.Minute {
-					delete(rl.buckets, ip)
-				}
-			}
-			rl.mu.Unlock()
+			rl.sweepOnce()
 		case <-rl.stop:
 			return
 		}
 	}
+}
+
+// sweepOnce performs one bounded sweep pass. It runs at most
+// maxChunksPerTick chunks of chunkSize entries, with a brief yield
+// between chunks so concurrent Allow callers aren't starved.
+func (rl *RateLimiter) sweepOnce() {
+	const (
+		chunkSize        = 4096
+		maxChunksPerTick = 64 // ≤ 256k entries scanned per tick worst-case
+	)
+	cutoff := time.Now().Add(-10 * time.Minute)
+	for i := 0; i < maxChunksPerTick; i++ {
+		if done := rl.sweepChunk(chunkSize, cutoff); done {
+			return
+		}
+		// Allow a quick observer interrupt between chunks instead
+		// of a hard sleep — Stop() should unblock the next tick.
+		select {
+		case <-rl.stop:
+			return
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// sweepChunk evicts up to budget stale entries. Returns true when the
+// scan reached the end of the map (i.e., no further chunks needed).
+func (rl *RateLimiter) sweepChunk(budget int, cutoff time.Time) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	scanned := 0
+	for ip, b := range rl.buckets {
+		scanned++
+		if b.last.Before(cutoff) {
+			delete(rl.buckets, ip)
+		}
+		if scanned >= budget {
+			return false
+		}
+	}
+	return true
 }
 
 // Stats returns current resource usage.

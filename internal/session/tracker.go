@@ -278,11 +278,33 @@ func (t *Tracker) EnsureSession(w http.ResponseWriter, r *http.Request) *Session
 		// Fresh session.
 		id = randomID()
 		if w != nil {
-			t.setCookie(w, id)
+			t.setCookie(w, id, requestIsTLS(r))
 		}
 	}
 	s := t.touchSession(id, r)
 	return s
+}
+
+// requestIsTLS reports whether the request was received over a TLS
+// channel — either directly (r.TLS != nil) or via a trusted edge proxy
+// announcing the original scheme. Used to gate the Cookie Secure flag.
+func requestIsTLS(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	// Common edge headers. Accepting these is safe because failing
+	// open here only causes "Secure" to be omitted; it never sends a
+	// cookie that wasn't going to be sent anyway.
+	if v := r.Header.Get("X-Forwarded-Proto"); strings.EqualFold(v, "https") {
+		return true
+	}
+	if v := r.Header.Get("X-Forwarded-Ssl"); strings.EqualFold(v, "on") {
+		return true
+	}
+	return false
 }
 
 // touchSession upserts the session and updates per-request signals.
@@ -405,7 +427,11 @@ func (t *Tracker) RecordChallengePass(id string) {
 // legitimate (challenge pass) means the attacker's captured ID is dead
 // weight. Returns the new ID, or oldID unchanged if rotation isn't
 // possible (unknown id / nil writer / tracker disabled).
-func (t *Tracker) RotateSession(w http.ResponseWriter, oldID string) string {
+//
+// `secure` controls whether the replacement cookie carries the Secure
+// flag — pass true when the originating request arrived over TLS so the
+// rotated cookie keeps the same transport guarantees as the original.
+func (t *Tracker) RotateSession(w http.ResponseWriter, oldID string, secure bool) string {
 	if t == nil || oldID == "" || w == nil {
 		return oldID
 	}
@@ -420,7 +446,7 @@ func (t *Tracker) RotateSession(w http.ResponseWriter, oldID string) string {
 	s.ID = newID
 	t.sessions[newID] = s
 	t.mu.Unlock()
-	t.setCookie(w, newID)
+	t.setCookie(w, newID, secure)
 	return newID
 }
 
@@ -525,12 +551,13 @@ func (t *Tracker) sweep() {
 
 // --- Cookie signing -----------------------------------------------------
 
-func (t *Tracker) setCookie(w http.ResponseWriter, id string) {
+func (t *Tracker) setCookie(w http.ResponseWriter, id string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    t.signCookie(id),
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int((t.idleTTL * 2).Seconds()),
 	})
@@ -539,7 +566,7 @@ func (t *Tracker) setCookie(w http.ResponseWriter, id string) {
 func (t *Tracker) signCookie(id string) string {
 	mac := hmac.New(sha256.New, t.secret)
 	mac.Write([]byte(id))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:12])
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return id + "." + sig
 }
 
@@ -564,19 +591,24 @@ func (t *Tracker) verifyCookie(value string) (string, bool) {
 // IssueChallengeCookie returns a signed cookie value proving a browser
 // challenge was passed at a given time. The caller writes it via
 // http.SetCookie with the ChallengeCookieName name.
-func (t *Tracker) IssueChallengeCookie() (*http.Cookie, string) {
+//
+// `secure` should be true when the originating request arrived over
+// TLS so the cookie is never sent over plaintext after a successful
+// challenge.
+func (t *Tracker) IssueChallengeCookie(secure bool) (*http.Cookie, string) {
 	nowSec := time.Now().UTC().Unix()
 	payload := fmt.Sprintf("%d", nowSec)
 	mac := hmac.New(sha256.New, t.secret)
 	mac.Write([]byte("challenge:"))
 	mac.Write([]byte(payload))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:12])
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	value := payload + "." + sig
 	return &http.Cookie{
 		Name:     ChallengeCookieName,
 		Value:    value,
 		Path:     "/",
 		HttpOnly: false, // readable by JS so the beacon can avoid re-challenging
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int((24 * time.Hour).Seconds()),
 	}, value
@@ -597,7 +629,7 @@ func (t *Tracker) VerifyChallengeCookie(value string) (time.Time, bool) {
 	mac := hmac.New(sha256.New, t.secret)
 	mac.Write([]byte("challenge:"))
 	mac.Write([]byte(payload))
-	expectSig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil)[:12])
+	expectSig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	if !hmac.Equal([]byte(expectSig), []byte(value[dot+1:])) {
 		return time.Time{}, false
 	}
