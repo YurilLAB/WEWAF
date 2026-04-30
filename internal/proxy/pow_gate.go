@@ -91,7 +91,7 @@ func (wp *WAFProxy) servePoWChallenge(w http.ResponseWriter, r *http.Request, sc
 		return
 	}
 
-	ip := getClientIP(r, wp.cfg.TrustXFF)
+	ip := wp.ipExtractor.ClientIP(r)
 	if !wp.allowPoWIssuance(ip) {
 		// Rate-limited — record as a log-only event so operators see
 		// the abuse pattern.

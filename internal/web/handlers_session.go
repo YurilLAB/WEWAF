@@ -341,7 +341,7 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "PoW disabled", http.StatusServiceUnavailable)
 		return
 	}
-	clientIP := clientIPFromRequest(r, s.cfg.TrustXFF)
+	clientIP := s.clientIPOf(r)
 	r.Body = http.MaxBytesReader(w, r.Body, sessionEndpointBodyLimit)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
@@ -419,24 +419,21 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// clientIPFromRequest is a small helper that mirrors getClientIP in the
-// proxy package without dragging the proxy import. The session/web
-// boundary doesn't expose it directly, so we duplicate the trivial
-// extraction here. Honours TrustXFF for parity with the rest of the WAF.
-func clientIPFromRequest(r *http.Request, trustXFF bool) string {
+// clientIPOf resolves the request's client IP through the same shared
+// extractor the proxy hot path uses, so admin endpoints (PoW verify,
+// audit attribution) record the exact IP the rule engine saw. The
+// previous local copy of this logic could disagree with the proxy when
+// the trust policy was reloaded, leaving log entries pointing at
+// different IPs for the same request — diagnostically catastrophic.
+func (s *Server) clientIPOf(r *http.Request) string {
+	if s != nil && s.proxy != nil {
+		if ipx := s.proxy.IPExtractor(); ipx != nil {
+			return ipx.ClientIP(r)
+		}
+	}
+	// Defensive fallback for tests that wire a Server without a Proxy.
 	if r == nil {
 		return ""
-	}
-	if trustXFF {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if comma := strings.Index(xff, ","); comma != -1 {
-				return strings.TrimSpace(xff[:comma])
-			}
-			return strings.TrimSpace(xff)
-		}
-		if xri := r.Header.Get("X-Real-Ip"); xri != "" {
-			return strings.TrimSpace(xri)
-		}
 	}
 	host := r.RemoteAddr
 	if i := strings.LastIndexByte(host, ':'); i > -1 {

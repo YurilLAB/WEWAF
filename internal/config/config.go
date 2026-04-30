@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+
+	"wewaf/internal/clientip"
 )
 
 // Config holds all WAF runtime settings.
@@ -16,6 +18,14 @@ type Config struct {
 	AdminAddr       string `json:"admin_addr"`       // e.g. ":8443"
 	BackendURL      string `json:"backend_url"`      // e.g. "http://localhost:3000"
 	TrustXFF        bool   `json:"trust_xff"`        // trust X-Forwarded-For header
+	// TrustedProxies is the CIDR allowlist of upstream proxies whose
+	// X-Forwarded-For / X-Real-Ip headers we honour. When empty AND
+	// TrustXFF is true, the WAF falls back to the legacy left-most
+	// behaviour and emits a startup warning. Production deployments
+	// behind a CDN should always populate this with the CDN's egress
+	// CIDRs so an attacker who reaches the WAF directly cannot spoof
+	// the client IP via headers.
+	TrustedProxies  []string `json:"trusted_proxies"`
 	ReadTimeoutSec  int    `json:"read_timeout_sec"`
 	WriteTimeoutSec int    `json:"write_timeout_sec"`
 
@@ -260,6 +270,7 @@ func Default() *Config {
 		AdminAddr:                ":8443",
 		BackendURL:               "http://localhost:3000",
 		TrustXFF:                 false,
+		TrustedProxies:           nil,
 		ReadTimeoutSec:           30,
 		WriteTimeoutSec:          30,
 		MaxCPUCores:              runtime.NumCPU(),
@@ -672,7 +683,21 @@ func (c *Config) Validate() error {
 	if c.IntelFeedsLearningHours > 24*30 {
 		c.IntelFeedsLearningHours = 24 * 30
 	}
+	// Reject malformed trusted_proxies entries up front so a typo in
+	// production config doesn't silently disable the trust-gate at
+	// runtime.
+	if _, err := clientip.New(c.TrustXFF, c.TrustedProxies); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
 	return nil
+}
+
+// BuildClientIPExtractor returns a *clientip.Extractor configured from
+// the current TrustXFF / TrustedProxies values. Validate() must have
+// been called first; otherwise a malformed CIDR will surface as a
+// non-nil error here too.
+func (c *Config) BuildClientIPExtractor() (*clientip.Extractor, error) {
+	return clientip.New(c.TrustXFF, c.TrustedProxies)
 }
 
 // Snapshot returns a pointer to a shallow copy for safe read-only access.
@@ -686,6 +711,7 @@ func (c *Config) Snapshot() *Config {
 		AdminAddr:                c.AdminAddr,
 		BackendURL:               c.BackendURL,
 		TrustXFF:                 c.TrustXFF,
+		TrustedProxies:           append([]string(nil), c.TrustedProxies...),
 		ReadTimeoutSec:           c.ReadTimeoutSec,
 		WriteTimeoutSec:          c.WriteTimeoutSec,
 		MaxCPUCores:              c.MaxCPUCores,

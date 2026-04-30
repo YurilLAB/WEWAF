@@ -1,3 +1,11 @@
+> **Note (2026-04):** A code-level audit of every issue listed below
+> was completed. Most items in the original list had already been
+> addressed in subsequent commits — the remaining open item, the
+> client-IP spoofing risk in the XFF parser, has been resolved by
+> introducing `internal/clientip` with a trusted-proxy CIDR allowlist
+> and rightmost-untrusted hop walking. See the `Status` line under
+> each table row.
+
 ## What's Actually Strong
 
 ### 1. Session Tracker (`internal/session/tracker.go`)
@@ -51,6 +59,7 @@
 |-------|----------|--------|-----|
 | **Session cookie `HttpOnly: true` but challenge cookie `HttpOnly: false`** | `tracker.go:IssueChallengeCookie` | Challenge cookie readable by JS (intentional for beacon), but if XSS exists on site, attacker can steal `__wewaf_bc` and impersonate challenge-pass status | Consider `Secure` flag requirement, or split into two cookies: one HttpOnly for server verification, one JS-readable for beacon optimization |
 | **`clientIPFromRequest` trusts X-Forwarded-For blindly** | `tracker.go:clientIPFromRequest` | If `TrustXFF` is true but no trusted proxy list exists, attacker can spoof any IP in XFF, bypassing per-IP rate limits and session IP drift detection | Add `TrustedProxies []string` config, only parse XFF when RemoteAddr matches a trusted proxy CIDR |
+| **Status — RESOLVED** | `internal/clientip/clientip.go` | New shared `Extractor` honours forwarding headers only when the immediate peer matches a configured `trusted_proxies` CIDR, walking XFF rightmost-untrusted (RFC 7239). Empty list keeps legacy behaviour with a startup warning. Hot-reloadable via atomic.Pointer. Replaces 4 duplicate parsers across proxy/session/web/core. | — |
 | **GraphQL validator doesn't check subscription abuse** | `validator.go:walkSelectionSet` | No detection of WebSocket frame flooding or subscription amplification attacks | Add subscription operation counting, frame rate limiting |
 | **Egress proxy `dangerReason` resolves DNS on every request for cache misses** | `proxy.go:dangerReason` | DNS cache only helps on hits; first request to a new host still blocks on `resolver.LookupIP` with 5s timeout | Pre-resolve allowlist hosts at startup, add async background resolution for cache misses |
 | **No HSTS header injection** | `proxy.go:modifyResponse` | Security headers include X-Frame-Options, X-Content-Type-Options, Referrer-Policy, Permissions-Policy, but no `Strict-Transport-Security` | Add `Strict-Transport-Security: max-age=31536000; includeSubDomains` when backend is HTTPS |

@@ -122,7 +122,16 @@ func main() {
 	bf := bruteforce.NewDetector(time.Duration(cfg.BruteForceWindowSec) * time.Second)
 	defer bf.Stop()
 
+	// One *clientip.Extractor per WAF instance. The proxy creates its
+	// own from cfg in NewWAFProxy below, so we don't construct a second
+	// one here — instead we hand the proxy's instance to the session
+	// tracker. That keeps trust_xff + trusted_proxies single-sourced
+	// and makes hot-reload a single Update() call. The dependency
+	// inversion (build proxy first, then tracker) is enforced by the
+	// init order below.
+
 	// Session tracker — foundation for anomaly scoring and browser challenge.
+	// IPExtractor is wired after the proxy is built (see below).
 	sessionTracker := session.NewTracker(session.Config{
 		Secret:             cfg.SessionCookieSecret,
 		MaxSessions:        cfg.SessionMaxSessions,
@@ -130,7 +139,6 @@ func main() {
 		Enabled:            cfg.SessionTrackingEnabled,
 		RequestRateCeiling: cfg.SessionRequestRateCeiling,
 		PathCountCeiling:   cfg.SessionPathCountCeiling,
-		TrustXFF:           cfg.TrustXFF,
 	})
 	defer sessionTracker.Stop()
 
@@ -162,6 +170,15 @@ func main() {
 	wp, err := proxy.NewWAFProxy(cfg, eng, metrics, bf)
 	if err != nil {
 		log.Fatalf("failed to create proxy: %v", err)
+	}
+	// Share the proxy's client-IP extractor with the session tracker
+	// so both layers agree on every source-IP decision and a single
+	// hot-reload Update() propagates atomically.
+	sessionTracker.SetClientIPExtractor(wp.IPExtractor())
+	if cfg.TrustXFF && !wp.IPExtractor().HasTrustedProxies() {
+		log.Printf("WARN: trust_xff is enabled with an empty trusted_proxies list — " +
+			"any client can spoof X-Forwarded-For. Populate trusted_proxies with the " +
+			"upstream CDN/LB CIDR ranges in production.")
 	}
 	wp.AttachSessionTracker(sessionTracker)
 	wp.AttachGraphQLValidator(gqlValidator)
@@ -471,6 +488,15 @@ func main() {
 			cfg.ParanoiaLevel = fresh.ParanoiaLevel
 			cfg.RateLimitRPS = fresh.RateLimitRPS
 			cfg.RateLimitBurst = fresh.RateLimitBurst
+			cfg.TrustXFF = fresh.TrustXFF
+			cfg.TrustedProxies = append([]string(nil), fresh.TrustedProxies...)
+			// Apply the fresh trust policy atomically. A bad CIDR keeps
+			// the previous policy in place and surfaces in the log.
+			if ipx := wp.IPExtractor(); ipx != nil {
+				if err := ipx.Update(fresh.TrustXFF, fresh.TrustedProxies); err != nil {
+					log.Printf("config hot-reload: trusted_proxies rejected: %v", err)
+				}
+			}
 			log.Printf("config hot-reload: %d rules compiled, mode=%s paranoia=%d",
 				compiled.Count(), fresh.Mode, fresh.ParanoiaLevel)
 		})

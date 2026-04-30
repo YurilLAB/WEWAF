@@ -21,6 +21,7 @@ import (
 
 	"wewaf/internal/audit"
 	"wewaf/internal/bruteforce"
+	"wewaf/internal/clientip"
 	"wewaf/internal/config"
 	"wewaf/internal/core"
 	"wewaf/internal/ddos"
@@ -53,6 +54,10 @@ type WAFProxy struct {
 	sessions  *session.Tracker
 	gql       *graphql.Validator
 	audit     *audit.Chain
+	// ipExtractor encapsulates the trust_xff + trusted_proxies policy
+	// used to derive the real client IP. Always non-nil after
+	// construction; nil-safe for defensive callers.
+	ipExtractor *clientip.Extractor
 
 	// JA3 fingerprinting. ja3Cache is populated by the TLS listener via
 	// GetConfigForClient. ja3Detector + ja3Trust + ja3Header drive
@@ -141,6 +146,16 @@ func (wp *WAFProxy) AttachPoW(p *pow.Issuer) {
 		return
 	}
 	wp.pow = p
+}
+
+// IPExtractor returns the proxy's client-IP extractor so other
+// subsystems (admin handlers, mesh sync) can resolve the same
+// trust-policy as the hot path.
+func (wp *WAFProxy) IPExtractor() *clientip.Extractor {
+	if wp == nil {
+		return nil
+	}
+	return wp.ipExtractor
 }
 
 // JA3 returns the fingerprint observed for r, plus the detector verdict.
@@ -367,14 +382,20 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	sema := limits.NewSemaphore(cfg.MaxConcurrentReq)
 	rl := limits.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
+	ipx, err := cfg.BuildClientIPExtractor()
+	if err != nil {
+		return nil, fmt.Errorf("proxy: %w", err)
+	}
+
 	wp := &WAFProxy{
-		cfg:     cfg,
-		eng:     eng,
-		metrics: metrics,
-		bf:      bf,
-		sema:    sema,
-		rl:      rl,
-		backend: backend,
+		cfg:         cfg,
+		eng:         eng,
+		metrics:     metrics,
+		bf:          bf,
+		sema:        sema,
+		rl:          rl,
+		backend:     backend,
+		ipExtractor: ipx,
 		ddos: ddos.New(ddos.Config{
 			VolumetricBaseline:      cfg.DDoSVolumetricBaseline,
 			VolumetricSpike:         cfg.DDoSVolumetricSpike,
@@ -507,14 +528,13 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// X-WEWAF-Client-Cert-Verified is consumed by the zerotrust mTLS
-	// gate as a "verified by terminator" signal. When the operator has
-	// NOT opted into trusting edge headers (TrustXFF=false) we strip
-	// it on ingress so a direct attacker cannot fake mTLS. Operators
-	// running behind a trusted terminator (TrustXFF=true) should also
-	// configure the terminator to set this header AFTER stripping
-	// whatever the client sent — the same pattern used everywhere for
-	// edge-injected trust signals.
-	if !wp.cfg.TrustXFF {
+	// gate as a "verified by terminator" signal. We strip it on ingress
+	// unless the immediate peer is a configured trusted proxy — that
+	// way an attacker who reaches the WAF directly cannot forge mTLS,
+	// even when trust_xff is on for legitimate edge traffic. Operators
+	// behind a trusted terminator must configure that terminator to
+	// set this header AFTER stripping whatever the client sent.
+	if !wp.ipExtractor.IsTrustedPeer(r) {
 		r.Header.Del("X-WEWAF-Client-Cert-Verified")
 	}
 
@@ -526,7 +546,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// looks malformed in subtle ways. Logged via metrics so operators
 	// can tune via the dashboard.
 	if v := evaluateHardening(r); v.Reject {
-		ip := getClientIP(r, wp.cfg.TrustXFF)
+		ip := wp.ipExtractor.ClientIP(r)
 		wp.metrics.RecordBlock(ip, r.Method, r.URL.Path, v.RuleID, v.Reason, 100)
 		wp.auditWrite("harden_reject", ip, v.Reason, v.RuleID)
 		http.Error(w, v.Reason, v.Status)
@@ -546,8 +566,8 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		if !verdict.Allow {
 			wp.wsRejected.Add(1)
-			wp.metrics.RecordBlock(getClientIP(r, wp.cfg.TrustXFF), r.Method, r.URL.Path, "WS-UPGRADE", verdict.Reason, 0)
-			wp.auditWrite("ws_reject", getClientIP(r, wp.cfg.TrustXFF), verdict.Reason, "")
+			wp.metrics.RecordBlock(wp.ipExtractor.ClientIP(r), r.Method, r.URL.Path, "WS-UPGRADE", verdict.Reason, 0)
+			wp.auditWrite("ws_reject", wp.ipExtractor.ClientIP(r), verdict.Reason, "")
 			http.Error(w, "Forbidden: "+verdict.Reason, http.StatusForbidden)
 			return
 		}
@@ -575,7 +595,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				wp.sessions.RecordJA3(sessID, hash, verdict.Match, verdict.Reason)
 			}
 			if verdict.Blocked {
-				ip := getClientIP(r, wp.cfg.TrustXFF)
+				ip := wp.ipExtractor.ClientIP(r)
 				reason := "JA3 hard-block: " + verdict.Reason
 				wp.metrics.RecordBlock(ip, r.Method, r.URL.Path, "JA3:"+hash, reason, 100)
 				wp.auditWrite("ja3_block", ip, reason, hash)
@@ -587,7 +607,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Security Events tab. Score 0 + a "ja3" category keeps it
 			// out of the block totals.
 			if verdict.Match == "bad" {
-				ip := getClientIP(r, wp.cfg.TrustXFF)
+				ip := wp.ipExtractor.ClientIP(r)
 				wp.metrics.RecordBlockWithCategory(ip, r.Method, r.URL.Path,
 					"JA3-FLAG:"+hash, "ja3", "ja3 fingerprint match: "+verdict.Reason, 0)
 			}
@@ -638,7 +658,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer wp.sema.Release()
 	semaWait := time.Since(semaStart)
 
-	clientIP := getClientIP(r, wp.cfg.TrustXFF)
+	clientIP := wp.ipExtractor.ClientIP(r)
 
 	// DDoS detection: classify the request before we spend any effort on it.
 	// The detector tracks three independent signals (volumetric, per-IP
@@ -721,7 +741,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create WAF transaction.
-	tx := core.NewTransaction(w, r, wp.cfg.TrustXFF)
+	tx := core.NewTransaction(w, r, wp.ipExtractor)
 	reportedLen := int(r.ContentLength)
 	if reportedLen < 0 {
 		reportedLen = 0
@@ -1288,25 +1308,6 @@ func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("responseRecorder: Hijacker not supported by underlying writer")
 }
 
-func getClientIP(r *http.Request, trustXFF bool) string {
-	if trustXFF {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if idx := strings.Index(xff, ","); idx != -1 {
-				return strings.TrimSpace(xff[:idx])
-			}
-			return strings.TrimSpace(xff)
-		}
-		if xri := r.Header.Get("X-Real-Ip"); xri != "" {
-			return strings.TrimSpace(xri)
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
 func isWebSocket(r *http.Request) bool {
 	if r == nil {
 		return false
@@ -1488,8 +1489,11 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.ContentLength = int64(len(body))
 	}
 
-	// Create a synthetic transaction for egress inspection.
-	tx := core.NewTransaction(w, r, false)
+	// Create a synthetic transaction for egress inspection. Egress
+	// requests originate from the protected backend over loopback, so
+	// the trust_xff policy is irrelevant — we pass a nil extractor and
+	// NewTransaction degrades to RemoteAddr.
+	tx := core.NewTransaction(w, r, nil)
 	tx.SetMetadata("body", body)
 
 	targets := map[string]string{

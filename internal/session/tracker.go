@@ -28,13 +28,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"wewaf/internal/clientip"
 )
 
 const (
@@ -158,21 +159,23 @@ type Tracker struct {
 	requestRateCeiling atomic.Int64 // reqs/min above this starts scoring
 	pathCountCeiling   atomic.Int64 // distinct paths above this starts scoring
 
-	// trustXFF mirrors the proxy-level TrustXFF flag. When false the
-	// tracker ignores X-Forwarded-For / X-Real-Ip so hostile clients
-	// can't spoof source IPs past the per-session IP-drift check.
-	trustXFF atomic.Bool
+	// ipExtractor encapsulates the trust_xff + trusted_proxies policy
+	// shared with the proxy layer. Held behind an atomic.Pointer so
+	// SetClientIPExtractor can swap the policy on hot-reload without
+	// taking a lock on the per-request hot path. Nil is tolerated and
+	// degrades to RemoteAddr-only — exactly the safe default.
+	ipExtractor atomic.Pointer[clientip.Extractor]
 }
 
 // Config holds tracker tuning. Zero/empty fields fall back to sane defaults.
 type Config struct {
-	Secret             string        // HMAC key for cookie signing; auto-generated if empty
-	MaxSessions        int           // hard cap on live sessions (default 200 000)
-	IdleTTL            time.Duration // evict sessions idle longer than this (default 30 min)
-	Enabled            bool          // if false, GetOrCreate still works but signals are skipped
-	RequestRateCeiling int           // per-minute threshold that starts scoring
-	PathCountCeiling   int           // distinct-path threshold that starts scoring
-	TrustXFF           bool          // if true, parse X-Forwarded-For / X-Real-Ip; otherwise RemoteAddr only
+	Secret             string              // HMAC key for cookie signing; auto-generated if empty
+	MaxSessions        int                 // hard cap on live sessions (default 200 000)
+	IdleTTL            time.Duration       // evict sessions idle longer than this (default 30 min)
+	Enabled            bool                // if false, GetOrCreate still works but signals are skipped
+	RequestRateCeiling int                 // per-minute threshold that starts scoring
+	PathCountCeiling   int                 // distinct-path threshold that starts scoring
+	IPExtractor        *clientip.Extractor // shared trust-policy resolver; required for IP drift scoring
 }
 
 // NewTracker returns a Tracker with a cleanup goroutine started.
@@ -209,7 +212,9 @@ func NewTracker(cfg Config) *Tracker {
 		stopCh:      make(chan struct{}),
 	}
 	t.enabled.Store(cfg.Enabled)
-	t.trustXFF.Store(cfg.TrustXFF)
+	if cfg.IPExtractor != nil {
+		t.ipExtractor.Store(cfg.IPExtractor)
+	}
 	if cfg.RequestRateCeiling > 0 {
 		t.requestRateCeiling.Store(int64(cfg.RequestRateCeiling))
 	} else {
@@ -234,10 +239,17 @@ func (t *Tracker) Stop() {
 // scoring work happens on the hot path.
 func (t *Tracker) SetEnabled(on bool) { t.enabled.Store(on) }
 
-// SetTrustXFF updates whether the tracker parses X-Forwarded-For /
-// X-Real-Ip when extracting client IPs for drift scoring. Mirrors the
-// proxy-level flag so both layers agree on source-IP truth.
-func (t *Tracker) SetTrustXFF(on bool) { t.trustXFF.Store(on) }
+// SetClientIPExtractor swaps in a new trust policy at runtime. Pass
+// nil to fall back to RemoteAddr-only behaviour. The extractor is
+// shared with the proxy layer so both agree on the same source-IP
+// truth — config hot-reload calls this on the same instance both
+// layers reference, so a single Update() suffices for the whole WAF.
+func (t *Tracker) SetClientIPExtractor(ipx *clientip.Extractor) {
+	if t == nil {
+		return
+	}
+	t.ipExtractor.Store(ipx)
+}
 
 // Enabled reports whether scoring is active. The proxy checks this to
 // decide whether to invoke the tracker at all.
@@ -658,30 +670,13 @@ func randomID() string {
 	return hex.EncodeToString(b)
 }
 
-// clientIP extracts the best-guess client IP for this request. When the
-// operator has set TrustXFF we consult X-Forwarded-For / X-Real-Ip first
-// (stripping port numbers and whitespace). Otherwise we fall back to the
-// TCP-layer RemoteAddr so a client can't spoof the source IP by adding a
-// header. Using net.SplitHostPort handles IPv6 correctly (the previous
-// LastIndexByte shortcut broke on `[::1]:12345`).
+// clientIP extracts the best-guess client IP for this request,
+// honouring the shared trust_xff + trusted_proxies policy. When no
+// extractor is wired we degrade to RemoteAddr-only — a safe default
+// that never accepts a client-supplied forwarding header.
 func (t *Tracker) clientIP(r *http.Request) string {
-	if r == nil {
+	if t == nil {
 		return ""
 	}
-	if t != nil && t.trustXFF.Load() {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			// Left-most value is the original client per RFC 7239.
-			if idx := strings.Index(xff, ","); idx != -1 {
-				return strings.TrimSpace(xff[:idx])
-			}
-			return strings.TrimSpace(xff)
-		}
-		if xri := r.Header.Get("X-Real-Ip"); xri != "" {
-			return strings.TrimSpace(xri)
-		}
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && host != "" {
-		return host
-	}
-	return r.RemoteAddr
+	return t.ipExtractor.Load().ClientIP(r)
 }

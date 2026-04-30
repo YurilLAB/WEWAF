@@ -3,11 +3,11 @@ package core
 import (
 	"fmt"
 	"log"
-	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
+
+	"wewaf/internal/clientip"
 )
 
 // Phase represents a stage in the HTTP transaction lifecycle.
@@ -136,12 +136,15 @@ type Transaction struct {
 	Metadata  map[string]interface{} // arbitrary per-tx data (e.g. bruteforce counters)
 }
 
-// NewTransaction creates a transaction with safe defaults.
-func NewTransaction(w http.ResponseWriter, r *http.Request, trustXFF bool) *Transaction {
+// NewTransaction creates a transaction with safe defaults. The
+// extractor encapsulates the trust_xff + trusted_proxies policy so this
+// constructor can never accidentally read a spoofed forwarding header.
+// Callers may pass a nil extractor — it degrades to RemoteAddr only.
+func NewTransaction(w http.ResponseWriter, r *http.Request, ipx *clientip.Extractor) *Transaction {
 	tx := &Transaction{
 		ID:             generateID(),
 		Started:        time.Now().UTC(),
-		ClientIP:       clientIP(r, trustXFF),
+		ClientIP:       ipx.ClientIP(r),
 		Request:        r,
 		ResponseWriter: w,
 		Metadata:       make(map[string]interface{}),
@@ -227,25 +230,6 @@ func nextCounter() uint64 {
 	return counter
 }
 
-// clientIP extracts the remote address, optionally parsing X-Forwarded-For.
-func clientIP(r *http.Request, trustXFF bool) string {
-	if trustXFF {
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			if idx := strings.Index(xff, ","); idx != -1 {
-				return strings.TrimSpace(xff[:idx])
-			}
-			return strings.TrimSpace(xff)
-		}
-		if xri := r.Header.Get("X-Real-Ip"); xri != "" {
-			return strings.TrimSpace(xri)
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
 
 // BanEntry records a single IP ban.
 type BanEntry struct {
