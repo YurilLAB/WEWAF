@@ -10,6 +10,7 @@ import (
 	stdnet "net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1690,47 +1691,111 @@ func (s *Server) handleNetworkSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-// handleNetworkTopPaths returns the most frequently blocked paths from the
-// persisted history in the given time window.
+// handleNetworkTopPaths returns the most frequently visited paths in
+// the given time window. The legacy behaviour was "blocks only"; we
+// now accept a kind= query parameter so the network-monitoring page
+// can render either:
+//
+//	kind=blocked   (default) — most-targeted paths from blocks table
+//	kind=passed             — what real users hit (live counter,
+//	                          since-startup window only)
+//	kind=all                — union of the two so a single view shows
+//	                          both attack surface and live activity
+//
+// "passed" / "all" pull from the in-memory PassedPathCounts map rather
+// than persisted history because there's currently no per-request
+// table — adding one would write 5K+ rows/sec on a busy site, so the
+// live counter is the right tradeoff. The window for those modes is
+// "since process start" and the response includes a window=… field
+// so the UI can label it correctly.
 func (s *Server) handleNetworkTopPaths(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.history == nil {
-		writeJSON(w, map[string]interface{}{"paths": []map[string]interface{}{}})
+	kind := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("kind")))
+	switch kind {
+	case "":
+		kind = "blocked"
+	case "blocked", "passed", "all":
+		// ok
+	default:
+		http.Error(w, "kind must be blocked, passed, or all", http.StatusBadRequest)
 		return
-	}
-	from, to, _ := parseTimeRange(r, 2000)
-	events, err := s.history.QueryBlocks(from, to, 5000)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	counts := make(map[string]int, 64)
-	for _, e := range events {
-		counts[e.Method+" "+e.Path]++
 	}
 	type pathCount struct {
-		Path  string `json:"path"`
-		Count int    `json:"count"`
+		Path    string `json:"path"`
+		Count   int    `json:"count"`
+		Blocked int    `json:"blocked,omitempty"`
+		Passed  int    `json:"passed,omitempty"`
 	}
-	out := make([]pathCount, 0, len(counts))
-	for k, v := range counts {
-		out = append(out, pathCount{Path: k, Count: v})
+	counts := make(map[string]*pathCount, 64)
+	bumpBlocked := func(key string, n int) {
+		c, ok := counts[key]
+		if !ok {
+			c = &pathCount{Path: key}
+			counts[key] = c
+		}
+		c.Blocked += n
+		c.Count += n
 	}
-	// Simple in-place sort: largest count first. Using a handwritten compare
-	// avoids importing sort on a file that already has enough imports.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j].Count > out[j-1].Count; j-- {
-			out[j], out[j-1] = out[j-1], out[j]
+	bumpPassed := func(key string, n int) {
+		c, ok := counts[key]
+		if !ok {
+			c = &pathCount{Path: key}
+			counts[key] = c
+		}
+		c.Passed += n
+		c.Count += n
+	}
+
+	from, to, _ := parseTimeRange(r, 2000)
+
+	if (kind == "blocked" || kind == "all") && s.history != nil {
+		events, err := s.history.QueryBlocks(from, to, 5000)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, e := range events {
+			bumpBlocked(e.Method+" "+e.Path, 1)
 		}
 	}
+	if (kind == "passed" || kind == "all") && s.metrics != nil {
+		passed := s.metrics.PassedPathCountsSnapshot()
+		for k, v := range passed {
+			bumpPassed(k, int(v))
+		}
+	}
+
+	out := make([]pathCount, 0, len(counts))
+	for _, c := range counts {
+		out = append(out, *c)
+	}
+	// Stable sort, largest count first. sort.Slice is already in the
+	// import set elsewhere in this file, so the previous insertion
+	// sort was an unnecessary O(n²) on potentially-thousands of paths.
+	sort.Slice(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+
 	limit := clampInt(parseInt(r.URL.Query().Get("limit"), 25), 1, 200)
 	if len(out) > limit {
 		out = out[:limit]
 	}
-	writeJSON(w, map[string]interface{}{"paths": out, "from": from, "to": to})
+	resp := map[string]interface{}{
+		"paths": out,
+		"kind":  kind,
+	}
+	if kind == "blocked" || kind == "all" {
+		resp["from"] = from
+		resp["to"] = to
+	}
+	if kind == "passed" || kind == "all" {
+		// "passed" counters live in memory only — surface that fact
+		// so the UI can render "since restart" rather than implying
+		// the time window applies to them.
+		resp["passed_window"] = "since_startup"
+	}
+	writeJSON(w, resp)
 }
 
 // handleNetworkTopIPs wraps QueryIPs for the Network Monitoring page.

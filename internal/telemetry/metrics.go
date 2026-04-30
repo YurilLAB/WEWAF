@@ -22,6 +22,32 @@ const (
 	// IPs. The set is reset on history rotation so long-running daemons keep
 	// reporting fresh counts.
 	maxUniqueIPs = 100_000
+	// recentIPBucketCount is the number of hourly buckets in the
+	// sliding-window unique-IP tracker. 24 covers a full day on a
+	// per-hour cadence, which matches the typical history-rotation
+	// boundary, so the in-memory recent-window resets at the same
+	// time the persisted DB rolls.
+	recentIPBucketCount = 24
+	// recentIPBucketCap caps the size of any single hourly bucket.
+	// Each bucket independently holds up to this many distinct IPs,
+	// so the worst-case hot-path memory under a rotating-source
+	// attack is recentIPBucketCount × recentIPBucketCap entries —
+	// 24 × 50K = 1.2M IPs at ~32 bytes each ≈ 40 MB. Acceptable;
+	// shrinks to zero once the attack ends and the buckets rotate
+	// out.
+	recentIPBucketCap = 50_000
+	// statusCodeMaxKeys caps the per-code counter map.
+	statusCodeMaxKeys = 64
+	// methodMaxKeys caps the per-method counter map. Real protocols
+	// use 9 standard methods plus the occasional WebDAV / extension
+	// — anything past 32 is hostile creativity.
+	methodMaxKeys = 32
+	// passedPathsMaxKeys caps the live "what passed" path map. 4096
+	// covers a busy SPA + a CMS with categories; once full we stop
+	// adding new keys but keep counting hits on existing ones, so a
+	// scanner spraying random URLs can't bloat memory but real
+	// traffic on known paths still increments.
+	passedPathsMaxKeys = 4096
 )
 
 // Persister receives every event for durable storage. Implementations MUST be
@@ -74,6 +100,26 @@ type Metrics struct {
 	RecentEgress    []EgressEvent
 	RecentBots      []BotEvent
 	StatusCounts    map[int]uint64
+	// StatusCodes is the precise per-code count (200, 301, 401, 404,
+	// 429, 503…) — what StatusCounts conflates into 100-buckets. The
+	// security-events page uses this to differentiate auth failures
+	// (401/403) from rate-limited traffic (429) from origin failures
+	// (502/503), which the bucketed view collapses. Capped at
+	// statusCodeMaxKeys so a creative attacker can't make us hold a
+	// map with one entry per bogus code.
+	StatusCodes map[int]uint64
+	// MethodCounts is the per-HTTP-method count (GET / POST / PUT /
+	// DELETE / PATCH / OPTIONS / HEAD). Capped to a small set so a
+	// hostile client can't bloat the map with random tokens. Useful
+	// for spotting "flood of POSTs against /login" vs "scanner hit
+	// every URL with GETs" at a glance.
+	MethodCounts map[string]uint64
+	// PassedPathCounts is the live counter behind the "Top paths
+	// (all traffic)" view. Without this the only top-paths data is
+	// from the blocks table — useful for security but useless for
+	// "what URLs are my real users hitting". Capped at
+	// passedPathsMaxKeys.
+	PassedPathCounts map[string]uint64
 
 	// Bandwidth rate, computed in AddTrafficPoint.
 	lastSampleTime   time.Time
@@ -81,6 +127,19 @@ type Metrics struct {
 	lastBytesOut     uint64
 	CurrentBytesInPS uint64
 	CurrentBytesOutPS uint64
+
+	// Sliding-window unique IPs. The previous monotonic UniqueIPs map
+	// only ever grew; once it hit maxUniqueIPs the count saturated and
+	// the dashboard "unique IPs seen" number stayed at the cap forever
+	// regardless of current activity. recentIPBuckets stores one set
+	// per hour over a 24-hour ring, rotated on each sampler tick. The
+	// cardinality of the union approximates "unique IPs in the last
+	// 24 hours" — a number that rises with traffic and falls when an
+	// attack ends. UniqueIPs (map above) stays as the lifetime view
+	// for backwards compatibility.
+	recentIPBuckets       [recentIPBucketCount]map[string]struct{}
+	recentIPCurrentBucket int
+	recentIPCurrentHour   int64
 
 	recentBlocksCap int
 	trafficCap      int
@@ -123,27 +182,120 @@ type BlockRecord struct {
 	Message      string    `json:"message"`
 }
 
-// TrafficPoint stores request volume at a point in time.
+// TrafficPoint stores request volume + bandwidth at a point in time.
+// Mirrors history.TrafficPoint so the live /api/traffic endpoint can
+// return the same shape the persisted store already records — the
+// previous in-memory shape carried only Requests + Blocked, so the
+// dashboard's bandwidth-per-bucket view had to fall back to the
+// aggregate bytes_in/out_per_sec rate. With bytes on every point
+// callers can render a real bandwidth-over-time chart from a single
+// query.
 type TrafficPoint struct {
 	Time     time.Time `json:"time"`
 	Requests int       `json:"requests"`
 	Blocked  int       `json:"blocked"`
+	BytesIn  uint64    `json:"bytes_in"`
+	BytesOut uint64    `json:"bytes_out"`
 }
 
 // NewMetrics creates a metrics collector with the default caps.
 func NewMetrics() *Metrics {
-	return &Metrics{
-		UniqueIPs:       make(map[string]struct{}, 1024),
-		RecentBlocks:    make([]BlockRecord, 0, defaultRecentBlocksCap),
-		TrafficHistory:  make([]TrafficPoint, 0, defaultTrafficCap),
-		RecentEgress:    make([]EgressEvent, 0, defaultEgressCap),
-		RecentBots:      make([]BotEvent, 0, defaultBotCap),
-		StatusCounts:    make(map[int]uint64, 16),
-		recentBlocksCap: defaultRecentBlocksCap,
-		trafficCap:      defaultTrafficCap,
-		egressCap:       defaultEgressCap,
-		botCap:          defaultBotCap,
+	m := &Metrics{
+		UniqueIPs:        make(map[string]struct{}, 1024),
+		RecentBlocks:     make([]BlockRecord, 0, defaultRecentBlocksCap),
+		TrafficHistory:   make([]TrafficPoint, 0, defaultTrafficCap),
+		RecentEgress:     make([]EgressEvent, 0, defaultEgressCap),
+		RecentBots:       make([]BotEvent, 0, defaultBotCap),
+		StatusCounts:     make(map[int]uint64, 16),
+		StatusCodes:      make(map[int]uint64, 32),
+		MethodCounts:     make(map[string]uint64, 16),
+		PassedPathCounts: make(map[string]uint64, 256),
+		recentBlocksCap:  defaultRecentBlocksCap,
+		trafficCap:       defaultTrafficCap,
+		egressCap:        defaultEgressCap,
+		botCap:           defaultBotCap,
 	}
+	// Pre-seed the first hourly IP bucket so the first RecordRequest
+	// doesn't have to grow the array under the hot-path lock.
+	m.recentIPBuckets[0] = make(map[string]struct{}, 1024)
+	m.recentIPCurrentHour = time.Now().UTC().Unix() / 3600
+	return m
+}
+
+// rotateUniqueIPsLocked advances the sliding window if the current
+// hour-of-day has rolled. Cheap when the wall clock hasn't crossed an
+// hour boundary (a single int compare) so the sampler can call it on
+// every tick. CALLER MUST HOLD m.mu.
+func (m *Metrics) rotateUniqueIPsLocked(now time.Time) {
+	hour := now.UTC().Unix() / 3600
+	if hour == m.recentIPCurrentHour {
+		return
+	}
+	steps := hour - m.recentIPCurrentHour
+	if steps <= 0 {
+		// Clock travelled backwards (NTP slew). Keep the existing
+		// window — corruption from a wrong time is preferable to
+		// blowing away N hours of legitimate traffic data.
+		m.recentIPCurrentHour = hour
+		return
+	}
+	if steps >= int64(recentIPBucketCount) {
+		// Whole window aged out — clear everything in one pass
+		// rather than spinning the rotation N times.
+		for i := range m.recentIPBuckets {
+			m.recentIPBuckets[i] = nil
+		}
+		m.recentIPCurrentBucket = 0
+		m.recentIPBuckets[0] = make(map[string]struct{}, 1024)
+		m.recentIPCurrentHour = hour
+		return
+	}
+	for i := int64(0); i < steps; i++ {
+		m.recentIPCurrentBucket = (m.recentIPCurrentBucket + 1) % recentIPBucketCount
+		// Replace the slot rather than clearing — replacing drops
+		// the entire backing storage in one allocator call.
+		m.recentIPBuckets[m.recentIPCurrentBucket] = make(map[string]struct{}, 1024)
+	}
+	m.recentIPCurrentHour = hour
+}
+
+// recordRecentIPLocked stores ip in the current-hour bucket if it's
+// not full. CALLER MUST HOLD m.mu.
+func (m *Metrics) recordRecentIPLocked(ip string) {
+	if ip == "" {
+		return
+	}
+	bucket := m.recentIPBuckets[m.recentIPCurrentBucket]
+	if bucket == nil {
+		bucket = make(map[string]struct{}, 1024)
+		m.recentIPBuckets[m.recentIPCurrentBucket] = bucket
+	}
+	if len(bucket) >= recentIPBucketCap {
+		// Bucket cap hit. We deliberately do NOT evict from the
+		// bucket — that would make the cardinality count meaningless
+		// (we'd be deleting old IPs we already counted). Instead we
+		// just stop adding new IPs to this hour's bucket. Once the
+		// hour rolls the next bucket starts fresh.
+		return
+	}
+	bucket[ip] = struct{}{}
+}
+
+// recentUniqueIPCountLocked returns the cardinality of the union over
+// every hourly bucket. CALLER MUST HOLD m.mu (or RLock).
+func (m *Metrics) recentUniqueIPCountLocked() int {
+	// Estimate the union without allocating a temporary set: walk
+	// each bucket and dedupe via a single shared map. The 1024
+	// capacity covers the common case (a steady site) without
+	// growing for a quiet WAF; high-traffic deploys will resize it
+	// once.
+	seen := make(map[string]struct{}, 1024)
+	for _, b := range m.recentIPBuckets {
+		for ip := range b {
+			seen[ip] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 // SetPersister attaches a durable-storage backend. May be nil.
@@ -168,12 +320,19 @@ func (m *Metrics) OnRotation() {
 }
 
 // RecordRequest increments total requests and tracks the client IP.
+// Every request feeds both the lifetime-cap UniqueIPs set and the
+// sliding-window recent-IPs ring; Snapshot exposes both as
+// "unique_ips" (lifetime-since-rotation) and "unique_ips_recent"
+// (last 24h).
 func (m *Metrics) RecordRequest(ip string, bytesIn int) {
 	defer recoverPanic("RecordRequest")
 	m.mu.Lock()
 	m.TotalRequests++
-	if len(m.UniqueIPs) < maxUniqueIPs && ip != "" {
-		m.UniqueIPs[ip] = struct{}{}
+	if ip != "" {
+		if len(m.UniqueIPs) < maxUniqueIPs {
+			m.UniqueIPs[ip] = struct{}{}
+		}
+		m.recordRecentIPLocked(ip)
 	}
 	m.TotalBytesIn += uint64(maxInt(bytesIn, 0))
 	p := m.persister
@@ -245,20 +404,114 @@ func (m *Metrics) RecordBlockWithCategory(ip, method, path, ruleID, category, me
 }
 
 // RecordPass increments passed requests and records response status.
+// Deprecated shape kept for backwards compatibility — new callers
+// should prefer RecordPassDetailed which records method + path so the
+// "top paths (all traffic)" view has data.
 func (m *Metrics) RecordPass(bytesOut int, statusCode int) {
-	defer recoverPanic("RecordPass")
+	m.RecordPassDetailed("", "", bytesOut, statusCode)
+}
+
+// RecordPassDetailed is the full-fidelity passed-request recorder.
+// Adds per-method counters, exact status-code counts (in addition to
+// the legacy 100-bucketed StatusCounts), and a path-popularity counter
+// the network-monitoring page can consume. Each map is capped so a
+// hostile client spraying random methods / paths can't bloat memory.
+func (m *Metrics) RecordPassDetailed(method, path string, bytesOut, statusCode int) {
+	defer recoverPanic("RecordPassDetailed")
 	m.mu.Lock()
 	m.PassedRequests++
 	m.TotalBytesOut += uint64(maxInt(bytesOut, 0))
 	if statusCode > 0 {
-		// Bucket by hundreds so the map stays small: 200, 300, 400, 500.
+		// Bucketed view (legacy): 200, 300, 400, 500 etc.
 		bucket := (statusCode / 100) * 100
 		if m.StatusCounts == nil {
 			m.StatusCounts = make(map[int]uint64, 8)
 		}
 		m.StatusCounts[bucket]++
+		// Precise view: exact code. Only commit to the map if either
+		// the code is already there or we're under the cap; this lets
+		// existing keys keep counting while preventing unbounded growth
+		// from a stream of synthetic codes (e.g. an upstream returning
+		// random integers).
+		if m.StatusCodes == nil {
+			m.StatusCodes = make(map[int]uint64, 32)
+		}
+		if _, exists := m.StatusCodes[statusCode]; exists || len(m.StatusCodes) < statusCodeMaxKeys {
+			m.StatusCodes[statusCode]++
+		}
+	}
+	if method != "" {
+		// Standard methods are uppercase; normalising avoids
+		// "GET" / "get" / "Get" splitting the count three ways
+		// when a buggy client mis-cases the verb.
+		method = upperASCII(method)
+		if m.MethodCounts == nil {
+			m.MethodCounts = make(map[string]uint64, 8)
+		}
+		if _, exists := m.MethodCounts[method]; exists || len(m.MethodCounts) < methodMaxKeys {
+			m.MethodCounts[method]++
+		}
+	}
+	if path != "" {
+		// Trim query / fragment so /search?q=foo and /search?q=bar
+		// merge into one popularity-meaningful key. Cap path length
+		// so a 10 KB URL can't bloat a single map entry.
+		key := normaliseTopPathKey(method, path)
+		if m.PassedPathCounts == nil {
+			m.PassedPathCounts = make(map[string]uint64, 256)
+		}
+		if _, exists := m.PassedPathCounts[key]; exists || len(m.PassedPathCounts) < passedPathsMaxKeys {
+			m.PassedPathCounts[key]++
+		}
 	}
 	m.mu.Unlock()
+}
+
+// upperASCII converts ASCII letters to upper case without touching
+// multi-byte runes — methods are 7-bit per RFC 9110 so we don't need
+// strings.ToUpper's locale awareness.
+func upperASCII(s string) string {
+	b := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 32
+		}
+		b[i] = c
+	}
+	return string(b)
+}
+
+// normaliseTopPathKey returns "METHOD path-without-query" trimmed to
+// a sane length. Used so the top-paths view counts /api/users?id=42
+// and /api/users?id=99 together instead of as 2 distinct keys.
+func normaliseTopPathKey(method, path string) string {
+	const maxPath = 256
+	// Drop query + fragment. The proxy never sees a fragment but
+	// belt-and-braces here.
+	if i := indexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	if len(path) > maxPath {
+		path = path[:maxPath]
+	}
+	if method == "" {
+		return path
+	}
+	return method + " " + path
+}
+
+// indexAny is a tiny stand-in for strings.IndexAny — kept inline so
+// this file's import set doesn't expand for one tiny lookup.
+func indexAny(s, chars string) int {
+	for i := 0; i < len(s); i++ {
+		for j := 0; j < len(chars); j++ {
+			if s[i] == chars[j] {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // RecordBlockFromResponse preserved for backwards compatibility with callers.
@@ -390,6 +643,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 	for k, v := range m.StatusCounts {
 		statusCounts[strconvItoa(k)] = v
 	}
+	statusCodes := make(map[string]uint64, len(m.StatusCodes))
+	for k, v := range m.StatusCodes {
+		statusCodes[strconvItoa(k)] = v
+	}
+	methodCounts := make(map[string]uint64, len(m.MethodCounts))
+	for k, v := range m.MethodCounts {
+		methodCounts[k] = v
+	}
 	return map[string]interface{}{
 		"total_requests":      m.TotalRequests,
 		"blocked_requests":    m.BlockedRequests,
@@ -402,11 +663,36 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"egress_blocked":      m.EgressBlocked,
 		"egress_allowed":      m.EgressAllowed,
 		"bots_detected":       m.BotsDetected,
+		// "unique_ips" is the lifetime-since-rotation count (legacy
+		// behaviour, capped at maxUniqueIPs). "unique_ips_recent" is
+		// the rolling-24h cardinality the dashboard wants when it
+		// asks "how many unique clients are talking to me right now".
 		"unique_ips":          len(m.UniqueIPs),
+		"unique_ips_recent":   m.recentUniqueIPCountLocked(),
 		"recent_blocks":       recent,
 		"traffic_history":     history,
 		"status_code_buckets": statusCounts,
+		"status_codes":        statusCodes,
+		"method_counts":       methodCounts,
 	}
+}
+
+// PassedPathCountsSnapshot returns a copy of the live passed-traffic
+// path map. Used by the /api/network/top-paths handler when the
+// caller asks for kind=all|passed — without this the only top-paths
+// view came from the persisted blocks table, which is great for
+// security but useless for "where are real users hitting".
+func (m *Metrics) PassedPathCountsSnapshot() map[string]uint64 {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]uint64, len(m.PassedPathCounts))
+	for k, v := range m.PassedPathCounts {
+		out[k] = v
+	}
+	return out
 }
 
 // CountersSnapshot returns just the scalar counters (no slices). Useful for
@@ -449,24 +735,22 @@ func (m *Metrics) RecentBlocksSnapshot(n int) []BlockRecord {
 	return out
 }
 
-// AddTrafficPoint appends a traffic sample for the line graph and recomputes
-// the current bandwidth rate (bytes per second) from the delta since the last
-// sample. The caller (cmd/waf startTrafficSampler) ticks at a fixed interval.
+// AddTrafficPoint appends a traffic sample for the line graph and
+// recomputes the current bandwidth rate (bytes per second) from the
+// delta since the last sample. The caller (cmd/waf startTrafficSampler)
+// ticks at a fixed interval.
+//
+// The bytes deltas are derived inside this function from the running
+// TotalBytesIn / TotalBytesOut counters so callers don't have to track
+// state. Each TrafficPoint stored in TrafficHistory now carries the
+// per-bucket bytes — previously the dashboard had to combine the
+// in-memory point (req+blocked only) with the separate aggregate
+// bytes/sec to render bandwidth-over-time, which produced a flat line
+// at low traffic and a misleading spike on the most recent sample.
 func (m *Metrics) AddTrafficPoint(reqs, blocked int) {
 	defer recoverPanic("AddTrafficPoint")
 	now := time.Now().UTC()
-	pt := TrafficPoint{
-		Time:     now,
-		Requests: reqs,
-		Blocked:  blocked,
-	}
 	m.mu.Lock()
-	m.TrafficHistory = append(m.TrafficHistory, pt)
-	if len(m.TrafficHistory) > m.trafficCap {
-		over := len(m.TrafficHistory) - m.trafficCap
-		copy(m.TrafficHistory, m.TrafficHistory[over:])
-		m.TrafficHistory = m.TrafficHistory[:m.trafficCap]
-	}
 	// Compute bytes/sec since the last sample plus the raw delta so the
 	// persister can store per-bucket traffic volumes for long-term analysis.
 	var bytesInDelta, bytesOutDelta uint64
@@ -483,9 +767,26 @@ func (m *Metrics) AddTrafficPoint(reqs, blocked int) {
 			m.CurrentBytesOutPS = uint64(float64(bytesOutDelta) / elapsed)
 		}
 	}
+	pt := TrafficPoint{
+		Time:     now,
+		Requests: reqs,
+		Blocked:  blocked,
+		BytesIn:  bytesInDelta,
+		BytesOut: bytesOutDelta,
+	}
+	m.TrafficHistory = append(m.TrafficHistory, pt)
+	if len(m.TrafficHistory) > m.trafficCap {
+		over := len(m.TrafficHistory) - m.trafficCap
+		copy(m.TrafficHistory, m.TrafficHistory[over:])
+		m.TrafficHistory = m.TrafficHistory[:m.trafficCap]
+	}
 	m.lastSampleTime = now
 	m.lastBytesIn = m.TotalBytesIn
 	m.lastBytesOut = m.TotalBytesOut
+	// Tick the unique-IPs sliding window — every sample we may have
+	// crossed an hour boundary; rotateUniqueIPsLocked handles the cheap
+	// no-op case when we haven't.
+	m.rotateUniqueIPsLocked(now)
 	p := m.persister
 	m.mu.Unlock()
 	if p != nil {
