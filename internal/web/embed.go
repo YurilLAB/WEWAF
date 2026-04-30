@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
 	stdnet "net"
@@ -937,6 +938,16 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if path, err := s.cfg.SnapshotToFile("config_backup", 10); err == nil {
 			log.Printf("config snapshot saved: %s", path)
 		}
+		// Append an audit entry. We deliberately don't dump the whole
+		// payload — secrets like mesh_api_key would land in the log.
+		// A short summary plus the snapshot file path is enough to
+		// correlate "config changed at T" with "the snapshot at T".
+		if s.audit != nil {
+			_, _ = s.audit.Append("config_write", s.clientIPOf(r),
+				"admin POST /api/config",
+				fmt.Sprintf(`{"mode":%q,"history_rotate_hours":%d}`,
+					s.cfg.ModeSnapshot(), rotateHours))
+		}
 		writeJSON(w, map[string]interface{}{"status": "ok", "mode": s.cfg.ModeSnapshot(), "history_rotate_hours": rotateHours})
 	default:
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -1028,6 +1039,16 @@ func (s *Server) handleBans(w http.ResponseWriter, r *http.Request) {
 			payload.Reason = "manual"
 		}
 		s.banList.Ban(payload.IP, payload.Reason, time.Duration(payload.DurationSec)*time.Second)
+		// Tamper-evident audit record. Without this, an admin who
+		// reaches /api/bans (e.g. by stealing the API key) leaves no
+		// chain entry — the previous design only logged WAF-issued
+		// bans, not operator-issued ones.
+		if s.audit != nil {
+			meta := fmt.Sprintf(`{"ip":%q,"duration_sec":%d,"reason":%q}`,
+				payload.IP, payload.DurationSec, payload.Reason)
+			_, _ = s.audit.Append("ban_admin", s.clientIPOf(r),
+				"admin POST /api/bans", meta)
+		}
 		writeJSON(w, map[string]string{"status": "ok"})
 	case http.MethodDelete:
 		ip := r.URL.Query().Get("ip")
@@ -1037,6 +1058,11 @@ func (s *Server) handleBans(w http.ResponseWriter, r *http.Request) {
 		}
 		if s.banList != nil {
 			s.banList.Unban(ip)
+		}
+		if s.audit != nil {
+			_, _ = s.audit.Append("unban_admin", s.clientIPOf(r),
+				"admin DELETE /api/bans",
+				fmt.Sprintf(`{"ip":%q}`, ip))
 		}
 		writeJSON(w, map[string]string{"status": "ok"})
 	default:
@@ -1782,6 +1808,15 @@ func (s *Server) handleAutoMitigate(w http.ResponseWriter, r *http.Request) {
 		s.banList.Ban(a.IP, "auto-mitigation: exceeded block threshold", time.Duration(req.DurationSec)*time.Second)
 		banned = append(banned, a.IP)
 	}
+	// One audit entry summarising the bulk action — operator-initiated
+	// bulk bans are exactly the kind of mutation an incident timeline
+	// needs to be able to reconstruct after the fact.
+	if s.audit != nil && len(banned) > 0 {
+		_, _ = s.audit.Append("auto_mitigate", s.clientIPOf(r),
+			"admin POST /api/ip-auto-mitigate",
+			fmt.Sprintf(`{"threshold":%d,"duration_sec":%d,"banned_count":%d}`,
+				req.Threshold, req.DurationSec, len(banned)))
+	}
 	writeJSON(w, map[string]interface{}{
 		"banned":    banned,
 		"scanned":   len(ips),
@@ -1947,6 +1982,11 @@ func (s *Server) handleZeroTrustPolicies(w http.ResponseWriter, r *http.Request)
 		if err := zt.SetPolicies(payload.Policies); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		if s.audit != nil {
+			_, _ = s.audit.Append("zerotrust_write", s.clientIPOf(r),
+				"admin "+r.Method+" /api/zerotrust/policies",
+				fmt.Sprintf(`{"count":%d}`, len(payload.Policies)))
 		}
 		writeJSON(w, map[string]interface{}{"status": "ok", "count": len(payload.Policies)})
 	default:

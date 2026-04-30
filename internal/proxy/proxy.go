@@ -210,6 +210,27 @@ func (wp *WAFProxy) applyHeadersForTest(res *http.Response) {
 		res.Header.Set("X-Frame-Options", "DENY")
 		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		res.Header.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+		// Disabling implicit DNS prefetch keeps the browser from
+		// resolving links the user hasn't followed yet, which would
+		// otherwise leak target hostnames to a network attacker even
+		// when the user never clicks. Cheap, no app impact.
+		res.Header.Set("X-DNS-Prefetch-Control", "off")
+		// Cross-Origin-Resource-Policy=same-origin tells modern browsers
+		// to refuse rendering this response inside <img>/<script> on
+		// other origins — a meaningful defence against Spectre-style
+		// cross-origin reads and against opportunistic resource theft.
+		// We only set it when the backend hasn't supplied its own
+		// CORP value, since some apps deliberately publish "cross-origin"
+		// for static assets.
+		if res.Header.Get("Cross-Origin-Resource-Policy") == "" {
+			res.Header.Set("Cross-Origin-Resource-Policy", "same-origin")
+		}
+		// Cross-Origin-Opener-Policy=same-origin gives the response its
+		// own browsing-context group, neutralising tabnabbing /
+		// window.opener attacks against any page the response renders.
+		if res.Header.Get("Cross-Origin-Opener-Policy") == "" {
+			res.Header.Set("Cross-Origin-Opener-Policy", "same-origin")
+		}
 	}
 	if wp.cfg.HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
 		maxAge := wp.cfg.HSTSMaxAgeSec
@@ -1083,6 +1104,27 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 		res.Header.Set("X-Frame-Options", "DENY")
 		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
 		res.Header.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+		// Disabling implicit DNS prefetch keeps the browser from
+		// resolving links the user hasn't followed yet, which would
+		// otherwise leak target hostnames to a network attacker even
+		// when the user never clicks. Cheap, no app impact.
+		res.Header.Set("X-DNS-Prefetch-Control", "off")
+		// Cross-Origin-Resource-Policy=same-origin tells modern browsers
+		// to refuse rendering this response inside <img>/<script> on
+		// other origins — a meaningful defence against Spectre-style
+		// cross-origin reads and against opportunistic resource theft.
+		// We only set it when the backend hasn't supplied its own
+		// CORP value, since some apps deliberately publish "cross-origin"
+		// for static assets.
+		if res.Header.Get("Cross-Origin-Resource-Policy") == "" {
+			res.Header.Set("Cross-Origin-Resource-Policy", "same-origin")
+		}
+		// Cross-Origin-Opener-Policy=same-origin gives the response its
+		// own browsing-context group, neutralising tabnabbing /
+		// window.opener attacks against any page the response renders.
+		if res.Header.Get("Cross-Origin-Opener-Policy") == "" {
+			res.Header.Set("Cross-Origin-Opener-Policy", "same-origin")
+		}
 	}
 	// HSTS — only emit on HTTPS backends. Setting Strict-Transport-Security
 	// on http:// is spec-non-compliant and most browsers ignore it anyway,

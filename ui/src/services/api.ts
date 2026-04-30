@@ -587,6 +587,17 @@ export const api = {
     intel_feeds_cache_dir?: string;
     intel_feeds_learning_hours?: number;
     intel_feeds_allow_sources?: string[];
+    // CIDR allowlist gating X-Forwarded-For. Bare IPs accepted.
+    trusted_proxies?: string[];
+    // gRPC + WebSocket DPI.
+    grpc_inspect?: boolean;
+    grpc_block_on_error?: boolean;
+    grpc_max_frames?: number;
+    grpc_max_frame_bytes?: number;
+    websocket_inspect?: boolean;
+    websocket_require_subprotocol?: boolean;
+    websocket_origin_allowlist?: string[];
+    websocket_subprotocol_allowlist?: string[];
   }) =>
     post<ConfigResponse & { status: string }>('/config', payload),
   // Threat-intel feed health, multi-limiter, adaptive PoW stats.
@@ -594,6 +605,14 @@ export const api = {
   getMultiLimitStats: () => get<{ enabled: boolean; window_sec?: number; tracked?: number; cap?: number; checks?: number; allowed?: number; blocked?: number; dropped?: number; blocked_by_dim?: Record<string, number>; budgets?: Record<string, number>; cookie_name?: string }>('/multilimit/stats'),
   getPoWAdaptiveStats: () => get<{ enabled: boolean; ips_tracked?: number; tier_bumps?: number; total_queries?: number; load_hint?: number; tier2_failures?: number; tier2_penalty_bits?: number }>('/pow/adaptive'),
   getRuleCounters: () => get<{ counters: Record<string, number> }>('/rules/counters'),
+  // JA3, PoW issuer, DPI stats. Surfaced under their respective UI cards.
+  getJA3Stats: () => get<{ enabled: boolean; hard_block?: boolean; header?: string; trusted_sources?: string[]; cache_capacity?: number; cache_ttl_sec?: number; stats?: Record<string, number> }>('/ja3/stats'),
+  getPoWStats: () => get<{ enabled: boolean; trigger_score?: number; min_difficulty?: number; max_difficulty?: number; token_ttl_sec?: number; cookie_ttl_sec?: number; seen_count?: number; proxy_counters?: Record<string, number> }>('/pow/stats'),
+  getDPIStats: () => get<{ grpc_inspect: boolean; grpc_block: boolean; websocket_inspect: boolean; websocket_allowlist: string[]; stats: Record<string, number> }>('/dpi/stats'),
+  // Audit chain — verifies the HMAC-chain integrity end-to-end and
+  // returns the most recent N entries. Tail is read-only; no secrets.
+  getAuditVerify: () => get<{ enabled: boolean; ok?: boolean; bad_seq?: number; total?: number; appends?: number; verify_fails?: number }>('/audit/verify'),
+  getAuditTail: (n = 100) => get<{ entries: Array<{ seq: number; timestamp: string; kind: string; actor?: string; message: string; meta?: string; prev_mac: string; mac: string }> }>(`/audit/tail?n=${n}`),
 
   // Sessions + browser integrity.
   getSessions: (limit = 200) => get<{ sessions: SessionView[]; enabled: boolean; count: number }>(`/sessions?limit=${limit}`),
