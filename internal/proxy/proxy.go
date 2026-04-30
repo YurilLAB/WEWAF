@@ -1036,7 +1036,12 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wp.proxy.ServeHTTP(rec, r)
 
 	if !tx.IsBlocked() {
-		wp.metrics.RecordPass(rec.bytesWritten, rec.statusCode)
+		// RecordPassDetailed feeds the per-method, exact-status, and
+		// passed-path counters the network-monitoring page surfaces.
+		// Method+path come from r so the analytics agree with the
+		// access path the rule engine actually saw — the canonicalised
+		// path is preserved on r.URL.Path through the proxy.
+		wp.metrics.RecordPassDetailed(r.Method, r.URL.Path, rec.bytesWritten, rec.statusCode)
 	}
 	wp.eng.ProcessLogging(tx)
 }
