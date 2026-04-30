@@ -155,13 +155,24 @@ func InspectGRPCBody(body []byte, limits GRPCLimits) GRPCResult {
 		flags := body[cursor]
 		length := binary.BigEndian.Uint32(body[cursor+1 : cursor+5])
 		cursor += 5
-		if int(length) > limits.MaxFrameBytes {
+		// Stay in uint32 land for the bounds check before casting to
+		// int. On 32-bit Go, int is 32-bit signed, so a length of
+		// 0xFFFFFFFF cast to int is -1 — the previous "if int(length)
+		// > MaxFrameBytes" check evaluates to false, then the slice
+		// expression body[cursor : cursor+(-1)] panics. The check
+		// below uses uint64 so no signed-overflow bypass exists, and
+		// the explicit ceiling at maxInt32 keeps the subsequent int
+		// arithmetic safe regardless of host word size.
+		const maxFrameLen = uint32(1<<31 - 1) // safe int32 ceiling
+		if length > maxFrameLen || uint64(length) > uint64(limits.MaxFrameBytes) {
 			res.Blocked = true
 			res.Reason = fmt.Sprintf("grpc frame %d bytes exceeds max %d", length, limits.MaxFrameBytes)
 			res.Stats.Oversize++
 			return res
 		}
-		if cursor+int(length) > len(body) {
+		// Same uint64 promotion for the bounds-vs-body check so a 4 GiB
+		// length on 32-bit doesn't underflow the comparison.
+		if uint64(cursor)+uint64(length) > uint64(len(body)) {
 			res.Stats.Truncated = true
 			break
 		}

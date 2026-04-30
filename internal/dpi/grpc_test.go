@@ -105,6 +105,29 @@ func TestGRPCCompressedFrameSkipsStringExtraction(t *testing.T) {
 	}
 }
 
+// TestGRPCRejectsLengthBeyondInt32 closes the 32-bit cast bypass:
+// a malicious frame declared as 0xFFFFFFFF bytes used to slip past
+// the "int(length) > MaxFrameBytes" check on 32-bit hosts (where
+// int(0xFFFFFFFF) == -1) and crash the parser via a panic in the
+// subsequent slice expression. The check now stays in uint64 / has
+// an explicit int32 ceiling so the bypass is impossible regardless
+// of host word size.
+func TestGRPCRejectsLengthBeyondInt32(t *testing.T) {
+	// Hand-craft a frame whose declared length is uint32-max. We
+	// only need 5 bytes (the header); the parser must refuse based
+	// on the length field before touching the (absent) payload.
+	body := make([]byte, 5)
+	body[0] = 0
+	body[1], body[2], body[3], body[4] = 0xff, 0xff, 0xff, 0xff
+	res := InspectGRPCBody(body, GRPCLimits{MaxFrameBytes: 1 << 20})
+	if !res.Blocked {
+		t.Fatalf("uint32-max length must be rejected (Reason=%q)", res.Reason)
+	}
+	if res.Stats.Oversize != 1 {
+		t.Fatalf("Oversize counter = %d, want 1", res.Stats.Oversize)
+	}
+}
+
 // TestGRPCBlockCompressedFailsClosed documents the bypass class the
 // BlockCompressed knob closes: an attacker can hide a payload behind
 // any compression codec the inspector doesn't decode, and without

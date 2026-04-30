@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 )
@@ -132,21 +133,92 @@ func containsToken(h, t string) bool {
 
 // matchOrigin applies allowlist semantics with optional wildcard
 // subdomain support.
+//
+// The previous implementation matched on the raw Origin string with
+// strings.HasSuffix. That was bypassable: per RFC 6454 a browser-sent
+// Origin is "scheme://host[:port]" with no path or query, but a
+// hand-crafted client can submit "https://evil.com/.example.com",
+// which strings.HasSuffix(origin, ".example.com") happily accepts and
+// the upgrade goes through with an attacker-controlled origin.
+// Parsing the value as a URL and comparing only the host (case-fold,
+// stripped of port and trailing dot) closes that hole.
 func matchOrigin(origin string, allow []string) bool {
-	origin = strings.ToLower(origin)
-	for _, a := range allow {
-		a = strings.ToLower(strings.TrimSpace(a))
-		if a == origin {
-			return true
+	host, port := parseOriginHost(origin)
+	if host == "" {
+		return false
+	}
+	hostPort := host
+	if port != "" {
+		hostPort = host + ":" + port
+	}
+	for _, raw := range allow {
+		a := strings.ToLower(strings.TrimSpace(raw))
+		if a == "" {
+			continue
 		}
+		// If the entry has a scheme, parse it the same way as the
+		// origin so "https://app.example.com" matches the same
+		// host/port pair.
+		entryHost, entryPort := parseOriginHost(a)
+		// Wildcard subdomain pattern: "*.example.com" — accepts any
+		// label preceding the suffix but NOT the bare suffix itself.
 		if strings.HasPrefix(a, "*.") {
 			suffix := a[1:] // ".example.com"
-			if strings.HasSuffix(origin, suffix) {
+			// Whole-label suffix match: host must end with suffix
+			// AND have at least one character before it. Avoids
+			// the previous-implementation issue where a path-bearing
+			// origin could fake the suffix.
+			if len(host) > len(suffix) && strings.HasSuffix(host, suffix) {
 				return true
 			}
+			continue
+		}
+		if entryHost != "" {
+			// Exact host:port (or host alone if no port specified).
+			if entryPort != "" {
+				if host == entryHost && port == entryPort {
+					return true
+				}
+			} else {
+				if host == entryHost {
+					return true
+				}
+			}
+			continue
+		}
+		// Plain "host" or "host:port" entry — compare against the
+		// origin's host[:port] form.
+		if a == host || a == hostPort {
+			return true
 		}
 	}
 	return false
+}
+
+// parseOriginHost extracts a normalised host + port from an Origin
+// header value. Returns ("","") on anything that isn't a real
+// browser-shaped Origin (scheme://host[:port], no path, no query).
+// Lowercases the host and strips a single trailing dot — modern
+// resolvers treat "example.com." and "example.com" as identical.
+func parseOriginHost(s string) (host, port string) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "null" {
+		return "", ""
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" {
+		return "", ""
+	}
+	// Origin must have NO path / query / fragment. A path-bearing
+	// value is either malformed or hostile; refuse rather than
+	// trying to extract a host.
+	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", ""
+	}
+	host = strings.ToLower(u.Hostname())
+	host = strings.TrimSuffix(host, ".")
+	port = u.Port()
+	return host, port
 }
 
 // --- WebSocket frame parser (RFC 6455) ----------------------------------

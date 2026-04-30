@@ -67,6 +67,57 @@ func TestWSUpgradeOriginAllowlist(t *testing.T) {
 	}
 }
 
+// TestWSUpgradeOriginBypassClassesRejected covers the bypass class an
+// audit found in the previous string-suffix matcher: hand-crafted
+// clients can send Origin values that aren't real browser origins,
+// and a naive HasSuffix check would let them through. The parser
+// must refuse anything that isn't strict scheme://host[:port].
+func TestWSUpgradeOriginBypassClassesRejected(t *testing.T) {
+	cfg := WSUpgradeConfig{OriginAllowlist: []string{"*.example.com", "https://api.example.com"}}
+	bad := []string{
+		// Path-bearing origin that would pass HasSuffix(".example.com").
+		"https://evil.com/.example.com",
+		// Query-bearing variant of the same trick.
+		"https://evil.com/?x=.example.com",
+		// Fragment-bearing variant.
+		"https://evil.com/#.example.com",
+		// Suffix substring without a label boundary.
+		"https://evilexample.com",
+		// Trailing dot used to confuse normalisation. Should normalise
+		// to "evil.com" host (not allowed).
+		"https://evil.com.",
+		// Embedded null byte from a tampered client.
+		"https://evil.com\x00.example.com",
+		// "null" Origin (sandboxed iframe / file://) — never on an
+		// allowlist that uses real domains.
+		"null",
+		// IDN homograph attempt (Cyrillic 'e' in "exаmple" — U+0430).
+		"https://exаmple.com",
+		// Empty.
+		"",
+	}
+	for _, o := range bad {
+		r := httptest.NewRequest("GET", "/ws", nil)
+		r.Header.Set("Upgrade", "websocket")
+		r.Header.Set("Connection", "Upgrade")
+		r.Header.Set("Sec-WebSocket-Version", "13")
+		r.Header.Set("Origin", o)
+		if v := CheckWSUpgrade(r, cfg); v.Allow {
+			t.Fatalf("Origin %q should be refused but was allowed", o)
+		}
+	}
+
+	// Genuine subdomain — allowed.
+	r := httptest.NewRequest("GET", "/ws", nil)
+	r.Header.Set("Upgrade", "websocket")
+	r.Header.Set("Connection", "Upgrade")
+	r.Header.Set("Sec-WebSocket-Version", "13")
+	r.Header.Set("Origin", "https://api.example.com")
+	if v := CheckWSUpgrade(r, cfg); !v.Allow {
+		t.Fatalf("genuine subdomain should be allowed: %s", v.Reason)
+	}
+}
+
 func TestWSUpgradeSubprotocolAllowlist(t *testing.T) {
 	r := httptest.NewRequest("GET", "/ws", nil)
 	r.Header.Set("Upgrade", "websocket")

@@ -167,7 +167,11 @@ func Open(opts Options) (*Store, error) {
 		opts.FlushBatch = 256
 	}
 
-	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
+	// 0o700 — the history DBs hold per-IP block records, attack
+	// payloads, and timestamps that adjacent unprivileged users on
+	// shared hosts shouldn't be able to enumerate. POSIX-only; on
+	// Windows ACLs are inherited.
+	if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
 		return nil, fmt.Errorf("history: create dir: %w", err)
 	}
 

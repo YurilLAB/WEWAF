@@ -298,3 +298,49 @@ func TestChainTailOrder(t *testing.T) {
 		t.Fatalf("tail not in increasing seq order: %v", []uint64{tail[0].Seq, tail[1].Seq, tail[2].Seq})
 	}
 }
+
+// TestValidateAuditFilePath_BlocksDevicesAndReservedNames documents
+// the bypass class the path validator closes: an audit log that
+// silently absorbs entries into a device file leaves no trace of
+// security events. The Windows-reserved-name check runs on every
+// platform — we share configs across OSes and would rather refuse
+// the path on the Linux box than silently break it on Windows.
+func TestValidateAuditFilePath_BlocksDevicesAndReservedNames(t *testing.T) {
+	bad := []string{
+		"",                              // empty
+		"audit\x00.log",                 // NUL injection
+		`\\server\share\audit.log`,      // UNC
+		"//server/share/audit.log",      // POSIX-style network share
+		`\\?\C:\audit.log`,              // Windows long-path device namespace
+		"/dev/null", "/dev/zero",
+		"/dev/random", "/dev/urandom",
+		"/dev/full", "/dev/tty",
+		// Windows reserved names — with extension, with a directory
+		// prefix, and case-folded. CreateFile() honours the device
+		// regardless of either.
+		"con", "CON", "Nul.log", "audit/PRN", "audit/COM1.txt",
+		`logs\LPT3.audit`, "AUX",
+	}
+	for _, p := range bad {
+		if err := validateAuditFilePath(p); err == nil {
+			t.Fatalf("validateAuditFilePath(%q) accepted; expected refusal", p)
+		}
+	}
+
+	good := []string{
+		"audit.log",
+		"logs/audit.log",
+		"/var/log/wewaf/audit.log",
+		`C:\waf\audit.log`,
+		"./audit.log",
+		// "console.log" and "lptd.log" — superficially similar to
+		// reserved names but neither is itself reserved.
+		"console.log",
+		"lptd.log",
+	}
+	for _, p := range good {
+		if err := validateAuditFilePath(p); err != nil {
+			t.Fatalf("validateAuditFilePath(%q) refused; expected acceptance: %v", p, err)
+		}
+	}
+}

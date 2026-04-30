@@ -290,7 +290,7 @@ func (t *Tracker) EnsureSession(w http.ResponseWriter, r *http.Request) *Session
 		// Fresh session.
 		id = randomID()
 		if w != nil {
-			t.setCookie(w, id, requestIsTLS(r))
+			t.setCookie(w, id, t.requestIsTLS(r))
 		}
 	}
 	s := t.touchSession(id, r)
@@ -300,23 +300,24 @@ func (t *Tracker) EnsureSession(w http.ResponseWriter, r *http.Request) *Session
 // requestIsTLS reports whether the request was received over a TLS
 // channel — either directly (r.TLS != nil) or via a trusted edge proxy
 // announcing the original scheme. Used to gate the Cookie Secure flag.
-func requestIsTLS(r *http.Request) bool {
+//
+// Forwarding-header trust is delegated to the same *clientip.Extractor
+// the proxy uses for client-IP decisions. Without that gate an attacker
+// who reached the WAF directly could send X-Forwarded-Proto: https,
+// receive a Secure cookie, and then capture it on the next plaintext
+// hop because the browser sees no contradiction. With the gate, only
+// peers in the trusted_proxies CIDR set can announce TLS.
+func (t *Tracker) requestIsTLS(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
 	if r.TLS != nil {
 		return true
 	}
-	// Common edge headers. Accepting these is safe because failing
-	// open here only causes "Secure" to be omitted; it never sends a
-	// cookie that wasn't going to be sent anyway.
-	if v := r.Header.Get("X-Forwarded-Proto"); strings.EqualFold(v, "https") {
-		return true
+	if t == nil {
+		return false
 	}
-	if v := r.Header.Get("X-Forwarded-Ssl"); strings.EqualFold(v, "on") {
-		return true
-	}
-	return false
+	return t.ipExtractor.Load().IsTLSRequest(r)
 }
 
 // touchSession upserts the session and updates per-request signals.

@@ -1,6 +1,7 @@
 package clientip
 
 import (
+	"crypto/tls"
 	"net/http"
 	"testing"
 )
@@ -200,6 +201,63 @@ func TestNilSafety(t *testing.T) {
 	// Nil request is also safe.
 	if got := e.ClientIP(nil); got != "" {
 		t.Fatalf("nil request: %q", got)
+	}
+}
+
+// TestIsTLSRequest_DirectTLSAlwaysHonoured — when the listener
+// presents a real TLS state, the request is TLS regardless of trust
+// policy. This branch can never be spoofed because r.TLS is set by
+// the Go runtime, not the client.
+func TestIsTLSRequest_DirectTLSAlwaysHonoured(t *testing.T) {
+	e, _ := New(false, nil) // even with trust_xff off
+	r := newReq("198.51.100.55:1234", "", "")
+	r.TLS = &tls.ConnectionState{} // pretend the runtime accepted TLS
+	if !e.IsTLSRequest(r) {
+		t.Fatal("direct TLS must always count as TLS")
+	}
+}
+
+// TestIsTLSRequest_UntrustedPeerCannotForge — the bypass class this
+// helper closes. Attacker hits the WAF directly with X-Forwarded-Proto
+// set; they must NOT be treated as TLS, otherwise the cookie layer
+// would issue Secure cookies that the attacker captures plaintext on
+// the next request.
+func TestIsTLSRequest_UntrustedPeerCannotForge(t *testing.T) {
+	e, _ := New(true, []string{"10.0.0.0/8"})
+	r := newReq("198.51.100.55:1234", "", "")
+	r.Header.Set("X-Forwarded-Proto", "https")
+	r.Header.Set("X-Forwarded-Ssl", "on")
+	if e.IsTLSRequest(r) {
+		t.Fatal("untrusted peer must not be able to forge TLS via X-Forwarded-Proto")
+	}
+}
+
+// TestIsTLSRequest_TrustedPeerHonoured — a legitimate edge proxy in
+// the configured CIDR can announce HTTPS via X-Forwarded-Proto.
+func TestIsTLSRequest_TrustedPeerHonoured(t *testing.T) {
+	e, _ := New(true, []string{"10.0.0.0/8"})
+	r := newReq("10.0.0.5:1234", "", "")
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if !e.IsTLSRequest(r) {
+		t.Fatal("trusted peer with X-Forwarded-Proto: https must count as TLS")
+	}
+	r2 := newReq("10.0.0.6:1234", "", "")
+	r2.Header.Set("X-Forwarded-Ssl", "on")
+	if !e.IsTLSRequest(r2) {
+		t.Fatal("trusted peer with X-Forwarded-Ssl: on must count as TLS")
+	}
+}
+
+// TestIsTLSRequest_LegacyTrustAll — back-compat: when trust_xff is on
+// and no CIDRs are configured (legacy single-CDN deployments), every
+// upstream is treated as trusted, matching the existing left-most
+// XFF behaviour the trust gate inherits.
+func TestIsTLSRequest_LegacyTrustAll(t *testing.T) {
+	e, _ := New(true, nil)
+	r := newReq("203.0.113.7:1234", "", "")
+	r.Header.Set("X-Forwarded-Proto", "https")
+	if !e.IsTLSRequest(r) {
+		t.Fatal("legacy trust-all mode must still honour X-Forwarded-Proto")
 	}
 }
 
