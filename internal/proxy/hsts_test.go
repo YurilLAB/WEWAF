@@ -78,7 +78,16 @@ func TestHSTSEmittedOnlyForHTTPSBackends(t *testing.T) {
 	r, _ := http.NewRequest("GET", "/", nil)
 	resp := &http.Response{Header: http.Header{}, Request: r}
 	wp.applyHeadersForTest(resp)
-	for _, h := range []string{"X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy"} {
+	for _, h := range []string{
+		"X-Content-Type-Options",
+		"X-Frame-Options",
+		"Referrer-Policy",
+		// Defence-in-depth additions — once they're in, never let a
+		// future refactor silently drop them.
+		"X-DNS-Prefetch-Control",
+		"Cross-Origin-Resource-Policy",
+		"Cross-Origin-Opener-Policy",
+	} {
 		if resp.Header.Get(h) == "" {
 			t.Fatalf("%s missing — base security headers regressed", h)
 		}

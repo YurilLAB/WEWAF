@@ -1,8 +1,115 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Cpu, HardDrive, Bell, Shield, Save, RotateCcw, Database, ArrowLeftRight, Network, Lock, Gauge, AlertTriangle } from 'lucide-react';
+import { Cpu, HardDrive, Bell, Shield, Save, RotateCcw, Database, ArrowLeftRight, Network, Lock, Gauge, AlertTriangle, FileLock2, RefreshCw } from 'lucide-react';
 import { useWAF, type WAFSettings } from '../../store/wafStore';
 import { api } from '../../services/api';
+
+// AuditChainCard surfaces the tamper-evident HMAC chain so operators can
+// confirm log integrity and inspect recent ban / config / zero-trust
+// mutations without dropping to the shell. Network failures degrade to
+// a quiet "—" rather than throwing, so this card never breaks the page.
+function AuditChainCard() {
+  const [verify, setVerify] = useState<{ enabled: boolean; ok?: boolean; bad_seq?: number; total?: number; appends?: number; verify_fails?: number } | null>(null);
+  const [tail, setTail] = useState<Array<{ seq: number; timestamp: string; kind: string; actor?: string; message: string }>>([]);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = async () => {
+    setLoading(true);
+    try {
+      const [v, t] = await Promise.all([
+        api.getAuditVerify(),
+        api.getAuditTail(50),
+      ]);
+      if (v) setVerify(v);
+      if (t && Array.isArray(t.entries)) {
+        // Newest first — the API returns ascending; we reverse for the UI.
+        setTail([...t.entries].reverse().slice(0, 50));
+      }
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { refresh(); /* one-shot on mount */ }, []);
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.25 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-waf-text font-medium text-sm flex items-center gap-2">
+          <FileLock2 className="w-4 h-4 text-waf-orange" /> Tamper-Evident Audit Chain
+        </h3>
+        <button
+          onClick={refresh}
+          disabled={loading}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-waf-elevated text-waf-muted rounded text-xs hover:bg-waf-border transition-colors disabled:opacity-50"
+        >
+          <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
+          {loading ? 'Verifying' : 'Verify + Refresh'}
+        </button>
+      </div>
+      {!verify || !verify.enabled ? (
+        <p className="text-xs text-waf-dim">
+          Audit chain is disabled. Enable <code>audit_enabled</code> in <code>config.json</code> to record a tamper-evident HMAC chain of every block, ban, and config write.
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+            <div className="bg-waf-elevated rounded p-2">
+              <p className="text-[10px] text-waf-dim uppercase">Integrity</p>
+              <p className={`text-sm font-medium ${verify.ok ? 'text-waf-success' : 'text-waf-danger'}`}>
+                {verify.ok ? '✓ valid' : `✗ broken @ ${verify.bad_seq ?? '?'}`}
+              </p>
+            </div>
+            <div className="bg-waf-elevated rounded p-2">
+              <p className="text-[10px] text-waf-dim uppercase">Entries</p>
+              <p className="text-sm text-waf-text font-medium">{verify.total ?? 0}</p>
+            </div>
+            <div className="bg-waf-elevated rounded p-2">
+              <p className="text-[10px] text-waf-dim uppercase">Appends</p>
+              <p className="text-sm text-waf-text font-medium">{verify.appends ?? 0}</p>
+            </div>
+            <div className="bg-waf-elevated rounded p-2">
+              <p className="text-[10px] text-waf-dim uppercase">Verify fails</p>
+              <p className={`text-sm font-medium ${(verify.verify_fails ?? 0) > 0 ? 'text-waf-warning' : 'text-waf-text'}`}>
+                {verify.verify_fails ?? 0}
+              </p>
+            </div>
+          </div>
+          <div className="border border-waf-border rounded overflow-hidden">
+            <div className="max-h-64 overflow-y-auto">
+              <table className="w-full text-[11px]">
+                <thead className="bg-waf-elevated text-waf-dim uppercase text-[10px]">
+                  <tr>
+                    <th className="text-left px-2 py-1.5">Seq</th>
+                    <th className="text-left px-2 py-1.5">Time</th>
+                    <th className="text-left px-2 py-1.5">Kind</th>
+                    <th className="text-left px-2 py-1.5">Actor</th>
+                    <th className="text-left px-2 py-1.5">Message</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {tail.length === 0 ? (
+                    <tr><td colSpan={5} className="text-center text-waf-dim py-3">No entries yet.</td></tr>
+                  ) : (
+                    tail.map((e) => (
+                      <tr key={e.seq} className="border-t border-waf-border">
+                        <td className="px-2 py-1 text-waf-dim font-mono">{e.seq}</td>
+                        <td className="px-2 py-1 text-waf-muted">{new Date(e.timestamp).toLocaleString()}</td>
+                        <td className="px-2 py-1 text-waf-text">{e.kind}</td>
+                        <td className="px-2 py-1 text-waf-muted font-mono">{e.actor || '—'}</td>
+                        <td className="px-2 py-1 text-waf-muted truncate max-w-md" title={e.message}>{e.message}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
+    </motion.div>
+  );
+}
 
 export default function SettingsPage() {
   const { state, dispatch } = useWAF();
@@ -98,6 +205,7 @@ export default function SettingsPage() {
       if (typeof cfg.mesh_api_key === 'string') updates.meshAPIKey = cfg.mesh_api_key;
       if (typeof cfg.security_headers_enabled === 'boolean') updates.securityHeadersEnabled = cfg.security_headers_enabled;
       if (typeof cfg.trust_xff === 'boolean') updates.trustXFF = cfg.trust_xff;
+      if (Array.isArray(cfg.trusted_proxies)) updates.trustedProxies = (cfg.trusted_proxies as string[]).join(', ');
       if (typeof cfg.hsts_enabled === 'boolean') updates.hstsEnabled = cfg.hsts_enabled;
       if (typeof cfg.hsts_max_age_sec === 'number') updates.hstsMaxAgeSec = cfg.hsts_max_age_sec;
       if (typeof cfg.hsts_include_subdomains === 'boolean') updates.hstsIncludeSubdomains = cfg.hsts_include_subdomains;
@@ -112,6 +220,25 @@ export default function SettingsPage() {
       if (typeof cfg.pow_max_difficulty === 'number') updates.powMaxDifficulty = cfg.pow_max_difficulty;
       if (typeof cfg.pow_token_ttl_sec === 'number') updates.powTokenTTLSec = cfg.pow_token_ttl_sec;
       if (typeof cfg.pow_cookie_ttl_sec === 'number') updates.powCookieTTLSec = cfg.pow_cookie_ttl_sec;
+      if (typeof cfg.pow_adaptive_enabled === 'boolean') updates.powAdaptiveEnabled = cfg.pow_adaptive_enabled;
+      if (typeof cfg.pow_adaptive_tier2_failures === 'number') updates.powAdaptiveTier2Failures = cfg.pow_adaptive_tier2_failures;
+      if (typeof cfg.pow_adaptive_tier2_penalty_bits === 'number') updates.powAdaptiveTier2PenaltyBits = cfg.pow_adaptive_tier2_penalty_bits;
+      if (typeof cfg.multi_limit_enabled === 'boolean') updates.multiLimitEnabled = cfg.multi_limit_enabled;
+      if (typeof cfg.multi_limit_window_sec === 'number') updates.multiLimitWindowSec = cfg.multi_limit_window_sec;
+      if (typeof cfg.multi_limit_ip_rpm === 'number') updates.multiLimitIPRPM = cfg.multi_limit_ip_rpm;
+      if (typeof cfg.multi_limit_ja4_rpm === 'number') updates.multiLimitJA4RPM = cfg.multi_limit_ja4_rpm;
+      if (typeof cfg.multi_limit_cookie_rpm === 'number') updates.multiLimitCookieRPM = cfg.multi_limit_cookie_rpm;
+      if (typeof cfg.multi_limit_cookie_name === 'string') updates.multiLimitCookieName = cfg.multi_limit_cookie_name;
+      if (typeof cfg.multi_limit_query_rpm === 'number') updates.multiLimitQueryRPM = cfg.multi_limit_query_rpm;
+      if (typeof cfg.multi_limit_max_entries === 'number') updates.multiLimitMaxEntries = cfg.multi_limit_max_entries;
+      if (typeof cfg.grpc_inspect === 'boolean') updates.grpcInspect = cfg.grpc_inspect;
+      if (typeof cfg.grpc_block_on_error === 'boolean') updates.grpcBlockOnError = cfg.grpc_block_on_error;
+      if (typeof cfg.grpc_max_frames === 'number') updates.grpcMaxFrames = cfg.grpc_max_frames;
+      if (typeof cfg.grpc_max_frame_bytes === 'number') updates.grpcMaxFrameBytes = cfg.grpc_max_frame_bytes;
+      if (typeof cfg.websocket_inspect === 'boolean') updates.websocketInspect = cfg.websocket_inspect;
+      if (typeof cfg.websocket_require_subprotocol === 'boolean') updates.websocketRequireSubprotocol = cfg.websocket_require_subprotocol;
+      if (Array.isArray(cfg.websocket_origin_allowlist)) updates.websocketOriginAllowlist = (cfg.websocket_origin_allowlist as string[]).join(', ');
+      if (Array.isArray(cfg.websocket_subprotocol_allowlist)) updates.websocketSubprotocolAllowlist = (cfg.websocket_subprotocol_allowlist as string[]).join(', ');
       if (Object.keys(updates).length > 0) {
         setForm((prev) => ({ ...prev, ...updates }));
         dispatch({ type: 'UPDATE_SETTINGS', payload: updates });
@@ -171,6 +298,7 @@ export default function SettingsPage() {
         mesh_api_key: form.meshAPIKey,
         security_headers_enabled: form.securityHeadersEnabled,
         trust_xff: form.trustXFF,
+        trusted_proxies: form.trustedProxies.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
         hsts_enabled: form.hstsEnabled,
         hsts_max_age_sec: form.hstsMaxAgeSec,
         hsts_include_subdomains: form.hstsIncludeSubdomains,
@@ -185,6 +313,25 @@ export default function SettingsPage() {
         pow_max_difficulty: form.powMaxDifficulty,
         pow_token_ttl_sec: form.powTokenTTLSec,
         pow_cookie_ttl_sec: form.powCookieTTLSec,
+        pow_adaptive_enabled: form.powAdaptiveEnabled,
+        pow_adaptive_tier2_failures: form.powAdaptiveTier2Failures,
+        pow_adaptive_tier2_penalty_bits: form.powAdaptiveTier2PenaltyBits,
+        multi_limit_enabled: form.multiLimitEnabled,
+        multi_limit_window_sec: form.multiLimitWindowSec,
+        multi_limit_ip_rpm: form.multiLimitIPRPM,
+        multi_limit_ja4_rpm: form.multiLimitJA4RPM,
+        multi_limit_cookie_rpm: form.multiLimitCookieRPM,
+        multi_limit_cookie_name: form.multiLimitCookieName,
+        multi_limit_query_rpm: form.multiLimitQueryRPM,
+        multi_limit_max_entries: form.multiLimitMaxEntries,
+        grpc_inspect: form.grpcInspect,
+        grpc_block_on_error: form.grpcBlockOnError,
+        grpc_max_frames: form.grpcMaxFrames,
+        grpc_max_frame_bytes: form.grpcMaxFrameBytes,
+        websocket_inspect: form.websocketInspect,
+        websocket_require_subprotocol: form.websocketRequireSubprotocol,
+        websocket_origin_allowlist: form.websocketOriginAllowlist.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
+        websocket_subprotocol_allowlist: form.websocketSubprotocolAllowlist.split(/[\n,]+/).map(s => s.trim()).filter(Boolean),
       });
       if (res) {
         dispatch({ type: 'UPDATE_SETTINGS', payload: { ...form } });
@@ -860,6 +1007,25 @@ export default function SettingsPage() {
             <input type="checkbox" checked={form.trustXFF} onChange={(e) => setForm({ ...form, trustXFF: e.target.checked })} className="rounded border-waf-border" />
             Trust X-Forwarded-For / X-Real-Ip (only enable when the WAF sits behind a trusted reverse proxy)
           </label>
+          {form.trustXFF && (
+            <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="pl-6">
+              <label className="text-xs text-waf-muted mb-1 block">
+                Trusted proxy CIDRs (comma or newline separated) — required so an attacker bypassing your CDN cannot spoof the source IP. Bare IPs are accepted (auto-promoted to <code>/32</code> or <code>/128</code>).
+              </label>
+              <textarea
+                value={form.trustedProxies}
+                onChange={(e) => setForm({ ...form, trustedProxies: e.target.value })}
+                rows={2}
+                placeholder="173.245.48.0/20, 103.21.244.0/22, 2400:cb00::/32"
+                className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange"
+              />
+              {form.trustedProxies.trim() === '' && (
+                <p className="text-[10px] text-waf-warning mt-1">
+                  ⚠ Empty list = legacy behaviour: every client can spoof X-Forwarded-For. Populate this in production.
+                </p>
+              )}
+            </motion.div>
+          )}
 
           {/* JA3 TLS fingerprinting */}
           <div className="border-t border-waf-border pt-3 mt-3">
@@ -918,9 +1084,122 @@ export default function SettingsPage() {
                 <p className="text-[10px] text-waf-dim col-span-full">18 bits ≈ 1s on a phone, 24 bits ≈ 5–15s. Difficulty scales linearly with score above the trigger.</p>
               </motion.div>
             )}
+
+            {/* Adaptive PoW Tier-2 — bumps difficulty for repeat failers. */}
+            {form.powEnabled && (
+              <div className="pl-6 mt-3">
+                <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+                  <input type="checkbox" checked={form.powAdaptiveEnabled} onChange={(e) => setForm({ ...form, powAdaptiveEnabled: e.target.checked })} className="rounded border-waf-border" />
+                  Enable Tier-2 adaptive escalation (raises difficulty for IPs that repeatedly fail)
+                </label>
+                {form.powAdaptiveEnabled && (
+                  <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="grid grid-cols-2 gap-3 pl-6 mt-2">
+                    <div>
+                      <label className="text-xs text-waf-muted mb-1 block">Failures before Tier-2 (1–20)</label>
+                      <input type="number" min={1} max={20} value={form.powAdaptiveTier2Failures} onChange={(e) => setForm({ ...form, powAdaptiveTier2Failures: Math.max(1, Math.min(20, Number(e.target.value) || 5)) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                    </div>
+                    <div>
+                      <label className="text-xs text-waf-muted mb-1 block">Penalty (extra bits, 1–10)</label>
+                      <input type="number" min={1} max={10} value={form.powAdaptiveTier2PenaltyBits} onChange={(e) => setForm({ ...form, powAdaptiveTier2PenaltyBits: Math.max(1, Math.min(10, Number(e.target.value) || 3)) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                    </div>
+                    <p className="text-[10px] text-waf-dim col-span-full">Each failed solve past the threshold adds the penalty bits to the next challenge. Capped to maximum difficulty.</p>
+                  </motion.div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Multi-dimensional rate limiter */}
+          <div className="border-t border-waf-border pt-3 mt-3">
+            <p className="text-xs text-waf-text font-medium mb-2">Multi-Dimensional Rate Limiter</p>
+            <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+              <input type="checkbox" checked={form.multiLimitEnabled} onChange={(e) => setForm({ ...form, multiLimitEnabled: e.target.checked })} className="rounded border-waf-border" />
+              Enforce per-IP / per-JA4 / per-cookie / per-query-key budgets in parallel (defeats IP-rotating bots that keep stable client fingerprints)
+            </label>
+            {form.multiLimitEnabled && (
+              <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="grid grid-cols-2 md:grid-cols-3 gap-3 pl-6 mt-2">
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Window (seconds)</label>
+                  <input type="number" min={10} max={3600} value={form.multiLimitWindowSec} onChange={(e) => setForm({ ...form, multiLimitWindowSec: Math.max(10, Math.min(3600, Number(e.target.value) || 60)) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">IP budget (req/window)</label>
+                  <input type="number" min={1} value={form.multiLimitIPRPM} onChange={(e) => setForm({ ...form, multiLimitIPRPM: Math.max(1, Number(e.target.value) || 600) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">JA4 budget (req/window)</label>
+                  <input type="number" min={0} value={form.multiLimitJA4RPM} onChange={(e) => setForm({ ...form, multiLimitJA4RPM: Math.max(0, Number(e.target.value) || 1200) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Cookie budget (req/window)</label>
+                  <input type="number" min={0} value={form.multiLimitCookieRPM} onChange={(e) => setForm({ ...form, multiLimitCookieRPM: Math.max(0, Number(e.target.value) || 600) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Cookie name</label>
+                  <input type="text" value={form.multiLimitCookieName} onChange={(e) => setForm({ ...form, multiLimitCookieName: e.target.value })} placeholder="session" className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Query-keys budget</label>
+                  <input type="number" min={0} value={form.multiLimitQueryRPM} onChange={(e) => setForm({ ...form, multiLimitQueryRPM: Math.max(0, Number(e.target.value) || 600) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Max tracked entries</label>
+                  <input type="number" min={1000} value={form.multiLimitMaxEntries} onChange={(e) => setForm({ ...form, multiLimitMaxEntries: Math.max(1000, Number(e.target.value) || 200000) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <p className="text-[10px] text-waf-dim col-span-full">Set 0 to disable a dimension. Each request is rejected if any enabled budget overflows.</p>
+              </motion.div>
+            )}
+          </div>
+
+          {/* Deep packet inspection — gRPC + WebSocket */}
+          <div className="border-t border-waf-border pt-3 mt-3">
+            <p className="text-xs text-waf-text font-medium mb-2">Deep Packet Inspection</p>
+            <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+              <input type="checkbox" checked={form.grpcInspect} onChange={(e) => setForm({ ...form, grpcInspect: e.target.checked })} className="rounded border-waf-border" />
+              Inspect gRPC frames (parses length-prefixed Protobuf, extracts UTF-8 strings for rule matching)
+            </label>
+            {form.grpcInspect && (
+              <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="grid grid-cols-2 md:grid-cols-3 gap-3 pl-6 mt-2">
+                <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer col-span-full">
+                  <input type="checkbox" checked={form.grpcBlockOnError} onChange={(e) => setForm({ ...form, grpcBlockOnError: e.target.checked })} className="rounded border-waf-border" />
+                  Block when frame caps are exceeded (default = observe + score)
+                </label>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Max frames per body</label>
+                  <input type="number" min={1} value={form.grpcMaxFrames} onChange={(e) => setForm({ ...form, grpcMaxFrames: Math.max(1, Number(e.target.value) || 1024) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Max frame size (bytes)</label>
+                  <input type="number" min={1024} value={form.grpcMaxFrameBytes} onChange={(e) => setForm({ ...form, grpcMaxFrameBytes: Math.max(1024, Number(e.target.value) || 1048576) })} className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+              </motion.div>
+            )}
+            <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer mt-3">
+              <input type="checkbox" checked={form.websocketInspect} onChange={(e) => setForm({ ...form, websocketInspect: e.target.checked })} className="rounded border-waf-border" />
+              Inspect WebSocket upgrades (rejects off-policy Origin / subprotocol before the handshake completes)
+            </label>
+            {form.websocketInspect && (
+              <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} className="space-y-2 pl-6 mt-2">
+                <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer">
+                  <input type="checkbox" checked={form.websocketRequireSubprotocol} onChange={(e) => setForm({ ...form, websocketRequireSubprotocol: e.target.checked })} className="rounded border-waf-border" />
+                  Require Sec-WebSocket-Protocol header (rejects upgrades that don't advertise one)
+                </label>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Origin allowlist (comma or newline separated; <code>*.example.com</code> wildcards supported)</label>
+                  <textarea value={form.websocketOriginAllowlist} onChange={(e) => setForm({ ...form, websocketOriginAllowlist: e.target.value })} rows={2} placeholder="https://app.example.com, https://*.example.com" className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+                <div>
+                  <label className="text-xs text-waf-muted mb-1 block">Subprotocol allowlist (case-insensitive)</label>
+                  <textarea value={form.websocketSubprotocolAllowlist} onChange={(e) => setForm({ ...form, websocketSubprotocolAllowlist: e.target.value })} rows={2} placeholder="graphql-ws, mqtt" className="w-full bg-waf-elevated border border-waf-border rounded px-3 py-1.5 text-xs text-waf-text focus:outline-none focus:border-waf-orange" />
+                </div>
+              </motion.div>
+            )}
           </div>
         </div>
       </motion.div>
+
+      {/* Audit chain — tamper-evident operator activity log */}
+      <AuditChainCard />
 
       {/* Alerts */}
       <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="bg-waf-panel border border-waf-border rounded-xl p-4 lg:p-5">

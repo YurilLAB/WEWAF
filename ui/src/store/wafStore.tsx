@@ -176,6 +176,9 @@ export interface WAFSettings {
   cspEnabled: boolean;
   cspPolicy: string;
   trustXFF: boolean;
+  // CIDR allowlist of upstream proxies whose X-Forwarded-For we honour.
+  // Comma- or newline-separated. Empty = legacy left-most behaviour.
+  trustedProxies: string;
   hstsEnabled: boolean;
   hstsMaxAgeSec: number;
   hstsIncludeSubdomains: boolean;
@@ -194,6 +197,31 @@ export interface WAFSettings {
   powMaxDifficulty: number;
   powTokenTTLSec: number;
   powCookieTTLSec: number;
+  // Tier-2 adaptive PoW: bumps difficulty for IPs that fail the basic
+  // challenge a configurable number of times. Disabled by default.
+  powAdaptiveEnabled: boolean;
+  powAdaptiveTier2Failures: number;
+  powAdaptiveTier2PenaltyBits: number;
+
+  // Multi-dimensional rate limiter (IP / JA4 / cookie / query-keys).
+  multiLimitEnabled: boolean;
+  multiLimitWindowSec: number;
+  multiLimitIPRPM: number;
+  multiLimitJA4RPM: number;
+  multiLimitCookieRPM: number;
+  multiLimitCookieName: string;
+  multiLimitQueryRPM: number;
+  multiLimitMaxEntries: number;
+
+  // Deep packet inspection — gRPC + WebSocket.
+  grpcInspect: boolean;
+  grpcBlockOnError: boolean;
+  grpcMaxFrames: number;
+  grpcMaxFrameBytes: number;
+  websocketInspect: boolean;
+  websocketRequireSubprotocol: boolean;
+  websocketOriginAllowlist: string;
+  websocketSubprotocolAllowlist: string;
 }
 
 export interface HostMachineStats {
@@ -404,6 +432,7 @@ const defaultSettings: WAFSettings = {
   cspEnabled: false,
   cspPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'",
   trustXFF: false,
+  trustedProxies: '',
   hstsEnabled: false,
   hstsMaxAgeSec: 15552000,
   hstsIncludeSubdomains: true,
@@ -418,6 +447,25 @@ const defaultSettings: WAFSettings = {
   powMaxDifficulty: 24,
   powTokenTTLSec: 120,
   powCookieTTLSec: 3600,
+  powAdaptiveEnabled: false,
+  powAdaptiveTier2Failures: 5,
+  powAdaptiveTier2PenaltyBits: 3,
+  multiLimitEnabled: false,
+  multiLimitWindowSec: 60,
+  multiLimitIPRPM: 600,
+  multiLimitJA4RPM: 1200,
+  multiLimitCookieRPM: 600,
+  multiLimitCookieName: 'session',
+  multiLimitQueryRPM: 600,
+  multiLimitMaxEntries: 200000,
+  grpcInspect: false,
+  grpcBlockOnError: false,
+  grpcMaxFrames: 1024,
+  grpcMaxFrameBytes: 1048576,
+  websocketInspect: false,
+  websocketRequireSubprotocol: false,
+  websocketOriginAllowlist: '',
+  websocketSubprotocolAllowlist: '',
 };
 
 const defaultDDoS: DDoSConfig = {
