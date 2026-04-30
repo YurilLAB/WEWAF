@@ -188,8 +188,20 @@ func (c *Chain) resume(f *os.File) error {
 	for sc.Scan() {
 		var e Entry
 		if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
-			// Incomplete / corrupt tail line — ignore and stop scanning
-			// rather than abort resume (power-cut case).
+			// Incomplete / corrupt tail line — stop scanning rather
+			// than abort resume (the power-cut case is the common
+			// reason). Track that we observed corruption so callers
+			// can surface it: a truncated trailing line is benign,
+			// but a corrupt entry mid-file means downstream entries
+			// would be silently lost from the in-memory ring (and
+			// from any audit verification done before disk recovery).
+			c.statsVerifyFails.Add(1)
+			if c.firstBadSeq.Load() == 0 {
+				c.firstBadSeq.Store(lastSeq + 1)
+			}
+			fmt.Fprintf(os.Stderr,
+				"audit: resume halted by malformed entry after seq %d (%v)\n",
+				lastSeq, err)
 			break
 		}
 		// Verify against the prev we've tracked so far.

@@ -592,6 +592,7 @@ export const api = {
     // gRPC + WebSocket DPI.
     grpc_inspect?: boolean;
     grpc_block_on_error?: boolean;
+    grpc_block_compressed?: boolean;
     grpc_max_frames?: number;
     grpc_max_frame_bytes?: number;
     websocket_inspect?: boolean;

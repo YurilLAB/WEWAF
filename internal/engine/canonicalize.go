@@ -121,18 +121,32 @@ func isASCII(s string) bool {
 // normalisation — applied earlier in Canonicalize — already collapses
 // them to ASCII. Only code points NFKC leaves alone belong here.
 var homoglyphMap = map[rune]rune{
-	// Cyrillic lookalikes
+	// Cyrillic lookalikes — the lowercase block is the realistic attack
+	// surface (matches "select", "admin", "script" word-shapes); we add
+	// uppercase confusables for completeness.
 	'а': 'a',
+	'А': 'A',
+	'В': 'B',
 	'е': 'e',
+	'Е': 'E',
 	'о': 'o',
+	'О': 'O',
 	'р': 'p',
+	'Р': 'P',
 	'с': 'c',
+	'С': 'C',
 	'у': 'y',
+	'У': 'Y',
 	'х': 'x',
+	'Х': 'X',
 	'Ѕ': 'S',
 	'І': 'I',
 	'Ј': 'J',
-	// Greek lookalikes
+	'К': 'K',
+	'Н': 'H',
+	'М': 'M',
+	'Т': 'T',
+	// Greek capital lookalikes
 	'Α': 'A',
 	'Β': 'B',
 	'Ε': 'E',
@@ -145,7 +159,22 @@ var homoglyphMap = map[rune]rune{
 	'Ρ': 'P',
 	'Τ': 'T',
 	'Χ': 'X',
+	// Greek lowercase lookalikes — the audit gap. ρassword / αlert /
+	// μser variants previously slipped past the canonicalizer because
+	// NFKC doesn't normalise these to ASCII.
+	'α': 'a',
+	'β': 'b',
+	'ε': 'e',
+	'ι': 'i',
+	'κ': 'k',
+	'μ': 'u', // visually closer to u than to m in most fonts
+	'ν': 'v',
 	'ο': 'o',
+	'ρ': 'p',
+	'τ': 't',
+	'υ': 'u',
+	'χ': 'x',
+	'ζ': 'z',
 }
 
 // HasObfuscatedTransferEncoding returns true if a Transfer-Encoding header
@@ -207,22 +236,39 @@ func collapseSlashes(s string) string {
 }
 
 // stripControlChars removes ASCII control characters that attackers use to
-// split headers, smuggle requests, or break rule-matching (\r, \n, \x7f).
-// Tab and space are preserved — they're legitimate in form data.
+// split headers, smuggle requests, or break rule-matching (\r, \n, \x7f),
+// AND multi-byte format-class characters (zero-width joiners, RTL
+// overrides, byte-order marks) that attackers use to render rule-evading
+// payloads in the browser while presenting different bytes to the
+// canonicalizer. Tab and space are preserved — they're legitimate in
+// form data.
+//
+// Algorithm note: the previous fast-path scanned for ASCII control bytes
+// only (`< 0x20`), which let UTF-8-encoded ZWJ (E2 80 8D), ZWSP (E2 80
+// 8B), RTL-override (E2 80 AE) and similar slip through unchanged. The
+// fast-path now also flags any byte ≥ 0x80 — i.e. any non-ASCII rune —
+// so the slow-path runs whenever the string contains characters whose
+// printability we have to decide via Unicode tables.
 func stripControlChars(s string) string {
-	hasControl := false
+	needsScan := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c < 0x20 && c != '\t' {
-			hasControl = true
+			needsScan = true
 			break
 		}
 		if c == 0x7f {
-			hasControl = true
+			needsScan = true
+			break
+		}
+		if c >= 0x80 {
+			// Any non-ASCII byte forces the Unicode-aware scan below
+			// so format-class runes (Cf) get filtered.
+			needsScan = true
 			break
 		}
 	}
-	if !hasControl {
+	if !needsScan {
 		return s
 	}
 	var b strings.Builder
@@ -235,6 +281,11 @@ func stripControlChars(s string) string {
 			continue
 		}
 		if !unicode.IsPrint(r) && !unicode.IsSpace(r) {
+			// IsPrint returns false for Unicode category Cf (format),
+			// which covers ZWJ (U+200D), ZWNJ (U+200C), ZWSP (U+200B),
+			// LRM/RLM, RTL/LTR override (U+202D / U+202E), Mongolian
+			// vowel separator, and the BOM (U+FEFF). Stripping them
+			// kills the "looks like X but matches as Y" bypass class.
 			continue
 		}
 		b.WriteRune(r)

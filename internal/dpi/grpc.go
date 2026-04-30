@@ -89,6 +89,16 @@ type GRPCLimits struct {
 	MaxFrames     int // hard cap on frames per body (default 1024)
 	MaxFrameBytes int // per-frame payload cap (default 1 MiB)
 	MaxTotalBytes int // sum of all payloads (default 16 MiB)
+	// BlockCompressed asks the inspector to fail-closed when it sees a
+	// frame with the compression flag set. The previous behaviour was
+	// to skip rule extraction on compressed frames and let them through
+	// uninspected — fine for trusted backends but a clean bypass when
+	// the operator wants every gRPC body subjected to the rule engine.
+	// Decompression isn't done in-line because the legitimate codecs
+	// (gzip, deflate, snappy, zstd) each cost CPU per frame; this knob
+	// gives operators a binary choice between "trust the codec, scan
+	// what we can" (default) and "no compressed frames, full stop".
+	BlockCompressed bool
 }
 
 func (l *GRPCLimits) applyDefaults() {
@@ -165,6 +175,13 @@ func InspectGRPCBody(body []byte, limits GRPCLimits) GRPCResult {
 		}
 		if flags&0x01 != 0 {
 			res.Stats.Compressed++
+			if limits.BlockCompressed {
+				// Operator opted into fail-closed: every compressed
+				// frame is a bypass risk because we can't see into it.
+				res.Blocked = true
+				res.Reason = "grpc compressed frame rejected (block_compressed=on)"
+				return res
+			}
 			// Skip string extraction on compressed payloads — it'd just
 			// return noise. The rule engine won't see into them; that's
 			// the tradeoff of gRPC compression being per-frame.

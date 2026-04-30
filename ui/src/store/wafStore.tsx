@@ -216,6 +216,7 @@ export interface WAFSettings {
   // Deep packet inspection — gRPC + WebSocket.
   grpcInspect: boolean;
   grpcBlockOnError: boolean;
+  grpcBlockCompressed: boolean;
   grpcMaxFrames: number;
   grpcMaxFrameBytes: number;
   websocketInspect: boolean;
@@ -460,6 +461,7 @@ const defaultSettings: WAFSettings = {
   multiLimitMaxEntries: 200000,
   grpcInspect: false,
   grpcBlockOnError: false,
+  grpcBlockCompressed: false,
   grpcMaxFrames: 1024,
   grpcMaxFrameBytes: 1048576,
   websocketInspect: false,

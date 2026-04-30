@@ -105,6 +105,21 @@ func TestGRPCCompressedFrameSkipsStringExtraction(t *testing.T) {
 	}
 }
 
+// TestGRPCBlockCompressedFailsClosed documents the bypass class the
+// BlockCompressed knob closes: an attacker can hide a payload behind
+// any compression codec the inspector doesn't decode, and without
+// fail-closed semantics the rule engine never sees the body.
+func TestGRPCBlockCompressedFailsClosed(t *testing.T) {
+	body := grpcFrame("opaque-codec-payload", true)
+	res := InspectGRPCBody(body, GRPCLimits{BlockCompressed: true})
+	if !res.Blocked {
+		t.Fatalf("BlockCompressed should reject compressed frames")
+	}
+	if res.Reason == "" {
+		t.Fatalf("BlockCompressed verdict missing reason for operator visibility")
+	}
+}
+
 func TestGRPCBlocksFrameCountBomb(t *testing.T) {
 	// 100 tiny frames with a cap of 50.
 	var body []byte

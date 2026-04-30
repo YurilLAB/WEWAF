@@ -448,7 +448,11 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, s.cfg.Snapshot())
+		// Strip HMAC keys before returning. The UI treats the placeholder
+		// as "secret is configured" without ever holding the value, and
+		// the POST branch ignores any payload that echoes it back so a
+		// form round-trip doesn't overwrite the running secret.
+		writeJSON(w, s.cfg.RedactSecrets())
 	case http.MethodPost:
 		var payload struct {
 			Mode                   string   `json:"mode"`
@@ -608,7 +612,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if payload.MeshSyncTimeoutSec > 0 {
 			s.cfg.MeshSyncTimeoutSec = payload.MeshSyncTimeoutSec
 		}
-		if payload.MeshAPIKey != "" {
+		// A POST that echoes back the redaction placeholder means the
+		// UI never had the real value; treat as "no change" rather
+		// than overwriting the running key with the literal string.
+		if payload.MeshAPIKey != "" && !config.IsRedactedPlaceholder(payload.MeshAPIKey) {
 			s.cfg.MeshAPIKey = payload.MeshAPIKey
 			s.meshAPIKey = payload.MeshAPIKey
 		}
@@ -1027,7 +1034,13 @@ func (s *Server) handleBans(w http.ResponseWriter, r *http.Request) {
 			DurationSec int    `json:"duration_sec"`
 			Reason      string `json:"reason"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		// DisallowUnknownFields refuses any field outside the three
+		// above. /api/bans is a high-blast-radius endpoint; rejecting
+		// surprise fields means a future code reader can't accidentally
+		// add a field that an attacker has already been smuggling.
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&payload); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
 		}
@@ -1467,22 +1480,35 @@ func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	// Fail closed when no mesh key is configured. The previous behaviour
+	// was "skip the auth check when the key is blank", which let any
+	// network-reachable peer POST forged ban entries — exactly the
+	// abuse the constant-time compare exists to prevent. Empty key now
+	// means mesh sync is unusable, full stop, and the operator must
+	// supply a key in config.json or via /api/config to enable it.
+	if s.meshAPIKey == "" {
+		http.Error(w, "mesh disabled: no mesh_api_key configured", http.StatusServiceUnavailable)
+		return
+	}
 	// Constant-time peer-key compare. Direct string `!=` would leak the
 	// key one byte at a time over the network — slow but real. A peer
 	// payload is never larger than a few MB of bans either way, so we
 	// also cap the body so a malicious peer can't OOM us.
-	if s.meshAPIKey != "" {
-		got := r.Header.Get("X-Mesh-Key")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(s.meshAPIKey)) != 1 {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	got := r.Header.Get("X-Mesh-Key")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.meshAPIKey)) != 1 {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var payload struct {
 		Bans []core.BanEntry `json:"bans"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+	// Mesh peers are trusted enough to skip every other check, so this
+	// is the right place to refuse surprise top-level fields. A peer
+	// running a future protocol version learns of the upgrade via 400.
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&payload); err != nil {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
