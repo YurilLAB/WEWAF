@@ -421,6 +421,7 @@ in `internal/config/config.go` for reference.
 | `admin_addr`          | `":8443"`         | Dashboard + API port. Put behind auth in prod.  |
 | `backend_url`         | required          | Origin the proxy forwards to.                   |
 | `trust_xff`           | `false`           | Trust `X-Forwarded-For` (only behind a CDN).    |
+| `trusted_proxies`     | `[]`              | CIDR allowlist of upstream proxies whose `X-Forwarded-For` we honour. Empty = legacy left-most behaviour with a startup warning; production behind a CDN should populate this so an attacker who reaches the WAF directly cannot spoof the source IP. Bare IPs are accepted and promoted to `/32` or `/128`. |
 | `max_concurrent_req`  | `10000`           | Global semaphore on in-flight requests.         |
 | `max_body_bytes`      | `10 MiB`          | Cap on request/response body inspection.        |
 | `block_threshold`     | `100`             | Aggregate score at which a request is blocked.  |

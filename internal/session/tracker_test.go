@@ -5,7 +5,23 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"wewaf/internal/clientip"
 )
+
+// trustXFFExtractor builds an *clientip.Extractor wired to legacy
+// "trust everything in XFF" semantics. The tests here pre-date the
+// trusted_proxies allowlist; they care about TrustXFF as a binary
+// gate. Tests that assert the new strict-trust behaviour live in the
+// clientip package.
+func trustXFFExtractor(t *testing.T, on bool) *clientip.Extractor {
+	t.Helper()
+	e, err := clientip.New(on, nil)
+	if err != nil {
+		t.Fatalf("clientip.New: %v", err)
+	}
+	return e
+}
 
 func TestEnsureSessionIssuesCookie(t *testing.T) {
 	tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute, MaxSessions: 1000})
@@ -98,7 +114,7 @@ func TestTrustXFFGating(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute, TrustXFF: tc.trust})
+			tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute, IPExtractor: trustXFFExtractor(t, tc.trust)})
 			defer tr.Stop()
 
 			r1 := httptest.NewRequest("GET", "/", nil)

@@ -486,9 +486,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			BrowserChallengeEnabled   *bool `json:"browser_challenge_enabled"`
 			BrowserChallengeBlock     *bool `json:"browser_challenge_block"`
 			SessionBlockThreshold     *int  `json:"session_block_threshold"`
-			SessionRequestRateCeiling int   `json:"session_request_rate_ceiling"`
-			SessionPathCountCeiling   int   `json:"session_path_count_ceiling"`
-			TrustXFF                  *bool `json:"trust_xff"`
+			SessionRequestRateCeiling int       `json:"session_request_rate_ceiling"`
+			SessionPathCountCeiling   int       `json:"session_path_count_ceiling"`
+			TrustXFF                  *bool     `json:"trust_xff"`
+			TrustedProxies            *[]string `json:"trusted_proxies"`
 
 			GRPCInspect            *bool    `json:"grpc_inspect"`
 			GRPCBlockOnError       *bool    `json:"grpc_block_on_error"`
@@ -746,6 +747,12 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if payload.TrustXFF != nil {
 			s.cfg.TrustXFF = *payload.TrustXFF
 		}
+		if payload.TrustedProxies != nil {
+			// Defensive copy — never alias the request body's slice into
+			// the live config, otherwise GC of the request would mutate
+			// the running policy.
+			s.cfg.TrustedProxies = append([]string(nil), (*payload.TrustedProxies)...)
+		}
 		if payload.HSTSEnabled != nil {
 			s.cfg.HSTSEnabled = *payload.HSTSEnabled
 		}
@@ -883,7 +890,11 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		sessionEnabled := s.cfg.SessionTrackingEnabled
 		sessionRateCeiling := s.cfg.SessionRequestRateCeiling
 		sessionPathCeiling := s.cfg.SessionPathCountCeiling
-		sessionTrustXFF := s.cfg.TrustXFF
+		// Snapshot under the lock so the Update() call below sees the
+		// same TrustXFF / TrustedProxies pair the caller posted, even
+		// under concurrent hot-reloads.
+		updateTrustXFF := s.cfg.TrustXFF
+		updateTrustedProxies := append([]string(nil), s.cfg.TrustedProxies...)
 		graphqlCfg := graphql.Config{
 			Enabled:            s.cfg.GraphQLEnabled,
 			MaxDepth:           s.cfg.GraphQLMaxDepth,
@@ -902,7 +913,18 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if s.sessions != nil {
 			s.sessions.SetEnabled(sessionEnabled)
 			s.sessions.SetThresholds(sessionRateCeiling, sessionPathCeiling)
-			s.sessions.SetTrustXFF(sessionTrustXFF)
+		}
+		// The proxy + tracker share a single *clientip.Extractor so a
+		// single Update() propagates the new trust policy atomically
+		// to every hot-path caller. A malformed CIDR in the new list
+		// leaves the previous policy in place and surfaces in the log
+		// — refusing to apply is safer than silently dropping the gate.
+		if s.proxy != nil {
+			if ipx := s.proxy.IPExtractor(); ipx != nil {
+				if err := ipx.Update(updateTrustXFF, updateTrustedProxies); err != nil {
+					log.Printf("config: trusted_proxies update rejected: %v", err)
+				}
+			}
 		}
 		if s.graphql != nil {
 			// Preserve any previously-loaded SDL across hot-reloads — config
