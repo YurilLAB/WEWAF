@@ -152,6 +152,8 @@ func main() {
 		Enabled:            cfg.SessionTrackingEnabled,
 		RequestRateCeiling: cfg.SessionRequestRateCeiling,
 		PathCountCeiling:   cfg.SessionPathCountCeiling,
+		ChallengeTTL:       time.Duration(cfg.ChallengeTTLSec) * time.Second,
+		ScoreDecayPerMin:   cfg.SessionScoreDecayPerMin,
 	})
 	defer sessionTracker.Stop()
 

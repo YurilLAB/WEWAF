@@ -78,9 +78,18 @@ type Session struct {
 	// through scoring so the admin UI can render "session was flagged due
 	// to ja3=… (curl)" without an extra lookup. JA3Verdict is "good",
 	// "bad", or empty.
+	//
+	// FirstJA3 is the hash captured on the FIRST request of the session.
+	// JA3Drifts counts how many distinct JA3 hashes we've seen on this
+	// session ID since then — a non-zero count is the cleanest signal we
+	// have for cookie sharing / theft (the same session ID arriving with
+	// a different TLS stack means the cookie is in someone else's
+	// browser). Score() weights this aggressively.
 	JA3        string
 	JA3Verdict string
 	JA3Reason  string
+	FirstJA3   string
+	JA3Drifts  int
 
 	// PoW state. PowPassedAt non-zero means the proof-of-work gate was
 	// cleared and the session is allowed through even at high score.
@@ -158,6 +167,16 @@ type Tracker struct {
 	// restart. Read on the hot path, so they're atomic.
 	requestRateCeiling atomic.Int64 // reqs/min above this starts scoring
 	pathCountCeiling   atomic.Int64 // distinct paths above this starts scoring
+	// challengeTTLSec is how long a successful browser challenge is
+	// honoured by the scoring path. After this many seconds, the
+	// missing-challenge bump re-applies and the session must re-run
+	// the challenge to re-suppress it. Stored as int64 seconds for
+	// atomic load/store.
+	challengeTTLSec atomic.Int64
+	// scoreDecayPerMin is how many score points fade per quiet
+	// minute. 0 disables decay (legacy monotonic). Stored atomic so
+	// the admin API can re-tune at runtime.
+	scoreDecayPerMin atomic.Int64
 
 	// ipExtractor encapsulates the trust_xff + trusted_proxies policy
 	// shared with the proxy layer. Held behind an atomic.Pointer so
@@ -176,6 +195,15 @@ type Config struct {
 	RequestRateCeiling int                 // per-minute threshold that starts scoring
 	PathCountCeiling   int                 // distinct-path threshold that starts scoring
 	IPExtractor        *clientip.Extractor // shared trust-policy resolver; required for IP drift scoring
+	// ChallengeTTL bounds how long a successful browser challenge
+	// is honoured by Score() before the missing-challenge bump
+	// re-applies. Defaults to 24 h. <=0 means "never expire" but
+	// that defeats the cookie-replay-detection class of bot — use
+	// only for development.
+	ChallengeTTL time.Duration
+	// ScoreDecayPerMin is how many score points fade per minute of
+	// quiet time. 0 keeps the legacy monotonic behaviour.
+	ScoreDecayPerMin int
 }
 
 // NewTracker returns a Tracker with a cleanup goroutine started.
@@ -225,8 +253,55 @@ func NewTracker(cfg Config) *Tracker {
 	} else {
 		t.pathCountCeiling.Store(40)
 	}
+	if cfg.ChallengeTTL > 0 {
+		t.challengeTTLSec.Store(int64(cfg.ChallengeTTL.Seconds()))
+	} else {
+		t.challengeTTLSec.Store(int64(24 * time.Hour.Seconds()))
+	}
+	if cfg.ScoreDecayPerMin > 0 {
+		t.scoreDecayPerMin.Store(int64(cfg.ScoreDecayPerMin))
+	}
 	go t.cleanupLoop()
 	return t
+}
+
+// SetChallengeTTL updates the challenge-pass freshness window at
+// runtime. Atomic — safe to call from the admin API hot path.
+func (t *Tracker) SetChallengeTTL(d time.Duration) {
+	if t == nil {
+		return
+	}
+	if d <= 0 {
+		t.challengeTTLSec.Store(0)
+		return
+	}
+	t.challengeTTLSec.Store(int64(d.Seconds()))
+}
+
+// SetScoreDecayPerMin updates the per-minute score decay rate.
+// 0 disables decay (legacy monotonic behaviour); positive values
+// cap at 50 so a typo can't make all sessions look benign.
+func (t *Tracker) SetScoreDecayPerMin(rate int) {
+	if t == nil {
+		return
+	}
+	if rate < 0 {
+		rate = 0
+	}
+	if rate > 50 {
+		rate = 50
+	}
+	t.scoreDecayPerMin.Store(int64(rate))
+}
+
+// ChallengeTTL returns the current challenge-pass freshness window.
+// Used by the proxy to verify __wewaf_bc cookies with the same TTL
+// the tracker is enforcing on its own ChallengePassed flag.
+func (t *Tracker) ChallengeTTL() time.Duration {
+	if t == nil {
+		return 24 * time.Hour
+	}
+	return time.Duration(t.challengeTTLSec.Load()) * time.Second
 }
 
 // Stop halts the cleanup goroutine. Safe to call multiple times.
@@ -388,15 +463,33 @@ func (t *Tracker) RecordBlock(id string) {
 }
 
 // RecordJA3 attaches a JA3 fingerprint and detector verdict to the session.
-// Idempotent: writing the same hash twice is a no-op so this is cheap to
-// call on every request. Verdict and reason are overwritten on each call
-// so a list reload by the operator takes effect for in-flight sessions.
+// Idempotent on a steady fingerprint: writing the same hash twice is a
+// no-op so this is cheap to call on every request. Verdict and reason are
+// overwritten on each call so a list reload by the operator takes effect
+// for in-flight sessions.
+//
+// FIRST-SEEN tracking: the first non-empty hash for a session is stored
+// in FirstJA3 and never overwritten. Subsequent calls with a different
+// hash bump JA3Drifts — the per-session count Score() weights heavily.
+// This is the cleanest tell we have for cookie sharing / theft, since
+// a stolen __wewaf_sid replayed from a different machine carries a
+// different TLS stack and produces a different JA3.
 func (t *Tracker) RecordJA3(id, hash, verdict, reason string) {
 	if t == nil || id == "" || hash == "" {
 		return
 	}
 	t.mu.Lock()
 	if s, ok := t.sessions[id]; ok {
+		if s.FirstJA3 == "" {
+			s.FirstJA3 = hash
+		} else if s.FirstJA3 != hash && s.JA3 != hash {
+			// Drift only when this hash differs from BOTH the
+			// first-seen and the most-recent. The "different from
+			// most-recent" guard keeps a NAT-induced flap (rare but
+			// possible across mobile-network reconnects) from
+			// counting twice.
+			s.JA3Drifts++
+		}
 		s.JA3 = hash
 		s.JA3Verdict = verdict
 		s.JA3Reason = reason
@@ -628,9 +721,21 @@ func (t *Tracker) IssueChallengeCookie(secure bool) (*http.Cookie, string) {
 }
 
 // VerifyChallengeCookie returns (timestamp, true) if the cookie value is
-// valid and signed by this tracker. A false return should be treated as
-// "challenge not yet passed" rather than an error.
-func (t *Tracker) VerifyChallengeCookie(value string) (time.Time, bool) {
+// valid AND was issued within ttl of now. A false return should be
+// treated as "challenge not yet passed" rather than an error.
+//
+// The ttl check is the second half of the cookie's lifecycle:
+// http.Cookie.MaxAge tells the browser to drop the cookie after the
+// window, but a bot client that ignores MaxAge (or scrapes a cookie
+// from a real browser and replays it from somewhere else) doesn't
+// honour MaxAge. Without this server-side check the HMAC signature
+// alone validates a cookie issued months ago — exactly the kind of
+// "solve once, replay forever" bypass a scaled bot operator wants.
+//
+// ttl <= 0 disables the freshness check, preserving the previous
+// signature-only behaviour. Real callers always pass a positive
+// duration; the zero-disabled path is for tests + legacy callers.
+func (t *Tracker) VerifyChallengeCookie(value string, ttl time.Duration) (time.Time, bool) {
 	if value == "" || len(value) > maxCookieLen {
 		return time.Time{}, false
 	}
@@ -653,7 +758,20 @@ func (t *Tracker) VerifyChallengeCookie(value string) (time.Time, bool) {
 		}
 		sec = sec*10 + int64(c-'0')
 	}
-	return time.Unix(sec, 0).UTC(), true
+	issued := time.Unix(sec, 0).UTC()
+	if ttl > 0 {
+		now := time.Now().UTC()
+		// Reject anything issued more than ttl in the past, AND
+		// anything dated more than 5 minutes in the future — the
+		// latter catches a tampered timestamp that managed to retain
+		// a valid HMAC (impossible without the secret, but defensive
+		// in case of a future cryptanalysis or a mis-handled clock
+		// skew on the issuing daemon).
+		if now.Sub(issued) > ttl || issued.Sub(now) > 5*time.Minute {
+			return time.Time{}, false
+		}
+	}
+	return issued, true
 }
 
 // --- Helpers ------------------------------------------------------------
