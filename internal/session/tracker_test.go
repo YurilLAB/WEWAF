@@ -213,7 +213,7 @@ func TestChallengeCookieRoundTrip(t *testing.T) {
 	if c.Name != ChallengeCookieName {
 		t.Fatalf("wrong cookie name: %q", c.Name)
 	}
-	ts, ok := tr.VerifyChallengeCookie(value)
+	ts, ok := tr.VerifyChallengeCookie(value, 0)
 	if !ok {
 		t.Fatal("verify rejected our own-issued cookie")
 	}
@@ -221,7 +221,7 @@ func TestChallengeCookieRoundTrip(t *testing.T) {
 		t.Fatalf("timestamp implausibly old: %v", ts)
 	}
 	// Swap signature — should be rejected.
-	if _, ok := tr.VerifyChallengeCookie(value + "x"); ok {
+	if _, ok := tr.VerifyChallengeCookie(value+"x", 0); ok {
 		t.Fatal("verify accepted tampered cookie")
 	}
 }
@@ -317,8 +317,10 @@ func TestJA3BadVerdictBumpsScore(t *testing.T) {
 		t.Fatalf("expected JA3 bad to add ≥15 points; baseline=%d after-bump=%d", baseline, bumped)
 	}
 
-	// "good" verdict overrides the bump path — re-tag and confirm.
-	tr.RecordJA3(s.ID, "feedface", "good", "Chrome stable")
+	// "good" verdict overrides the bump path — re-tag with the SAME
+	// hash so the JA3-drift bump doesn't enter the picture (we're
+	// testing the verdict axis, not the drift axis).
+	tr.RecordJA3(s.ID, "deadbeef", "good", "Chrome stable")
 	good := tr.Score(s.ID)
 	if good-baseline >= 15 {
 		t.Fatalf("'good' verdict shouldn't add ≥15 points; baseline=%d good=%d", baseline, good)
@@ -353,5 +355,169 @@ func TestPowPassCapsVisibleScore(t *testing.T) {
 	capped := tr.Score(s.ID)
 	if capped > 49 {
 		t.Fatalf("post-PoW score should be ≤49; got %d (raw was %d)", capped, rawHigh)
+	}
+}
+
+// TestVerifyChallengeCookie_TTLRejection closes the "solve once,
+// replay forever" bypass: the previous VerifyChallengeCookie only
+// checked the HMAC, so a captured cookie validated indefinitely. The
+// TTL gate now refuses cookies older than the configured window.
+func TestVerifyChallengeCookie_TTLRejection(t *testing.T) {
+	tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute})
+	defer tr.Stop()
+	_, value := tr.IssueChallengeCookie(false)
+
+	// ttl = 24h, cookie just issued — must verify.
+	if _, ok := tr.VerifyChallengeCookie(value, 24*time.Hour); !ok {
+		t.Fatal("fresh cookie should verify under 24h TTL")
+	}
+
+	// Forge an old cookie by re-signing a payload an hour in the past.
+	// We can't move time.Now backwards from inside a test, so we issue
+	// a cookie with a custom payload directly using the package-private
+	// signCookie helper would be simplest — but VerifyChallengeCookie's
+	// payload is a unix timestamp, so we just set ttl to 1ns and check
+	// that any non-future cookie is rejected.
+	if _, ok := tr.VerifyChallengeCookie(value, 1*time.Nanosecond); ok {
+		t.Fatal("ttl=1ns should reject any cookie issued before the call")
+	}
+
+	// ttl=0 disables the check (legacy / test path).
+	if _, ok := tr.VerifyChallengeCookie(value, 0); !ok {
+		t.Fatal("ttl=0 should fall through to signature-only verification")
+	}
+}
+
+// TestScoreReChallengeAfterTTL — the corresponding session-side
+// behaviour: a session that passed the challenge and then sat for
+// longer than the TTL must trigger the missing-challenge bump
+// again, ensuring a captured session ID can't ride forever.
+func TestScoreReChallengeAfterTTL(t *testing.T) {
+	tr := NewTracker(Config{
+		Enabled:      true,
+		IdleTTL:      time.Hour,
+		ChallengeTTL: 50 * time.Millisecond,
+	})
+	defer tr.Stop()
+
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:443"
+	w := httptest.NewRecorder()
+	s := tr.EnsureSession(w, r)
+	tr.RecordChallengePass(s.ID)
+
+	// Drive enough requests to clear the >5 threshold for the
+	// missing-challenge bump. Use touchSession directly so we
+	// re-touch the SAME session — re-calling EnsureSession with a
+	// cookieless request would mint a new session each iteration.
+	for i := 0; i < 8; i++ {
+		tr.touchSession(s.ID, r)
+	}
+	freshScore := tr.Score(s.ID)
+
+	// Wait past the TTL so the challenge pass is now stale.
+	time.Sleep(120 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		tr.touchSession(s.ID, r)
+	}
+	staleScore := tr.Score(s.ID)
+	if staleScore <= freshScore {
+		t.Fatalf("score should rise once challenge ages past TTL: fresh=%d stale=%d",
+			freshScore, staleScore)
+	}
+}
+
+// TestJA3DriftBumpsScore — cookie sharing / theft: same session ID
+// is replayed from a client with a different TLS stack. JA3Drifts
+// captures that and Score() weights it heavily because it's a
+// near-zero-false-positive signal for legit users.
+func TestJA3DriftBumpsScore(t *testing.T) {
+	tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute})
+	defer tr.Stop()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:443"
+	w := httptest.NewRecorder()
+	s := tr.EnsureSession(w, r)
+
+	tr.RecordJA3(s.ID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "good", "")
+	stable := tr.Score(s.ID)
+
+	// Same hash repeated — must NOT increment drift.
+	tr.RecordJA3(s.ID, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "good", "")
+	if got := tr.Score(s.ID); got != stable {
+		t.Fatalf("repeated same JA3 should not change score; was %d became %d", stable, got)
+	}
+
+	// New hash — drift +1.
+	tr.RecordJA3(s.ID, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "good", "")
+	drifted := tr.Score(s.ID)
+	if drifted < stable+25 {
+		t.Fatalf("first drift should bump score by ≥25; was %d became %d", stable, drifted)
+	}
+	tr.mu.RLock()
+	live := tr.sessions[s.ID]
+	if live.JA3Drifts != 1 {
+		t.Fatalf("JA3Drifts = %d, want 1", live.JA3Drifts)
+	}
+	if live.FirstJA3 != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("FirstJA3 = %q, want first-seen hash preserved", live.FirstJA3)
+	}
+	tr.mu.RUnlock()
+}
+
+// TestImplausibleBeaconRateBumps — bots faking realism send the
+// max-cap beacon every tick. After a sustained window we expect
+// the per-second event rate to drop into "no human is this active"
+// territory; the score must bump.
+func TestImplausibleBeaconRateBumps(t *testing.T) {
+	tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute})
+	defer tr.Stop()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:443"
+	w := httptest.NewRecorder()
+	s := tr.EnsureSession(w, r)
+	// Force FirstSeen back so the observedSec gate (>30s) is met.
+	tr.mu.Lock()
+	live := tr.sessions[s.ID]
+	live.FirstSeen = time.Now().UTC().Add(-1 * time.Minute)
+	tr.mu.Unlock()
+
+	// Rate above the implausible ceiling (100/s) over ~60s.
+	tr.RecordBeacon(s.ID, 8000, 500, 60000)
+	score := tr.Score(s.ID)
+	if score < 15 {
+		t.Fatalf("implausible beacon rate should bump score by ≥15; got %d", score)
+	}
+}
+
+// TestBlockRatioRequiresMinSample ensures a single block on a tiny
+// session no longer spikes the score. The previous unconditional
+// ratio check produced +30 from a 1-block / 2-request session.
+func TestBlockRatioRequiresMinSample(t *testing.T) {
+	tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute})
+	defer tr.Stop()
+	r := httptest.NewRequest("GET", "/", nil)
+	r.RemoteAddr = "10.0.0.1:443"
+	w := httptest.NewRecorder()
+	s := tr.EnsureSession(w, r)
+	// Two requests total + one block — under the minimum-sample
+	// threshold (5). Use touchSession so we stay on the same session.
+	tr.touchSession(s.ID, r)
+	tr.RecordBlock(s.ID)
+	low := tr.Score(s.ID)
+
+	// Now drive past the min-sample gate AND raise the block ratio
+	// above the 0.1 floor.
+	for i := 0; i < 6; i++ {
+		tr.touchSession(s.ID, r)
+	}
+	tr.RecordBlock(s.ID)
+	tr.RecordBlock(s.ID)
+	high := tr.Score(s.ID)
+	if low > 5 {
+		t.Fatalf("under-sample block ratio should not spike; got %d", low)
+	}
+	if high <= low {
+		t.Fatalf("post-sample block bump must apply: low=%d high=%d", low, high)
 	}
 }

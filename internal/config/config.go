@@ -167,6 +167,17 @@ type Config struct {
 	SessionPathCountCeiling   int    `json:"session_path_count_ceiling"`
 	BrowserChallengeEnabled   bool   `json:"browser_challenge_enabled"`
 	BrowserChallengeBlock     bool   `json:"browser_challenge_block"` // if true, failed challenge blocks; else score-only
+	// ChallengeTTLSec is how long a successful browser challenge stays
+	// valid. Once expired, the session must re-run the challenge before
+	// the missing-challenge score-bump is suppressed. Defaults to 24 h
+	// matching the cookie's MaxAge — both the server-side flag and the
+	// client-side cookie are gated by the same expiry.
+	ChallengeTTLSec int `json:"challenge_ttl_sec"`
+	// SessionScoreDecayPerMin is how many score points fade per quiet
+	// minute. Default 2 (a session that earned +50 from a noise burst
+	// is back to baseline after ~25 quiet minutes). Zero disables
+	// decay (legacy monotonic behaviour).
+	SessionScoreDecayPerMin int `json:"session_score_decay_per_min"`
 	SessionBlockThreshold     int    `json:"session_block_threshold"` // risk score at/above which to block; 0 = never
 
 	// Deep packet inspection — gRPC + WebSocket. When enabled, the
@@ -369,7 +380,9 @@ func Default() *Config {
 		SessionPathCountCeiling:   40,
 		BrowserChallengeEnabled:   false,
 		BrowserChallengeBlock:     false,
-		SessionBlockThreshold:     0, // disabled by default — observe first
+		ChallengeTTLSec:           86400, // 24h — matches cookie MaxAge
+		SessionScoreDecayPerMin:   2,     // 50 points fade in ~25 quiet min
+		SessionBlockThreshold:     0,     // disabled by default — observe first
 
 		GRPCInspect:            false,
 		GRPCBlockOnError:       false,
@@ -587,6 +600,21 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxBanDurationSec <= 0 {
 		c.MaxBanDurationSec = 7 * 24 * 3600
+	}
+	if c.ChallengeTTLSec <= 0 {
+		c.ChallengeTTLSec = 86400
+	}
+	// Cap at 7 days even if the operator typed something larger —
+	// indefinite challenge passes defeat the whole "bot solved once
+	// then shared the cookie" detection.
+	if c.ChallengeTTLSec > 7*86400 {
+		c.ChallengeTTLSec = 7 * 86400
+	}
+	if c.SessionScoreDecayPerMin < 0 {
+		c.SessionScoreDecayPerMin = 0
+	}
+	if c.SessionScoreDecayPerMin > 50 {
+		c.SessionScoreDecayPerMin = 50
 	}
 	if c.SessionIdleTTLSec <= 0 {
 		c.SessionIdleTTLSec = 1800
@@ -848,6 +876,8 @@ func (c *Config) Snapshot() *Config {
 		SessionPathCountCeiling:   c.SessionPathCountCeiling,
 		BrowserChallengeEnabled:   c.BrowserChallengeEnabled,
 		BrowserChallengeBlock:     c.BrowserChallengeBlock,
+		ChallengeTTLSec:           c.ChallengeTTLSec,
+		SessionScoreDecayPerMin:   c.SessionScoreDecayPerMin,
 		SessionBlockThreshold:     c.SessionBlockThreshold,
 
 		GRPCInspect:              c.GRPCInspect,

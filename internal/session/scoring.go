@@ -5,26 +5,40 @@ import (
 	"time"
 )
 
+// Per-second event rate above which a beacon is "implausibly active"
+// — a real human averages 50–200 mouse events per minute (~0.8–3.3 per
+// second); 100 per second sustained is automation faking realism.
+// Calibrated from public UEBA datasets and aligned with what most
+// CAPTCHA-replacement services consider the human-noise ceiling.
+const beaconImplausibleEventsPerSec = 100
+
 // ScoreRequest recomputes the session's risk score based on current state.
 // Called after every request. Runs inside the tracker lock so callers just
 // invoke it through Tracker.Score.
 //
-// Score is monotonically-derived from observed signals with explicit
-// weights — it is NOT an ML model. That's intentional: every bump is
-// explainable in the admin UI ("+15 for UA drift", "+20 for rate spike"),
-// and operators can tune thresholds without retraining anything. Anomaly
-// scoring with opaque ML tends to false-positive in ways operators can't
-// debug during an incident.
+// Score is observed-signal-derived with explicit weights — it is NOT an
+// ML model. That's intentional: every bump is explainable in the admin
+// UI ("+15 for UA drift", "+20 for rate spike"), and operators can tune
+// thresholds without retraining anything. Anomaly scoring with opaque ML
+// tends to false-positive in ways operators can't debug during an
+// incident.
 //
 // Weights (all additive, capped at 100):
 //   - Rate anomaly:         up to +25  (reqs/min > ceiling)
 //   - Path explosion:       up to +20  (distinct paths > ceiling)
 //   - UA drift:             +10 per distinct UA after the first (max +30)
 //   - IP drift:             +10 per distinct IP after the first (max +20)
-//   - Missing challenge:    +15  (active session with no browser cookie)
+//   - Missing challenge:    +15  (active session with no fresh challenge pass)
 //   - Missing beacon:       +10  (10+ requests, no event reports)
 //   - Suspiciously uniform: +10  (beacon with zero mouse AND zero keys)
-//   - Block ratio:          up to +30 (blocks ÷ requests)
+//   - Implausible beacon:   +15  (reported event rate above human ceiling)
+//   - Block ratio:          up to +30 (blocks ÷ requests, min 5 reqs)
+//   - JA3 verdict bad:      +15
+//   - JA3 drift:            +25 per drift, capped +50 (high-signal cookie sharing)
+//
+// Plus a time-decay step: scoreDecayPerMin points fade per minute of
+// inactivity so a session that earned a spike from one bad burst
+// gradually returns to baseline if it then behaves.
 //
 // Scores >= 60 are "high risk" and the proxy can optionally drop its
 // block threshold for these sessions.
@@ -97,9 +111,22 @@ func (t *Tracker) Score(id string) int {
 		score += bump
 	}
 
-	// Missing challenge — only penalise after a few requests so a
-	// landing-page hit isn't flagged before the JS has a chance to run.
-	if !s.ChallengePassed && s.RequestCount > 5 {
+	// Missing challenge — penalise active sessions that don't have a
+	// fresh challenge pass. The freshness check closes a class of
+	// bypass: ChallengePassed used to be a permanent boolean, so a
+	// bot solved once and stayed passed for the entire session
+	// lifetime (which can be days when activity keeps the idle TTL
+	// bumped). The TTL gate forces re-challenge after a configured
+	// window, putting an upper bound on how long a stolen cookie or
+	// a once-solved bot can ride a single session ID.
+	challengeFresh := s.ChallengePassed && !s.ChallengeAt.IsZero()
+	if challengeFresh {
+		ttlSec := t.challengeTTLSec.Load()
+		if ttlSec > 0 && now.Sub(s.ChallengeAt) > time.Duration(ttlSec)*time.Second {
+			challengeFresh = false
+		}
+	}
+	if !challengeFresh && s.RequestCount > 5 {
 		score += 15
 	}
 
@@ -116,8 +143,21 @@ func (t *Tracker) Score(id string) int {
 		score += 10
 	}
 
-	// Block ratio — if this session has been blocked repeatedly, bump.
-	if s.RequestCount > 0 {
+	// Implausible-activity beacon — the inverse failure mode. A bot
+	// faking realism has to commit to numbers; cap that with a
+	// human-baseline ceiling (mouse + key events per second sustained
+	// over the session). 100/sec is roughly 50× a busy human.
+	if s.BeaconCount > 0 && observedSec > 30 {
+		evRate := float64(s.MouseEvents+s.KeyEvents) / observedSec
+		if evRate > beaconImplausibleEventsPerSec {
+			score += 15
+		}
+	}
+
+	// Block ratio — bump only when there's enough sample to mean
+	// anything. The previous unconditional check let a 1-block /
+	// 2-request session score +30 from one cold-start mismatch.
+	if s.RequestCount >= 5 {
 		ratio := float64(s.BlockCount) / float64(s.RequestCount)
 		if ratio > 0.1 {
 			bump := int(math.Min(30, ratio*100))
@@ -127,14 +167,46 @@ func (t *Tracker) Score(id string) int {
 
 	// JA3 — a curated-bad fingerprint adds a fixed bump. We do NOT block
 	// on JA3 alone in the scoring path; that's the operator's choice via
-	// the hard-block flag in the JA3 detector. A "good" verdict is purely
-	// suppressive (no bump), never negative — score is monotonic.
+	// the hard-block flag in the JA3 detector.
 	if s.JA3Verdict == "bad" {
 		score += 15
 	}
 
+	// JA3 drift — the cleanest cookie-sharing tell we have. A stolen
+	// __wewaf_sid replayed on a different machine carries a different
+	// TLS stack and so a different JA3 hash. The first drift is +25;
+	// each subsequent drift adds +25 too, capped at +50 so legitimate
+	// network handoffs (mobile NAT swap, VPN connect/disconnect) don't
+	// get pinned past redemption. Anything past two distinct stacks on
+	// the same session ID is bot territory.
+	if s.JA3Drifts > 0 {
+		bump := s.JA3Drifts * 25
+		if bump > 50 {
+			bump = 50
+		}
+		score += bump
+	}
+
 	if score > 100 {
 		score = 100
+	}
+
+	// Apply time-decay AFTER all positive bumps — the new evidence is
+	// the most useful signal but we still want yesterday's spike to
+	// fade if the session has since been quiet. Decay anchors on
+	// LastScoreBump so a chatty-then-quiet session gradually returns
+	// to baseline without ever erasing a fresh spike.
+	if rate := t.scoreDecayPerMin.Load(); rate > 0 && !s.LastScoreBump.IsZero() {
+		quietMin := now.Sub(s.LastScoreBump).Minutes()
+		if quietMin > 0 {
+			fade := int(quietMin * float64(rate))
+			if fade > 0 {
+				score -= fade
+				if score < 0 {
+					score = 0
+				}
+			}
+		}
 	}
 
 	// PoW cap — if this session has cleared the proof-of-work gate within
@@ -157,8 +229,15 @@ func (t *Tracker) Score(id string) int {
 		return score
 	}
 	t.mu.Lock()
+	prev := s.RiskScore
 	s.RiskScore = score
-	s.LastScoreBump = now
+	// Only refresh LastScoreBump on UPWARD movement so a decay-driven
+	// drop doesn't count as fresh activity that resets the decay clock.
+	// Without this guard the decay never converges on a stable score
+	// for a quiet session.
+	if score > prev {
+		s.LastScoreBump = now
+	}
 	t.mu.Unlock()
 	return score
 }

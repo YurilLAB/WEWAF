@@ -493,6 +493,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			SessionBlockThreshold     *int  `json:"session_block_threshold"`
 			SessionRequestRateCeiling int       `json:"session_request_rate_ceiling"`
 			SessionPathCountCeiling   int       `json:"session_path_count_ceiling"`
+			ChallengeTTLSec           int       `json:"challenge_ttl_sec"`
+			SessionScoreDecayPerMin   *int      `json:"session_score_decay_per_min"`
 			TrustXFF                  *bool     `json:"trust_xff"`
 			TrustedProxies            *[]string `json:"trusted_proxies"`
 
@@ -704,6 +706,27 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if payload.SessionPathCountCeiling > 0 {
 			s.cfg.SessionPathCountCeiling = payload.SessionPathCountCeiling
 		}
+		if payload.ChallengeTTLSec > 0 {
+			// Validation in Validate() also clamps the upper bound,
+			// but we re-bound here so the live tracker doesn't see a
+			// week-and-a-half value for the brief window before the
+			// next Validate() pass.
+			ttl := payload.ChallengeTTLSec
+			if ttl > 7*86400 {
+				ttl = 7 * 86400
+			}
+			s.cfg.ChallengeTTLSec = ttl
+		}
+		if payload.SessionScoreDecayPerMin != nil {
+			d := *payload.SessionScoreDecayPerMin
+			if d < 0 {
+				d = 0
+			}
+			if d > 50 {
+				d = 50
+			}
+			s.cfg.SessionScoreDecayPerMin = d
+		}
 		if payload.GraphQLEnabled != nil {
 			s.cfg.GraphQLEnabled = *payload.GraphQLEnabled
 		}
@@ -898,6 +921,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		sessionEnabled := s.cfg.SessionTrackingEnabled
 		sessionRateCeiling := s.cfg.SessionRequestRateCeiling
 		sessionPathCeiling := s.cfg.SessionPathCountCeiling
+		sessionChallengeTTL := time.Duration(s.cfg.ChallengeTTLSec) * time.Second
+		sessionScoreDecay := s.cfg.SessionScoreDecayPerMin
 		// Snapshot under the lock so the Update() call below sees the
 		// same TrustXFF / TrustedProxies pair the caller posted, even
 		// under concurrent hot-reloads.
@@ -921,6 +946,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if s.sessions != nil {
 			s.sessions.SetEnabled(sessionEnabled)
 			s.sessions.SetThresholds(sessionRateCeiling, sessionPathCeiling)
+			s.sessions.SetChallengeTTL(sessionChallengeTTL)
+			s.sessions.SetScoreDecayPerMin(sessionScoreDecay)
 		}
 		// The proxy + tracker share a single *clientip.Extractor so a
 		// single Update() propagates the new trust policy atomically
