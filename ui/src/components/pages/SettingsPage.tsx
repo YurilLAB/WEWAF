@@ -233,6 +233,7 @@ export default function SettingsPage() {
       if (typeof cfg.multi_limit_max_entries === 'number') updates.multiLimitMaxEntries = cfg.multi_limit_max_entries;
       if (typeof cfg.grpc_inspect === 'boolean') updates.grpcInspect = cfg.grpc_inspect;
       if (typeof cfg.grpc_block_on_error === 'boolean') updates.grpcBlockOnError = cfg.grpc_block_on_error;
+      if (typeof cfg.grpc_block_compressed === 'boolean') updates.grpcBlockCompressed = cfg.grpc_block_compressed;
       if (typeof cfg.grpc_max_frames === 'number') updates.grpcMaxFrames = cfg.grpc_max_frames;
       if (typeof cfg.grpc_max_frame_bytes === 'number') updates.grpcMaxFrameBytes = cfg.grpc_max_frame_bytes;
       if (typeof cfg.websocket_inspect === 'boolean') updates.websocketInspect = cfg.websocket_inspect;
@@ -326,6 +327,7 @@ export default function SettingsPage() {
         multi_limit_max_entries: form.multiLimitMaxEntries,
         grpc_inspect: form.grpcInspect,
         grpc_block_on_error: form.grpcBlockOnError,
+        grpc_block_compressed: form.grpcBlockCompressed,
         grpc_max_frames: form.grpcMaxFrames,
         grpc_max_frame_bytes: form.grpcMaxFrameBytes,
         websocket_inspect: form.websocketInspect,
@@ -1163,6 +1165,10 @@ export default function SettingsPage() {
                 <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer col-span-full">
                   <input type="checkbox" checked={form.grpcBlockOnError} onChange={(e) => setForm({ ...form, grpcBlockOnError: e.target.checked })} className="rounded border-waf-border" />
                   Block when frame caps are exceeded (default = observe + score)
+                </label>
+                <label className="flex items-center gap-2 text-sm text-waf-muted cursor-pointer col-span-full">
+                  <input type="checkbox" checked={form.grpcBlockCompressed} onChange={(e) => setForm({ ...form, grpcBlockCompressed: e.target.checked })} className="rounded border-waf-border" />
+                  Block compressed frames (closes the rule-engine bypass where attackers hide payloads behind any compression codec — turn on once you've confirmed your services don't legitimately use gRPC compression)
                 </label>
                 <div>
                   <label className="text-xs text-waf-muted mb-1 block">Max frames per body</label>

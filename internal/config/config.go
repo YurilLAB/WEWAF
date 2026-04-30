@@ -177,6 +177,12 @@ type Config struct {
 	GRPCBlockOnError       bool `json:"grpc_block_on_error"`
 	GRPCMaxFrames          int  `json:"grpc_max_frames"`
 	GRPCMaxFrameBytes      int  `json:"grpc_max_frame_bytes"`
+	// Fail-closed on compressed gRPC frames. The default scanner skips
+	// extraction on compressed bodies (binary noise post-codec), which
+	// is a clean rule-engine bypass when the operator wants every body
+	// inspected. Turning this on rejects any compressed frame rather
+	// than letting it through unscanned.
+	GRPCBlockCompressed    bool `json:"grpc_block_compressed"`
 	WebSocketInspect       bool     `json:"websocket_inspect"`
 	WebSocketRequireSubproto bool   `json:"websocket_require_subprotocol"`
 	WebSocketOriginAllowlist []string `json:"websocket_origin_allowlist"`
@@ -700,6 +706,49 @@ func (c *Config) BuildClientIPExtractor() (*clientip.Extractor, error) {
 	return clientip.New(c.TrustXFF, c.TrustedProxies)
 }
 
+// secretRedactedPlaceholder marks a config field that has a non-empty
+// secret in the running daemon. The UI uses presence of this exact
+// string to render "secret is configured" without showing the value;
+// any POST that sends this placeholder back is treated as "no change"
+// by the admin API so a round-trip through the form doesn't corrupt
+// the secret to a literal "REDACTED".
+const secretRedactedPlaceholder = "[REDACTED]"
+
+// IsRedactedPlaceholder reports whether v is the placeholder used by
+// RedactSecrets, so the admin POST handler can ignore it on round-trip.
+func IsRedactedPlaceholder(v string) bool { return v == secretRedactedPlaceholder }
+
+// RedactSecrets returns a snapshot with every credential / signing-key
+// field replaced by a stable placeholder. /api/config GET returns this
+// flavour so authenticated UI sessions can present "configured" /
+// "not configured" without an attacker who lands on the admin port
+// (or anyone reading a session-replay) walking off with the running
+// HMAC keys. The placeholder is deliberately non-empty so the UI can
+// distinguish "configured" from "blank"; it's also picked specifically
+// so a paste-back round-trip is detectable in the POST handler.
+//
+// We never include the production secret value in any UI / SDK / log
+// surface — the only place it lives is config.json on disk.
+func (c *Config) RedactSecrets() *Config {
+	cp := c.Snapshot()
+	if cp == nil {
+		return nil
+	}
+	if cp.SessionCookieSecret != "" {
+		cp.SessionCookieSecret = secretRedactedPlaceholder
+	}
+	if cp.AuditSecret != "" {
+		cp.AuditSecret = secretRedactedPlaceholder
+	}
+	if cp.PoWSecret != "" {
+		cp.PoWSecret = secretRedactedPlaceholder
+	}
+	if cp.MeshAPIKey != "" {
+		cp.MeshAPIKey = secretRedactedPlaceholder
+	}
+	return cp
+}
+
 // Snapshot returns a pointer to a shallow copy for safe read-only access.
 // Do not modify the returned value. Takes an RLock so concurrent writers
 // (admin API, hot-reload) can't produce a torn read of int64 / slice fields.
@@ -805,6 +854,7 @@ func (c *Config) Snapshot() *Config {
 		GRPCBlockOnError:         c.GRPCBlockOnError,
 		GRPCMaxFrames:            c.GRPCMaxFrames,
 		GRPCMaxFrameBytes:        c.GRPCMaxFrameBytes,
+		GRPCBlockCompressed:      c.GRPCBlockCompressed,
 		WebSocketInspect:         c.WebSocketInspect,
 		WebSocketRequireSubproto: c.WebSocketRequireSubproto,
 		WebSocketOriginAllowlist: append([]string(nil), c.WebSocketOriginAllowlist...),

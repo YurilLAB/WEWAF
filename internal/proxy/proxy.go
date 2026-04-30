@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -891,8 +892,9 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if wp.cfg.GRPCInspect && dpi.IsGRPCRequest(r) {
 		wp.grpcRequests.Add(1)
 		res := dpi.InspectGRPCBody(body, dpi.GRPCLimits{
-			MaxFrames:     wp.cfg.GRPCMaxFrames,
-			MaxFrameBytes: wp.cfg.GRPCMaxFrameBytes,
+			MaxFrames:       wp.cfg.GRPCMaxFrames,
+			MaxFrameBytes:   wp.cfg.GRPCMaxFrameBytes,
+			BlockCompressed: wp.cfg.GRPCBlockCompressed,
 		})
 		if res.Blocked && wp.cfg.GRPCBlockOnError {
 			wp.grpcBlocked.Add(1)
@@ -1634,11 +1636,19 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// doesn't exceed respLimit.
 		remaining := respLimit - int64(len(inspected))
 		if remaining > 0 {
-			_, _ = io.Copy(w, io.LimitReader(resp.Body, remaining))
+			if _, err := io.Copy(w, io.LimitReader(resp.Body, remaining)); err != nil {
+				// Truncated/abandoned upstream response. We've already
+				// committed status + headers, so all we can do is log
+				// for the operator's incident timeline; net/http will
+				// abort the in-flight write on the client side.
+				log.Printf("egress: response copy failed: %v", err)
+			}
 		}
 		return
 	}
-	_, _ = io.Copy(w, io.LimitReader(resp.Body, respLimit))
+	if _, err := io.Copy(w, io.LimitReader(resp.Body, respLimit)); err != nil {
+		log.Printf("egress: response copy failed: %v", err)
+	}
 }
 
 // ExfilStats returns the cumulative detection and block counters for
