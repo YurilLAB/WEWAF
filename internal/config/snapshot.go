@@ -22,7 +22,13 @@ func (c *Config) SnapshotToFile(dir string, keep int) (string, error) {
 	if dir == "" {
 		dir = "config_backup"
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// 0o700 — config snapshots can hold redacted-but-still-sensitive
+	// metadata (mesh peer URLs, file paths, port numbers, ban counts).
+	// On a shared host the previous 0o755 made them world-readable.
+	// On Windows the mode bits are advisory and ACLs are inherited
+	// from the parent, so this hardens POSIX without changing
+	// observable Windows behaviour.
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("config: create snapshot dir: %w", err)
 	}
 	snap := c.Snapshot()

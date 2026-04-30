@@ -70,6 +70,19 @@ func main() {
 	}
 	log.Printf("config loaded: listen=%s backend=%s mode=%s", cfg.ListenAddr, cfg.BackendURL, cfg.Mode)
 
+	// The admin server has no built-in authentication beyond the
+	// X-API-Key header check. Binding it to every interface (the
+	// default for ":8443"-style addrs) means anyone on the same VPC,
+	// container network, or shared host can hammer the API. Surface a
+	// loud warning so operators on a lab box see it the first time
+	// they start the daemon and tune AdminAddr to "127.0.0.1:8443"
+	// or a private interface before exposing the WAF.
+	if isWildcardListenAddr(cfg.AdminAddr) {
+		log.Printf("WARN: admin_addr=%q binds every interface — restrict to 127.0.0.1 "+
+			"or a private interface in production, or front the admin port with mTLS",
+			cfg.AdminAddr)
+	}
+
 	if err := limits.Apply(cfg.MaxCPUCores, cfg.MaxMemoryMB); err != nil {
 		log.Fatalf("failed to apply resource limits: %v", err)
 	}
@@ -210,8 +223,9 @@ func main() {
 	// reference to the detector so the intel-feed sink (below) can
 	// MergeBad() into it as feeds publish new headless-build hashes.
 	var jaDetector *ja3.Detector
+	var jaCache *ja3.Cache // hoisted so the native TLS listener (below) can wire JA3 capture
 	if cfg.JA3Enabled {
-		jaCache := ja3.NewCache(cfg.JA3CacheCapacity, time.Duration(cfg.JA3CacheTTLSec)*time.Second)
+		jaCache = ja3.NewCache(cfg.JA3CacheCapacity, time.Duration(cfg.JA3CacheTTLSec)*time.Second)
 		jaDetector = ja3.NewDetector()
 		jaDetector.SetHardBlock(cfg.JA3HardBlock)
 		jaTrust := ja3.NewTrustChecker(cfg.JA3TrustedSources)
@@ -595,6 +609,50 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
+	// Native TLS termination, opt-in. The SSL manager owns the cert
+	// pairs + TLS policy; we ask it for a *tls.Config and only flip
+	// the proxy server to TLS when ssl_config.enabled is true AND
+	// at least one cert is loaded.
+	//
+	// Failure-mode policy: when the operator has turned the feature
+	// ON we refuse to start without TLS. The previous behaviour was
+	// to log + fall back to plaintext, but a silent downgrade after
+	// a cert-file corruption is exactly the kind of misconfiguration
+	// that's invisible until the next traffic capture proves it.
+	// Fail-fast forces the operator to fix the cert before traffic
+	// flows. When the feature is off the proxy serves plaintext as
+	// normal.
+	proxyTLSEnabled := false
+	if sslMgr != nil && sslMgr.ConfigSnapshot().Enabled {
+		if !sslMgr.HasUsableCerts() {
+			log.Fatalf("ssl: ssl_config.enabled=true but no usable certs are loaded — refusing to start " +
+				"so the proxy doesn't silently downgrade to plaintext")
+		}
+		tlsCfg, err := sslMgr.BuildTLSConfig()
+		if err != nil {
+			log.Fatalf("ssl: BuildTLSConfig failed (%v) — refusing to start a TLS-enabled WAF without TLS", err)
+		}
+		if tlsCfg == nil {
+			// Defensive: HasUsableCerts is true but BuildTLSConfig
+			// returned nil. That's a code-level inconsistency, not
+			// an operator error, but still refuse to silently
+			// downgrade.
+			log.Fatalf("ssl: BuildTLSConfig returned nil despite HasUsableCerts=true — internal inconsistency")
+		}
+		if jaCache != nil {
+			wrapped, hooked, jerr := proxy.JA3TLSConfig(tlsCfg, jaCache)
+			if jerr != nil {
+				log.Printf("ssl: JA3TLSConfig wrap failed (%v); using plain TLS without JA3 capture", jerr)
+			} else if hooked {
+				tlsCfg = wrapped
+			}
+		}
+		proxyServer.TLSConfig = tlsCfg
+		proxyTLSEnabled = true
+		log.Printf("ssl: native TLS enabled — min_version=%s, certs=%d",
+			sslMgr.ConfigSnapshot().MinTLSVersion, len(sslMgr.List()))
+	}
+
 	var egressServer *http.Server
 	if cfg.EgressEnabled {
 		ep := proxy.NewEgressProxy(cfg, eng, metrics, banList)
@@ -629,8 +687,19 @@ func main() {
 	})
 
 	core.SafeGo("proxy-server", func() {
-		log.Printf("WAF proxy listening on http://%s -> %s", cfg.ListenAddr, cfg.BackendURL)
-		if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		// ListenAndServeTLS("", "") tells net/http to use the
+		// pre-built proxyServer.TLSConfig (Certificates +
+		// GetCertificate) instead of reading cert/key files. Empty
+		// strings are the documented "use existing config" form.
+		var serveErr error
+		if proxyTLSEnabled {
+			log.Printf("WAF proxy listening on https://%s -> %s", cfg.ListenAddr, cfg.BackendURL)
+			serveErr = proxyServer.ListenAndServeTLS("", "")
+		} else {
+			log.Printf("WAF proxy listening on http://%s -> %s", cfg.ListenAddr, cfg.BackendURL)
+			serveErr = proxyServer.ListenAndServe()
+		}
+		if err := serveErr; err != nil && err != http.ErrServerClosed {
 			log.Printf("proxy server error: %v", err)
 			// Non-blocking — if the main loop is already shutting down on a
 			// real signal, an unconditional send would leak this goroutine.
@@ -822,4 +891,32 @@ func startTrafficSampler(m *telemetry.Metrics) func() {
 		}
 	}()
 	return func() { close(stop) }
+}
+
+// isWildcardListenAddr reports whether addr binds to every available
+// interface. Recognises the ":port" form (Go's net/http convention),
+// the explicit "0.0.0.0:port" / "[::]:port" forms, and the bare
+// IPv6-zero. Anything else (loopback, private addresses, DNS-only
+// hostnames) is treated as a more conservative choice and not warned
+// about. Cross-platform: Windows + Linux + BSD all use the same set
+// of zero-address representations here.
+func isWildcardListenAddr(addr string) bool {
+	if addr == "" {
+		return true // net/http defaults to ":http" when blank — wildcard
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Single-port form like ":8443" doesn't have a host — treat as
+		// wildcard. Anything else that fails the split is unknown
+		// shape; refuse to warn rather than cry wolf.
+		if strings.HasPrefix(addr, ":") {
+			return true
+		}
+		return false
+	}
+	switch host {
+	case "", "0.0.0.0", "::", "[::]":
+		return true
+	}
+	return false
 }

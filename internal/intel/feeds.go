@@ -190,7 +190,10 @@ func NewManager(cfg Config, sink Sink) (*Manager, error) {
 		return nil, errors.New("intel: sink is required")
 	}
 	cfg.applyDefaults()
-	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
+	// 0o700 — the cache holds full-size feed payloads (Spamhaus DROP,
+	// FireHOL, KEV) plus per-source timing metadata an attacker on the
+	// same shared host could use for reconnaissance. POSIX-only.
+	if err := os.MkdirAll(cfg.CacheDir, 0o700); err != nil {
 		// Non-fatal — the manager still works without disk cache, it
 		// just loses the stale-cache fallback path. Surface the error
 		// for observability but continue.

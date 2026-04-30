@@ -37,6 +37,40 @@ func TestRateLimiterRefillsOverTime(t *testing.T) {
 	}
 }
 
+// TestRateLimiterClockJumpDoesNotSelfDoS reproduces the bug where a
+// backwards clock step (NTP slew, suspended-VM resume) drove the
+// token bucket negative, denying every subsequent legitimate request
+// for minutes until the bucket re-filled past 1. We can't actually
+// reach into time.Now(), but we can exercise the same code path by
+// rewinding the bucket's `last` field directly — which is what the
+// clock-skew condition produces inside Allow().
+func TestRateLimiterClockJumpDoesNotSelfDoS(t *testing.T) {
+	rl := NewRateLimiter(100, 5)
+	defer rl.Stop()
+	// Drain the burst.
+	for i := 0; i < 5; i++ {
+		rl.Allow("ip")
+	}
+	// Now simulate a backwards clock step by reaching into the
+	// bucket and pushing `last` an hour into the future, so the
+	// next Allow() sees a deeply-negative elapsed.
+	rl.mu.Lock()
+	rl.buckets["ip"].last = time.Now().Add(time.Hour)
+	rl.mu.Unlock()
+	// Without the clamp this Allow goes through math like
+	//   tokens = min(5, 0 + (-3600 * 100)) = -360000
+	// which then refuses every subsequent caller for an hour.
+	// With the clamp, elapsed=0 keeps tokens at 0 and the next
+	// natural refill (after a real sleep) re-allows traffic.
+	rl.Allow("ip") // rejected, that's fine
+	rl.mu.RLock()
+	got := rl.buckets["ip"].tokens
+	rl.mu.RUnlock()
+	if got < 0 {
+		t.Fatalf("clock-jump self-DoS: tokens drained to %v (expected >=0)", got)
+	}
+}
+
 func TestRateLimiterDisabledWhenRPSZero(t *testing.T) {
 	rl := NewRateLimiter(0, 0)
 	defer rl.Stop()

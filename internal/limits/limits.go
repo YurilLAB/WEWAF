@@ -152,6 +152,17 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	}
 
 	elapsed := now.Sub(b.last).Seconds()
+	// Guard against monotonic-clock travel backwards. Despite Go's
+	// time.Time carrying a monotonic reading, the wall-clock anchor
+	// can shift on NTP slew, suspended-VM resume, or laptop sleep.
+	// A negative elapsed feeding into the line below would drive
+	// b.tokens deeply negative — which the >=1 gate then refuses for
+	// every legit client until the bucket re-fills back to 1, a
+	// self-DoS measurable in minutes for a 100 RPS limit. Treat
+	// non-positive elapsed as "no time has passed" instead.
+	if elapsed < 0 {
+		elapsed = 0
+	}
 	// Cap at burst, NOT burst*2 — the latter let a long-idle client
 	// burst at 2× the configured ceiling, which surprises operators
 	// reading the config and (more importantly) breaks the

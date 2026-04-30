@@ -126,9 +126,11 @@ func (s *Server) handleBrowserChallengeVerify(w http.ResponseWriter, r *http.Req
 	if s.sessions != nil && s.sessions.Enabled() {
 		sess := s.sessions.EnsureSession(w, r)
 		if passed && sess != nil {
-			secure := r.TLS != nil ||
-				strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") ||
-				strings.EqualFold(r.Header.Get("X-Forwarded-Ssl"), "on")
+			// Trust X-Forwarded-Proto only when the immediate peer is
+			// a configured trusted proxy. An untrusted client cannot
+			// forge "this was HTTPS" to extract a Secure cookie that
+			// they can then capture over plaintext on the next hop.
+			secure := s.isTLSRequest(r)
 			c, _ := s.sessions.IssueChallengeCookie(secure)
 			http.SetCookie(w, c)
 			// Rotate the session ID before recording the pass so any
@@ -391,9 +393,7 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "pow secret not configured", http.StatusServiceUnavailable)
 		return
 	}
-	secure := r.TLS != nil ||
-		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") ||
-		strings.EqualFold(r.Header.Get("X-Forwarded-Ssl"), "on")
+	secure := s.isTLSRequest(r)
 	http.SetCookie(w, &http.Cookie{
 		Name:     powCookieName,
 		Value:    cookieValue,
@@ -417,6 +417,24 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 		s.proxy.IncPoWVerified()
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// isTLSRequest delegates to the proxy's *clientip.Extractor so the
+// trust gate around X-Forwarded-Proto is identical to the one used
+// for client-IP decisions. The previous inline copies trusted the
+// header from any peer, which an attacker reaching the WAF directly
+// could forge to extract a Secure cookie they later capture on a
+// plaintext hop.
+func (s *Server) isTLSRequest(r *http.Request) bool {
+	if r != nil && r.TLS != nil {
+		return true
+	}
+	if s != nil && s.proxy != nil {
+		if ipx := s.proxy.IPExtractor(); ipx != nil {
+			return ipx.IsTLSRequest(r)
+		}
+	}
+	return false
 }
 
 // clientIPOf resolves the request's client IP through the same shared

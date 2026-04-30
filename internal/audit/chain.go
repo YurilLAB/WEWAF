@@ -50,10 +50,95 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// validateAuditFilePath rejects paths that look like accidents or
+// attacks: NUL byte injection (some Go file APIs error on these but
+// not all platforms agree), references to special device files, UNC
+// paths the operator probably didn't mean to write to, and Windows
+// reserved device names. The check is deliberately conservative —
+// paths inside the working directory or under an absolute logs
+// directory are allowed; what we refuse are the obvious red flags
+// that surface in copy-pasted-from-the-internet configs.
+//
+// The previous version only blocked /dev/null + \\.\NUL + nul, which
+// missed /dev/zero, /dev/random, and the Windows COMn / LPTn / PRN /
+// AUX / CON family — every one of those would silently consume audit
+// entries while presenting no error to the operator. Cross-platform:
+// works the same on POSIX and Windows; the Windows-specific names
+// are checked even on Linux because the operator might be sharing
+// configs across platforms.
+func validateAuditFilePath(p string) error {
+	if p == "" {
+		return errors.New("audit: file path is empty")
+	}
+	if strings.ContainsRune(p, 0x00) {
+		// Some POSIX syscalls truncate at the NUL; some return EINVAL.
+		// Refuse explicitly so behaviour is consistent.
+		return fmt.Errorf("audit: file path contains NUL byte")
+	}
+	// Check the ORIGINAL string for network-share prefixes, not the
+	// filepath.Clean() result: on POSIX, Clean collapses leading "//"
+	// to "/", so a check on the cleaned form would let "//host/share"
+	// slip through with a now-rooted absolute path. Operators almost
+	// never legitimately want an audit log on a remote share —
+	// refuse outright.
+	rawTrim := strings.TrimSpace(p)
+	if strings.HasPrefix(rawTrim, `\\`) || strings.HasPrefix(rawTrim, "//") ||
+		strings.HasPrefix(rawTrim, `\\?\`) {
+		return fmt.Errorf("audit: UNC / network / device-namespace paths refused (%q)", p)
+	}
+	clean := filepath.Clean(p)
+	low := strings.ToLower(clean)
+	// POSIX special files that absorb writes silently or randomly.
+	// Includes the obvious /dev/null plus the equally-bad /dev/zero
+	// and the entropy devices (writes to /dev/random / /dev/urandom
+	// are accepted on Linux but have no audit-trail effect).
+	posixDevices := []string{
+		"/dev/null", "/dev/zero",
+		"/dev/random", "/dev/urandom",
+		"/dev/full", "/dev/tty",
+	}
+	for _, bad := range posixDevices {
+		if low == bad {
+			return fmt.Errorf("audit: refusing to write chain to %q", p)
+		}
+	}
+	// Windows reserved device names. CreateFile() interprets these
+	// case-insensitively REGARDLESS of directory and any extension,
+	// so "C:\path\COM1" or "audit/NUL.log" still hit the device.
+	// Compare against the file basename (no extension) to catch all
+	// shapes — see https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+	// "CLOCK$" omitted because it's been valid as a regular filename
+	// since NT.
+	winReserved := map[string]struct{}{
+		"con": {}, "prn": {}, "aux": {}, "nul": {},
+		"com1": {}, "com2": {}, "com3": {}, "com4": {}, "com5": {},
+		"com6": {}, "com7": {}, "com8": {}, "com9": {},
+		"lpt1": {}, "lpt2": {}, "lpt3": {}, "lpt4": {}, "lpt5": {},
+		"lpt6": {}, "lpt7": {}, "lpt8": {}, "lpt9": {},
+	}
+	// Work out the basename with both '/' and '\' as separators
+	// regardless of host OS — operators routinely paste configs from
+	// one platform into another and we want the same answer either
+	// way. filepath.Base alone honours the OS-native separator only.
+	base := low
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	if i := strings.IndexByte(base, '.'); i > 0 {
+		base = base[:i]
+	}
+	if _, bad := winReserved[base]; bad {
+		return fmt.Errorf("audit: refusing Windows reserved device name in path %q", p)
+	}
+	return nil
+}
 
 // Entry is the on-disk / on-wire shape of one audit record.
 //
@@ -142,6 +227,17 @@ func New(cfg Config) (*Chain, error) {
 	}
 
 	if cfg.FilePath != "" {
+		if err := validateAuditFilePath(cfg.FilePath); err != nil {
+			return nil, err
+		}
+		// Ensure the parent directory exists with restrictive perms so
+		// the chain file isn't dropped into a world-readable folder
+		// the operator hadn't realised they were creating.
+		if dir := filepath.Dir(cfg.FilePath); dir != "" && dir != "." {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return nil, fmt.Errorf("audit: create dir for %q: %w", cfg.FilePath, err)
+			}
+		}
 		f, err := os.OpenFile(cfg.FilePath, os.O_RDWR|os.O_CREATE, 0600)
 		if err != nil {
 			return nil, fmt.Errorf("audit: open %q: %w", cfg.FilePath, err)

@@ -186,6 +186,33 @@ func (e *Extractor) IsTrustedPeer(r *http.Request) bool {
 	return ipInNets(splitHost(r.RemoteAddr), c.trustedNets)
 }
 
+// IsTLSRequest reports whether the request was received over a TLS
+// channel. Direct r.TLS != nil is always honoured (the runtime can't
+// lie about its own listener); X-Forwarded-Proto / X-Forwarded-Ssl are
+// only believed when the immediate peer is a trusted proxy, so an
+// attacker hitting the WAF directly cannot forge "this was HTTPS" and
+// trick the cookie layer into emitting Secure cookies that the
+// attacker can then capture over plaintext on the next hop. Mirrors
+// the trust model already used for client-IP extraction.
+func (e *Extractor) IsTLSRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	if !e.IsTrustedPeer(r) {
+		return false
+	}
+	if v := r.Header.Get("X-Forwarded-Proto"); strings.EqualFold(v, "https") {
+		return true
+	}
+	if v := r.Header.Get("X-Forwarded-Ssl"); strings.EqualFold(v, "on") {
+		return true
+	}
+	return false
+}
+
 // --- Helpers -----------------------------------------------------------
 
 func configOrZero(e *Extractor) config {
