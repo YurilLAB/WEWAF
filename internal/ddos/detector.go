@@ -80,6 +80,12 @@ type Config struct {
 	MaxPerIPEntries   int           // cap on tracked IPs
 	SlowMinBPS        int           // minimum bytes/sec before request is Slowloris-suspect
 	SlowMinAge        time.Duration // how long a request must be open before slow-detection fires
+	// BurstThreshold is the per-IP request count that triggers
+	// VerdictBurst when seen inside BurstWindow. Default 60 in 1 s —
+	// well above what a parallel-fetching browser produces and well
+	// below what a script needs to be useful. Set to 0 to disable.
+	BurstThreshold int
+	BurstWindow    time.Duration
 
 	// Botnet detection.
 	BotnetUniqueIPThreshold int // unique IPs on same path in 60s to flag
@@ -126,11 +132,26 @@ type Detector struct {
 	totalRequests    atomic.Uint64
 	flaggedVolume    atomic.Uint64
 	flaggedConnRate  atomic.Uint64
+	flaggedBurst     atomic.Uint64
 	flaggedSlow      atomic.Uint64
 	flaggedBotnet    atomic.Uint64
 	flaggedCB        atomic.Uint64
 	underAttack      atomic.Bool
 	lastAttackAtUnix atomic.Int64
+
+	// Per-path RPS visibility: total request count per path with a
+	// random-drop cap so a scanner spraying random URLs can't bloat
+	// the map. Exposed as a top-N list in StatsSnapshot so operators
+	// can see what's being hammered without consulting the persisted
+	// blocks table (which only shows blocked traffic, not all hits).
+	pathMu      sync.Mutex
+	pathCounts  map[string]*pathStat
+	pathMaxKeys int
+}
+
+type pathStat struct {
+	count   uint64
+	lastTS  int64
 }
 
 // Verdict is returned by RecordRequest.
@@ -142,6 +163,14 @@ const (
 	VerdictConnRate           // this IP is opening connections too fast
 	VerdictBotnet             // distributed attack shape on a sensitive path
 	VerdictCacheBuster        // single IP hammering one path with rotating querystrings
+	// VerdictBurst is a sub-second IP flood: the connection-rate gate
+	// is averaged over 10 s (default 300 hits = 30 RPS sustained),
+	// which lets a script send 60 requests in 1 s and still average
+	// 6 RPS over the window. Real browsers parallel-fetch ~10
+	// resources concurrently, so 60+ in a single second from one IP
+	// is automation. Distinct from VerdictConnRate so operators can
+	// tune them independently.
+	VerdictBurst
 )
 
 // New returns a configured detector with defaults filled in.
@@ -176,6 +205,13 @@ func New(cfg Config) *Detector {
 	if cfg.SlowMinAge <= 0 {
 		cfg.SlowMinAge = 10 * time.Second
 	}
+	if cfg.BurstThreshold == 0 {
+		// Zero means "use default". Negative explicitly disables.
+		cfg.BurstThreshold = 60
+	}
+	if cfg.BurstWindow <= 0 {
+		cfg.BurstWindow = time.Second
+	}
 	if cfg.BotnetUniqueIPThreshold <= 0 {
 		cfg.BotnetUniqueIPThreshold = 200
 	}
@@ -189,12 +225,14 @@ func New(cfg Config) *Detector {
 		}
 	}
 	return &Detector{
-		cfg:       cfg,
-		ipHits:    make(map[string][]int64),
-		botPaths:  make(map[string]map[string]int64),
-		volLast:   time.Now().UTC(),
-		startedAt: time.Now().UTC(),
-		emaRPS:    float64(cfg.VolumetricBaseline),
+		cfg:         cfg,
+		ipHits:      make(map[string][]int64),
+		botPaths:    make(map[string]map[string]int64),
+		pathCounts:  make(map[string]*pathStat, 256),
+		pathMaxKeys: 4096,
+		volLast:     time.Now().UTC(),
+		startedAt:   time.Now().UTC(),
+		emaRPS:      float64(cfg.VolumetricBaseline),
 	}
 }
 
@@ -207,6 +245,11 @@ func (d *Detector) RecordRequest(ip, path string) Verdict {
 	}
 	d.totalRequests.Add(1)
 	d.advanceVolume()
+	// Per-path counter is best-effort: we record before the verdict
+	// gates so a "what was being hammered" query covers blocked
+	// traffic too. Empty paths (e.g., misformed requests that got
+	// zeroed earlier in the pipeline) are skipped inside.
+	d.recordPathHit(path)
 
 	// Global volumetric verdict always wins — shed load first.
 	if d.IsUnderAttack() {
@@ -272,7 +315,11 @@ func (d *Detector) IsUnderAttack() bool {
 }
 
 func (d *Detector) checkPerIP(ip string) Verdict {
-	now := time.Now().Unix()
+	// Use UnixNano so the burst window can be sub-second. The 10-s
+	// connection-rate window still works in second-resolution
+	// because cutoff is at second granularity below.
+	nowNano := time.Now().UnixNano()
+	now := nowNano / int64(time.Second)
 	cutoff := now - 10
 	d.ipMu.Lock()
 	defer d.ipMu.Unlock()
@@ -306,17 +353,157 @@ func (d *Detector) checkPerIP(ip string) Verdict {
 	hits = append(hits, now)
 	d.ipHits[ip] = hits
 
+	// Sustained-rate gate: the existing 10-second window. Catches a
+	// client that maintains 30 RPS for long enough to be obvious.
 	if len(hits) >= d.cfg.ConnRateThreshold {
 		d.flaggedConnRate.Add(1)
 		return VerdictConnRate
 	}
+
+	// Burst gate: how many of those hits were in the last
+	// BurstWindow? A client that keeps within the sustained rate but
+	// fires 60+ requests in 1 s is using a script, not a browser. We
+	// scan from the tail since hits are append-ordered and the
+	// burst-window is by far the smaller cut.
+	if d.cfg.BurstThreshold > 0 {
+		burstCutoff := now - int64(d.cfg.BurstWindow.Seconds())
+		// Sub-second windows would round to zero seconds; treat any
+		// configured window <1s as 1s for the count, which still
+		// satisfies the "instantaneous" intent in second resolution.
+		if int64(d.cfg.BurstWindow.Seconds()) < 1 {
+			burstCutoff = now - 1
+		}
+		burst := 0
+		for i := len(hits) - 1; i >= 0; i-- {
+			if hits[i] < burstCutoff {
+				break
+			}
+			burst++
+		}
+		if burst >= d.cfg.BurstThreshold {
+			d.flaggedBurst.Add(1)
+			return VerdictBurst
+		}
+	}
 	return VerdictOK
 }
 
+// recordPathHit bumps the per-path total counter used by
+// StatsSnapshot's "top paths" view. Bounded by pathMaxKeys: once full,
+// existing keys keep counting but new keys are dropped until a random
+// eviction sweeps the map. Cheap on the hot path — single map lookup
+// + atomic int update under the dedicated pathMu.
+func (d *Detector) recordPathHit(path string) {
+	if d == nil || path == "" {
+		return
+	}
+	now := time.Now().Unix()
+	d.pathMu.Lock()
+	defer d.pathMu.Unlock()
+	if d.pathCounts == nil {
+		d.pathCounts = make(map[string]*pathStat, 256)
+	}
+	if ps, ok := d.pathCounts[path]; ok {
+		ps.count++
+		ps.lastTS = now
+		return
+	}
+	if len(d.pathCounts) >= d.pathMaxKeys {
+		// Random-drop sweep — same shape as the rest of the
+		// detector's bounded maps.
+		drop := d.pathMaxKeys / 64
+		if drop < 4 {
+			drop = 4
+		}
+		for k := range d.pathCounts {
+			delete(d.pathCounts, k)
+			drop--
+			if drop <= 0 {
+				break
+			}
+		}
+	}
+	d.pathCounts[path] = &pathStat{count: 1, lastTS: now}
+}
+
+// TopPaths returns the n busiest paths since detector startup, newest
+// activity first within tied counts. Uses a partial selection rather
+// than full sort to stay cheap when only a handful of paths matter.
+func (d *Detector) TopPaths(n int) []PathTraffic {
+	if d == nil || n <= 0 {
+		return nil
+	}
+	d.pathMu.Lock()
+	defer d.pathMu.Unlock()
+	out := make([]PathTraffic, 0, len(d.pathCounts))
+	for p, s := range d.pathCounts {
+		out = append(out, PathTraffic{Path: p, Count: s.count, LastSeenUnix: s.lastTS})
+	}
+	// Sort by count desc, last-seen desc for ties. Stable sort keeps
+	// the ordering deterministic for a given snapshot, which makes
+	// the dashboard render diff-free between calls when nothing has
+	// changed.
+	sortPathTraffic(out)
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
+}
+
+// PathTraffic is a single row in the top-paths visibility view.
+type PathTraffic struct {
+	Path         string `json:"path"`
+	Count        uint64 `json:"count"`
+	LastSeenUnix int64  `json:"last_seen_unix"`
+}
+
+func sortPathTraffic(s []PathTraffic) {
+	// Manual insertion sort — top-paths slices are small (<=4096
+	// after cap) and the existing detector file already avoids
+	// pulling in a sort import. For the typical N <= 25 the
+	// insertion-sort cost is trivial.
+	for i := 1; i < len(s); i++ {
+		j := i
+		for j > 0 {
+			a, b := s[j], s[j-1]
+			if a.Count > b.Count || (a.Count == b.Count && a.LastSeenUnix > b.LastSeenUnix) {
+				s[j], s[j-1] = s[j-1], s[j]
+				j--
+				continue
+			}
+			break
+		}
+	}
+}
+
+// isSensitivePath reports whether path matches one of the configured
+// sensitive prefixes. Match is on path-segment boundaries, not raw
+// prefix: "/admin" matches "/admin" and "/admin/users" but NOT
+// "/admincp" or "/administration" — those are unrelated endpoints
+// that happen to share the leading bytes. The previous string-prefix
+// match flagged any path with the right opening characters as
+// "sensitive", giving the botnet detector false positives on
+// admin-control-panel UIs and authentication-related endpoints under
+// different names. Cross-platform: pure stdlib, no path-separator
+// games (URL paths use '/' regardless of host OS).
 func (d *Detector) isSensitivePath(path string) bool {
+	if path == "" {
+		return false
+	}
 	lp := strings.ToLower(path)
 	for _, prefix := range d.cfg.BotnetSensitivePaths {
-		if strings.HasPrefix(lp, prefix) {
+		if !strings.HasPrefix(lp, prefix) {
+			continue
+		}
+		// Exact match — "/admin" == "/admin".
+		if len(lp) == len(prefix) {
+			return true
+		}
+		// Path-segment continuation — "/admin/" or "/admin?…" or
+		// "/admin#…". The last two are theoretical (the proxy strips
+		// query / fragment before this point) but cheap to allow.
+		next := lp[len(prefix)]
+		if next == '/' || next == '?' || next == '#' {
 			return true
 		}
 	}
@@ -502,18 +689,22 @@ func (d *Detector) StatsSnapshot() map[string]interface{} {
 	streak := d.spikeStreak
 	d.volMu.Unlock()
 	return map[string]interface{}{
-		"total_requests":      d.totalRequests.Load(),
-		"flagged_volumetric":  d.flaggedVolume.Load(),
-		"flagged_conn_rate":   d.flaggedConnRate.Load(),
-		"flagged_slow_read":   d.flaggedSlow.Load(),
-		"flagged_botnet":      d.flaggedBotnet.Load(),
+		"total_requests":       d.totalRequests.Load(),
+		"flagged_volumetric":   d.flaggedVolume.Load(),
+		"flagged_conn_rate":    d.flaggedConnRate.Load(),
+		"flagged_burst":        d.flaggedBurst.Load(),
+		"flagged_slow_read":    d.flaggedSlow.Load(),
+		"flagged_botnet":       d.flaggedBotnet.Load(),
 		"flagged_cache_buster": d.flaggedCB.Load(),
-		"under_attack":        d.underAttack.Load(),
-		"last_attack_unix":    d.lastAttackAtUnix.Load(),
-		"adaptive_baseline":   ema,
-		"spike_streak":        streak,
-		"spike_windows_req":   d.cfg.SpikeWindowsRequired,
-		"min_absolute_rps":    d.cfg.MinAbsoluteRPS,
+		"under_attack":         d.underAttack.Load(),
+		"last_attack_unix":     d.lastAttackAtUnix.Load(),
+		"adaptive_baseline":    ema,
+		"spike_streak":         streak,
+		"spike_windows_req":    d.cfg.SpikeWindowsRequired,
+		"min_absolute_rps":     d.cfg.MinAbsoluteRPS,
+		"burst_threshold":      d.cfg.BurstThreshold,
+		"burst_window_seconds": int64(d.cfg.BurstWindow.Seconds()),
+		"top_paths":            d.TopPaths(25),
 	}
 }
 
