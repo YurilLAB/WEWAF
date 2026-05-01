@@ -110,6 +110,16 @@ type Config struct {
 	DDoSSpikeWindowsRequired    int     `json:"ddos_spike_windows_required"`    // consecutive spike windows before declaring attack
 	DDoSCoolDownSeconds         int     `json:"ddos_cooldown_seconds"`          // after last spike before releasing attack state
 	DDoSBotnetUniqueIPThreshold int     `json:"ddos_botnet_unique_ip_threshold"` // unique IPs on sensitive path in 60s to flag
+	// DDoSBurstThreshold is the sub-second per-IP request count that
+	// triggers VerdictBurst. The connection-rate gate above is averaged
+	// over 10 s (default 300 = 30 RPS sustained), so a script firing
+	// 60 hits in 1 s averaged 6 RPS over the window and slipped past.
+	// Default 60 in 1 s — well above what a parallel-fetching browser
+	// produces on a content-heavy page (~10–20 RPS instantaneous) and
+	// well below what a script needs to be useful. Set negative to
+	// disable; 0 picks the default.
+	DDoSBurstThreshold      int `json:"ddos_burst_threshold"`
+	DDoSBurstWindowSeconds  int `json:"ddos_burst_window_seconds"`
 
 	// Pre-WAF shaper — admission control that runs before rule evaluation.
 	ShaperEnabled bool `json:"shaper_enabled"`
@@ -344,6 +354,8 @@ func Default() *Config {
 		DDoSSpikeWindowsRequired:    3,
 		DDoSCoolDownSeconds:         60,
 		DDoSBotnetUniqueIPThreshold: 200,
+		DDoSBurstThreshold:          60,
+		DDoSBurstWindowSeconds:      1,
 		// Shaper off by default — operators opt in once they've observed
 		// their traffic profile.
 		ShaperEnabled: false,
@@ -841,6 +853,8 @@ func (c *Config) Snapshot() *Config {
 		DDoSSpikeWindowsRequired:    c.DDoSSpikeWindowsRequired,
 		DDoSCoolDownSeconds:         c.DDoSCoolDownSeconds,
 		DDoSBotnetUniqueIPThreshold: c.DDoSBotnetUniqueIPThreshold,
+		DDoSBurstThreshold:          c.DDoSBurstThreshold,
+		DDoSBurstWindowSeconds:      c.DDoSBurstWindowSeconds,
 		ShaperEnabled:               c.ShaperEnabled,
 		ShaperMaxRPS:                c.ShaperMaxRPS,
 		ShaperBurst:                 c.ShaperBurst,

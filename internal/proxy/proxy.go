@@ -428,6 +428,8 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 			SpikeWindowsRequired:    cfg.DDoSSpikeWindowsRequired,
 			CoolDownSeconds:         cfg.DDoSCoolDownSeconds,
 			BotnetUniqueIPThreshold: cfg.DDoSBotnetUniqueIPThreshold,
+			BurstThreshold:          cfg.DDoSBurstThreshold,
+			BurstWindow:             time.Duration(cfg.DDoSBurstWindowSeconds) * time.Second,
 		}),
 		breaker: limits.NewBreaker(
 			cfg.BreakerConsecutiveFailures,
@@ -696,6 +698,17 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case ddos.VerdictConnRate:
 		w.Header().Set("Retry-After", "30")
 		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-CONN-RATE", "connection-rate flood", 0)
+		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+		return
+	case ddos.VerdictBurst:
+		// Sub-second flood from one IP — nearly always a script.
+		// 5-second Retry-After is short enough that a misbehaving
+		// fetch loop loses a useful window of throughput, long
+		// enough that a real "page with 50 inline assets" client
+		// recovers without complaint.
+		w.Header().Set("Retry-After", "5")
+		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-BURST",
+			"sub-second per-IP burst", 0)
 		http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 		return
 	case ddos.VerdictBotnet:
