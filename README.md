@@ -10,6 +10,11 @@ inspects every transaction against a compiled rule set, and persists
 telemetry to a rotating set of SQLite databases so historical data survives
 restarts and stays searchable by time range.
 
+> **Part of the Yuril suite — ypanel.** WEWAF is managed from **ypanel**, Yuril
+> Security's unified operator control panel (`https://yurillab.dev/ypanel`):
+> protected sites, the rule engine, the live block stream, bans, and connectors.
+> See [`docs/ypanel.md`](docs/ypanel.md) for how WEWAF connects + current status.
+
 ### Feature matrix
 
 | Area              | Feature                                                   | Default  |
