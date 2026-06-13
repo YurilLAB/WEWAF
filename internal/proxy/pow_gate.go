@@ -23,7 +23,7 @@ const powCookieName = "__wewaf_pow"
 // hasValidPoWCookie returns true when the request carries a __wewaf_pow
 // cookie that validates against the configured secret AND was issued
 // within PoWCookieTTLSec. Constant-time on signature compare.
-func (wp *WAFProxy) hasValidPoWCookie(r *http.Request) bool {
+func (wp *WAFProxy) hasValidPoWCookie(r *http.Request, sessID string) bool {
 	if wp == nil || wp.cfg == nil || !wp.cfg.PoWEnabled || wp.cfg.PoWSecret == "" {
 		return false
 	}
@@ -56,13 +56,24 @@ func (wp *WAFProxy) hasValidPoWCookie(r *http.Request) bool {
 	if time.Since(time.Unix(ts, 0)) > ttl {
 		return false
 	}
+	// Session binding: the cookie's first segment is the session ID it was
+	// minted for. Honour it only for a request carrying that same session.
+	// Without this the pass cookie is a pure bearer token — one solved cookie
+	// could be lifted and shared across an entire botnet to skip the gate for
+	// its whole lifetime. A plain compare is fine: the session ID is not a
+	// secret (it is the client's own __wewaf_sid) and parts[0] is already
+	// authenticated by the MAC above, so it can't be forged. When session
+	// tracking is off, sessID is "" and PoW never gates anyway (score 0).
+	if parts[0] != sessID {
+		return false
+	}
 	return true
 }
 
 // shouldGateWithPoW returns true if the proxy should serve the PoW page
 // for this request. Requires: PoW enabled, an issuer attached, the
 // session score above the configured trigger, and no valid pass cookie.
-func (wp *WAFProxy) shouldGateWithPoW(r *http.Request, score int) bool {
+func (wp *WAFProxy) shouldGateWithPoW(r *http.Request, score int, sessID string) bool {
 	if wp == nil || wp.pow == nil || !wp.cfg.PoWEnabled {
 		return false
 	}
@@ -73,7 +84,7 @@ func (wp *WAFProxy) shouldGateWithPoW(r *http.Request, score int) bool {
 	if score < trigger {
 		return false
 	}
-	return !wp.hasValidPoWCookie(r)
+	return !wp.hasValidPoWCookie(r, sessID)
 }
 
 // servePoWChallenge renders the PoW gate page for the given request. The

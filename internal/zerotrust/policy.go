@@ -220,9 +220,19 @@ func (e *Engine) Evaluate(r *http.Request, clientIP string) (Decision, string, *
 				return deny(p, "ip not in allowed CIDR list")
 			}
 		}
-		// IP blocklist.
-		if len(p.blockedNets) > 0 && ip != nil && anyCIDRContains(p.blockedNets, ip) {
-			return deny(p, "ip in blocked CIDR list")
+		// IP blocklist. An unparseable client IP must NOT silently skip the
+		// blocklist — that fails open, letting a request whose source can't
+		// be resolved past a policy that exists specifically to block source
+		// ranges. Treat "can't tell who you are" as blocked when this policy
+		// enforces an IP blocklist (the allowlist above already fails closed
+		// on a nil IP; this brings the blocklist in line).
+		if len(p.blockedNets) > 0 {
+			if ip == nil {
+				return deny(p, "unresolvable client IP under IP-blocklist policy")
+			}
+			if anyCIDRContains(p.blockedNets, ip) {
+				return deny(p, "ip in blocked CIDR list")
+			}
 		}
 
 		// Country check.

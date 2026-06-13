@@ -638,20 +638,33 @@ func (d *Detector) advanceVolume() {
 	spikeThreshold := baseline * d.cfg.VolumetricSpike
 	absoluteFloor := float64(d.cfg.MinAbsoluteRPS)
 
-	isSpike := avg >= spikeThreshold && avg >= absoluteFloor
-	if isSpike {
-		d.spikeStreak++
-		d.lastSpikeAtUnix = now.Unix()
-		if d.spikeStreak >= d.cfg.SpikeWindowsRequired && !d.inAttack {
-			d.inAttack = true
-			d.underAttack.Store(true)
-			d.lastAttackAtUnix.Store(now.Unix())
+	// Evaluate the spike streak at most once per elapsed second. The streak
+	// counts CONSECUTIVE SPIKING SECONDS — its whole point is to require
+	// sustained abnormality (SpikeWindowsRequired in a row) before declaring
+	// an attack. This block previously ran on every request, so several
+	// requests inside a single already-hot second drove the streak from 0 to
+	// the threshold instantly and tripped under_attack (a global 503 load-shed
+	// plus shaper tighten) on a sub-second burst — exactly the false positive
+	// the design is built to avoid. `elapsed > 0` is true only when the ring
+	// advanced to a new second (it's what moves volLast), so gating on it
+	// restores the intended per-second cadence. Same-second requests still
+	// accumulate in the current bucket and feed the next second's average.
+	if elapsed > 0 {
+		isSpike := avg >= spikeThreshold && avg >= absoluteFloor
+		if isSpike {
+			d.spikeStreak++
+			d.lastSpikeAtUnix = now.Unix()
+			if d.spikeStreak >= d.cfg.SpikeWindowsRequired && !d.inAttack {
+				d.inAttack = true
+				d.underAttack.Store(true)
+				d.lastAttackAtUnix.Store(now.Unix())
+			}
+		} else {
+			// One quiet window after a streak resets it. We still stay
+			// under-attack for the full cool-down so a brief dip doesn't
+			// prematurely open the floodgates.
+			d.spikeStreak = 0
 		}
-	} else {
-		// One quiet window after a streak resets it. We still stay
-		// under-attack for the full cool-down so a brief dip doesn't
-		// prematurely open the floodgates.
-		d.spikeStreak = 0
 	}
 
 	// Cool-down: release "under attack" only after CoolDownSeconds of

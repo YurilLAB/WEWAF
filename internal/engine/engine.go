@@ -163,9 +163,19 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 			body = b
 		}
 	}
-	targets := map[string]string{
-		"body": body,
-	}
+	// The injection signatures (XSS, SQLi, SSTI, NoSQL, prototype pollution,
+	// …) are registered at PhaseRequestBody but declare "args"/"uri"/"headers"
+	// targets alongside "body" — a reflected payload arrives in the query
+	// string or a header value as often as in the body. buildRequestHeaderTargets
+	// is the single producer of those request targets; we merge them with the
+	// body so a body-phase rule inspects the whole request surface, not just
+	// the body. Without this, args.* / headers.* were only ever populated in
+	// the request-header phase, so a body-phase rule (e.g. the <script>-tag
+	// signature) never saw the query string — GET /x?q=<script>… reached the
+	// backend unmatched. The header phase still runs first for cheap early
+	// blocks before the body is buffered; this closes the body-phase gap.
+	targets := e.buildRequestHeaderTargets(tx.Request)
+	targets["body"] = body
 	return e.evaluatePhase(tx, core.PhaseRequestBody, targets)
 }
 
@@ -522,16 +532,41 @@ func (e *Engine) buildRequestHeaderTargets(r *http.Request) map[string]string {
 	} else {
 		add("uri", FoldHomoglyphs(Canonicalize(r.URL.RequestURI())))
 	}
+	// Raw URI with percent-encoding intact. The encoding-detection rules
+	// (CRLF injection, overlong-UTF-8 traversal, encoded path traversal) match
+	// on the PRE-decode form — e.g. `%0d%0a` or `%c0%af`. Canonicalize()
+	// deliberately decodes and strips exactly those bytes for the `uri`/`args`
+	// targets, which would otherwise blind those signatures to a payload a
+	// decoding backend still interprets. Keeping a raw copy lets both the
+	// canonical injection rules and the raw encoding rules do their job.
+	add("uri_raw", r.URL.RequestURI())
 	add("method", r.Method)
 	add("path", FoldHomoglyphs(CanonicalizePath(r.URL.Path)))
-	for k, v := range r.URL.Query() {
-		raw := strings.Join(v, ", ")
-		if decoded, err := url.QueryUnescape(raw); err == nil {
-			if !add("args."+k, FoldHomoglyphs(Canonicalize(decoded))) {
-				break
+	// Parse the query LENIENTLY from the raw query string rather than via
+	// r.URL.Query(): the stdlib parser silently DROPS any key=value pair whose
+	// percent-escape is malformed (e.g. "?q=%zz%3cscript%3e"), so an attacker
+	// could hide a payload behind a single bad escape and have the arg vanish
+	// from inspection entirely, while a per-character-decoding backend still
+	// decoded "<script>". Canonicalize() does the lenient %XX decode; we only
+	// split on &/= here. Repeated keys are joined so no value is lost.
+	if rawQuery := r.URL.RawQuery; rawQuery != "" {
+		argVals := make(map[string]string)
+		argKeys := make([]string, 0, 8)
+		for _, pair := range strings.Split(rawQuery, "&") {
+			if pair == "" {
+				continue
 			}
-		} else {
-			if !add("args."+k, FoldHomoglyphs(Canonicalize(raw))) {
+			key, val, _ := strings.Cut(pair, "=")
+			cv := FoldHomoglyphs(Canonicalize(val))
+			if prev, ok := argVals[key]; ok {
+				argVals[key] = prev + ", " + cv
+			} else {
+				argVals[key] = cv
+				argKeys = append(argKeys, key)
+			}
+		}
+		for _, key := range argKeys {
+			if !add("args."+key, argVals[key]) {
 				break
 			}
 		}

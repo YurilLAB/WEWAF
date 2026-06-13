@@ -2,6 +2,7 @@
   "listen_addr": ":8080",
   "admin_addr": ":8443",
   "backend_url": "http://localhost:3000",
+  "ypanel_url": "https://ypanel.yurillab.dev",
   "trust_xff": false,
   "read_timeout_sec": 30,
   "write_timeout_sec": 30,

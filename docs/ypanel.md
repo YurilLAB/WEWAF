@@ -1,12 +1,16 @@
 # Connecting WEWAF to ypanel
 
 **ypanel** is Yuril Security's unified operator control panel — a single web app
-(served at `https://yurillab.dev/ypanel`) for running the whole Yuril suite
-(QPot, DireC, WEWAF, Kmap, GPTL) from one place, scoped to the licences an
-operator owns. In ypanel, **WEWAF** is the web-application-firewall product:
-protected sites, the rule engine, the live block stream, bans, and connectors.
+served at its own subdomain (`https://ypanel.yurillab.dev`) for running the
+whole Yuril suite (QPot, DireC, WEWAF, Kmap, GPTL) from one place, scoped to the
+licences an operator owns. In ypanel, **WEWAF** is the web-application-firewall
+product: protected sites, the rule engine, the live block stream, bans, and
+connectors.
 
-This document defines how a WEWAF instance connects to ypanel.
+This document defines how a WEWAF instance connects to ypanel. WEWAF ships no
+bundled UI: each node serves only the JSON API, Prometheus `/metrics`, and the
+SSE event stream on its admin port, and the admin root redirects a browser to
+the ypanel subdomain (configurable via `ypanel_url`).
 
 ## The operator-plane model
 
@@ -55,7 +59,7 @@ the worker on an interval; ypanel reads them.
 | Capability | Status |
 |------------|--------|
 | WEWAF engine: rules, DDoS detector, bans, `/metrics`, SSE, history store | **implemented** (this repo) |
-| Bundled React admin dashboard (`ui/`, `internal/web/dist`) | **implemented** |
+| Bundled React admin dashboard (`ui/`, `internal/web/dist`) | **removed** — node ships no local UI; the admin root redirects to ypanel |
 | ypanel WEWAF section (Sites/Rules/Events/Connectors/Settings) | **implemented** — honest demo today; fully operable in demo |
 | Node → worker snapshot reporter + operator job queue | **planned** — this doc defines the contract |
 

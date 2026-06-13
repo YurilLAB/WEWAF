@@ -1,19 +1,17 @@
 # WEWAF
 
-<p align="center">
-  <img src="internal/web/dist/eagle-logo-icon.png" alt="WEWAF Eagle Logo" width="120">
-</p>
+A self-hosted Web Application Firewall written in Go. WEWAF sits in front of
+your backend as a reverse proxy, inspects every transaction against a compiled
+rule set, and persists telemetry to a rotating set of SQLite databases so
+historical data survives restarts and stays searchable by time range.
 
-A self-hosted Web Application Firewall written in Go, paired with a React
-admin dashboard. WEWAF sits in front of your backend as a reverse proxy,
-inspects every transaction against a compiled rule set, and persists
-telemetry to a rotating set of SQLite databases so historical data survives
-restarts and stays searchable by time range.
-
-> **Part of the Yuril suite — ypanel.** WEWAF is managed from **ypanel**, Yuril
-> Security's unified operator control panel (`https://yurillab.dev/ypanel`):
-> protected sites, the rule engine, the live block stream, bans, and connectors.
-> See [`docs/ypanel.md`](docs/ypanel.md) for how WEWAF connects + current status.
+> **Operated from ypanel.** WEWAF ships no bundled UI. It is managed from
+> **ypanel**, Yuril Security's unified operator control panel at its own
+> subdomain (`https://ypanel.yurillab.dev`): protected sites, the rule engine,
+> the live block stream, bans, and connectors. Each node exposes a JSON API,
+> Prometheus `/metrics`, and an SSE event stream on its admin port; opening that
+> port in a browser redirects to ypanel. See [`docs/ypanel.md`](docs/ypanel.md)
+> for how WEWAF connects + current status.
 
 ### Feature matrix
 
@@ -49,10 +47,11 @@ restarts and stays searchable by time range.
 
 Most open-source WAFs fall into two camps: heavyweight rule engines glued to
 nginx/Apache (ModSecurity, Coraza), or cloud-managed blackboxes you rent.
-WEWAF is neither — it's a single static Go binary with the dashboard, rule
-engine, rotating history store, egress filter, DDoS detector, and
-zero-trust policy engine all inside the same process. One `go build`, one
-binary to deploy, no sidecars, no external database.
+WEWAF is neither — it's a single static Go binary with the rule engine,
+rotating history store, egress filter, DDoS detector, and zero-trust policy
+engine all inside the same process. One `go build`, one binary to deploy, no
+sidecars, no external database. The operator UI lives in ypanel, not on the
+node.
 
 That compactness is the point. Every subsystem can talk to every other
 subsystem directly, without RPC hops or brittle log-scraping integrations,
@@ -259,9 +258,10 @@ request path.
                                                      └───────────────┘
 
 ┌──────────────┐       ┌────────────────────────────────────────┐
-│  Operator    │──────▶│  :8443  Admin (embedded React SPA)     │
-└──────────────┘       │         + JSON API + SSE /events       │
-                       └────────────────────────────────────────┘
+│  ypanel      │──────▶│  :8443  Admin JSON API + SSE /events    │
+│ (control     │       │         + Prometheus /metrics           │
+│  plane)      │       │  no bundled UI — browser → ypanel       │
+└──────────────┘       └────────────────────────────────────────┘
 
 ┌──────────────┐       ┌────────────────────────────────────────┐
 │  Backend     │◀──────│  :8081  Egress Proxy (optional)        │
@@ -396,20 +396,19 @@ opened.
 ## Quick start
 
 ```bash
-# Clone, then build the UI (requires Node 18+).
-cd ui
-npm install
-npm run build           # emits ../internal/web/dist/
-
-# Build and run the Go daemon from the repo root.
-cd ..
+# Build and run the Go daemon from the repo root. There is no UI to build —
+# WEWAF is operated from ypanel.
 go build -o waf.exe ./cmd/waf
 ./waf.exe -config config.json
 ```
 
-After startup the proxy listens on `:8080` and the admin dashboard on
-`:8443`. Point your application traffic at `http://<host>:8080` and open
-`http://<host>:8443` in a browser.
+After startup the proxy listens on `:8080` and the admin API on `:8443`.
+Point your application traffic at `http://<host>:8080`. Operate the node from
+ypanel (`https://ypanel.yurillab.dev`, override with `ypanel_url` in the
+config); opening `http://<host>:8443` in a browser redirects there. The admin
+port serves the JSON API, Prometheus `/metrics`, and the SSE event stream the
+ypanel reporter consumes — keep it on a private interface or behind
+`WAF_API_KEY` in production.
 
 ## Configuration
 
@@ -744,9 +743,8 @@ internal/host/        — CPU/mem/disk/net sampler (gopsutil)
 internal/connection/  — backend probe + ping/event history
 internal/ssl/         — cert storage + TLS policy
 internal/bruteforce/  — sliding-window login attempt tracker
-internal/web/         — admin HTTP server + embedded SPA + SSE stream + /metrics
+internal/web/         — admin JSON API + SSE stream + /metrics (no bundled UI)
 tests/integration/    — black-box end-to-end tests (boot real proxy + backend)
-ui/                   — React + Vite source (builds to internal/web/dist)
 history/              — created at runtime; rotating SQLite files live here
 certs/                — created at runtime; uploaded PEM cert pairs
 ```

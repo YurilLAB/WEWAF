@@ -136,6 +136,33 @@ func TestBreakerHalfOpenReopensOnFailure(t *testing.T) {
 	}
 }
 
+// TestBreakerHalfOpenSelfHealsWhenProbeUnresolved guards against the
+// permanent-wedge bug: the proxy can block a request *after* the breaker
+// admits it as the half-open probe (e.g. a rule fires before it reaches the
+// backend), so neither RecordSuccess nor RecordFailure is ever called. A
+// naive breaker keeps probeInFlight set forever and short-circuits ALL
+// traffic until restart. The breaker must instead admit a fresh probe once
+// the in-flight one has been outstanding longer than the open timeout.
+func TestBreakerHalfOpenSelfHealsWhenProbeUnresolved(t *testing.T) {
+	b := NewBreaker(2, 30*time.Millisecond)
+	b.RecordFailure()
+	b.RecordFailure() // -> Open
+	time.Sleep(40 * time.Millisecond)
+	if !b.Allow() {
+		t.Fatalf("expected the first half-open probe to be admitted")
+	}
+	// The probe is never resolved (request dropped before the backend).
+	if b.Allow() {
+		t.Fatalf("a second probe within the open timeout must be denied")
+	}
+	// After the open timeout, the abandoned probe must be reclaimed so the
+	// breaker recovers instead of wedging in half-open forever.
+	time.Sleep(40 * time.Millisecond)
+	if !b.Allow() {
+		t.Fatalf("breaker wedged: no fresh probe admitted after the open timeout")
+	}
+}
+
 // itoa is a tiny strconv-free helper so this test file has zero imports
 // beyond testing + time + sync.
 func itoa(n int) string {

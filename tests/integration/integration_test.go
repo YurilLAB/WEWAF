@@ -140,6 +140,53 @@ func TestAllowsNormalTraffic(t *testing.T) {
 	}
 }
 
+// TestAllowsLegitimateClients confirms the body-phase header inspection (the
+// fix that catches query-string / header injection) does not false-positive on
+// ordinary traffic. A standard browser Accept header contains "*/*", and API
+// clients send "Accept: */*" — both must pass. This is the end-to-end guard
+// for the XPATH-001 "*/*" false positive a live attack exercise surfaced
+// (before the fix it blocked essentially every browser and API request).
+func TestAllowsLegitimateClients(t *testing.T) {
+	frontend, _, _, _, stop := newTestProxy(t)
+	defer stop()
+
+	cases := []struct {
+		name, path, ua, accept, acceptLang string
+	}{
+		{"browser", "/products?id=42",
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+			"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "en-US,en;q=0.9"},
+		{"api_star_accept", "/api/health", "MyApp/1.0", "*/*", "en-US"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, frontend.URL+c.path, nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("User-Agent", c.ua)
+			req.Header.Set("Accept", c.accept)
+			req.Header.Set("Accept-Language", c.acceptLang)
+			// Common header values that body-phase rules used to false-positive
+			// on (${} in a cookie, 0x hex ETag/token, Referer with a build id).
+			// These must NOT cause a block.
+			req.Header.Set("Cookie", "session=abc123; tmpl=${USER}; tok=0xDEADBEEF1234")
+			req.Header.Set("If-None-Match", `"0x1a2b3c4d5e"`)
+			req.Header.Set("Referer", "https://shop.example.com/build/0xdeadbeef99")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("legitimate %s request must be 200, got %d: %s", c.name, resp.StatusCode, b)
+			}
+		})
+	}
+}
+
 func TestBlocksPathTraversal(t *testing.T) {
 	frontend, _, metrics, _, stop := newTestProxy(t)
 	defer stop()
@@ -183,6 +230,135 @@ func TestBlocksJavaScriptProtocol(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("javascript: protocol should return 403, got %d", resp.StatusCode)
+	}
+}
+
+// TestBlocksQueryStringInjection guards the request-target coverage gap that
+// let reflected payloads through the query string. The XSS / SSTI / NoSQL
+// signatures are registered at the request-body phase but also declare
+// "args" as a target, so a payload in the query string MUST be inspected.
+// Before the fix, args.* was only populated in the request-header phase
+// while these rules ran in the body phase, so GET /x?q=<script>... reached
+// the backend unfiltered. UNION-SELECT and javascript: were already caught
+// because duplicate header-phase rules exist for them — these cases cover
+// the classes that had no header-phase twin.
+func TestBlocksQueryStringInjection(t *testing.T) {
+	frontend, _, _, _, stop := newTestProxy(t)
+	defer stop()
+
+	cases := []struct {
+		name string
+		path string
+	}{
+		{"script_tag", "/search?q=" + url.QueryEscape("<script>alert(1)</script>")},
+		{"img_onerror", "/p?x=" + url.QueryEscape("<img src=x onerror=alert(1)>")},
+		{"svg_onload", "/p?x=" + url.QueryEscape("<svg onload=alert(1)>")},
+		{"ssti_jinja", "/p?name=" + url.QueryEscape("{{7*7}}")},
+		{"nosql_where", "/p?f=" + url.QueryEscape(`{"$where":"sleep(1000)"}`)},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			resp, err := http.Get(frontend.URL + c.path)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("query-string %s payload should be blocked (403); got %d: %s",
+					c.name, resp.StatusCode, body)
+			}
+		})
+	}
+}
+
+// TestBlocksHeaderInjection covers the same gap for payloads delivered in a
+// request header value (Referer here) — also a body-phase rule target that
+// the live body phase never populated.
+// TestBlocksEncodingEvasion covers the canonicalization-depth fixes: IIS/.NET
+// %uXXXX decoding, percent-encoded CRLF injection, and overlong-UTF-8 path
+// traversal. Before the fix the canonicalizer either didn't understand %u, or
+// decoded-and-stripped the %0d%0a / %c0%af bytes before the encoding-detection
+// rules (which match the raw form via the new uri_raw target) could see them.
+func TestBlocksEncodingEvasion(t *testing.T) {
+	frontend, _, _, _, stop := newTestProxy(t)
+	defer stop()
+
+	cases := []struct{ name, path string }{
+		// %u002e%u002e%u002f -> "../" : IIS/.NET %u traversal, caught after
+		// the new decodePercentU pass feeds the uri target.
+		{"iis_percent_u_traversal", "/dl?file=%u002e%u002e%u002fetc/passwd"},
+		// Overlong-UTF-8 "../" — TRAV-002 / CRS now match it on uri_raw.
+		{"overlong_utf8_traversal", "/dl?file=%c0%ae%c0%ae%c0%afetc/passwd"},
+		// Percent-encoded CRLF response splitting — CRLF-001 / CRS-921120 on
+		// uri_raw catch the raw %0d%0a + header keyword.
+		{"crlf_response_split", "/redir?u=%0d%0aSet-Cookie:%20sessid=hijack"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			resp, err := http.Get(frontend.URL + c.path)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("%s should be blocked (403), got %d: %s", c.name, resp.StatusCode, b)
+			}
+		})
+	}
+}
+
+// TestBlocksMalformedEscapeEvasion guards the lenient-decode fix the
+// canonicalizer fuzzer surfaced. A single malformed percent-escape (%zz)
+// before a real payload used to defeat inspection two ways: url.QueryUnescape
+// decoded NOTHING on the bad escape, and r.URL.Query() DROPPED the whole arg —
+// so the WAF never saw the payload while a per-character-decoding backend still
+// decoded it. The canonicalizer now decodes valid escapes leniently and the
+// query is parsed from the raw string.
+func TestBlocksMalformedEscapeEvasion(t *testing.T) {
+	frontend, _, _, _, stop := newTestProxy(t)
+	defer stop()
+
+	cases := []struct{ name, path string }{
+		{"xss_behind_bad_escape", "/s?q=%zz%3cscript%3ealert(1)%3c/script%3e"},
+		{"sqli_behind_bad_escape", "/p?id=%gg1%20UNION%20SELECT%20pw%20FROM%20users"},
+		{"traversal_behind_bad_escape", "/dl?file=%zz..%2f..%2f..%2fetc/passwd"},
+	}
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			resp, err := http.Get(frontend.URL + c.path)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("%s should be blocked (403); got %d: %s", c.name, resp.StatusCode, b)
+			}
+		})
+	}
+}
+
+func TestBlocksHeaderInjection(t *testing.T) {
+	frontend, _, _, _, stop := newTestProxy(t)
+	defer stop()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Referer", "<script>alert(document.cookie)</script>")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("header-injected script tag should be blocked (403); got %d", resp.StatusCode)
 	}
 }
 

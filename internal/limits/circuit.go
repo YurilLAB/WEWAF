@@ -52,6 +52,7 @@ type Breaker struct {
 	shortCircuit  atomic.Uint64
 	openedAt      atomic.Int64 // unix ns
 	probeInFlight atomic.Bool  // half-open gate: only one probe at a time
+	probeStartedAt atomic.Int64 // unix ns the in-flight probe was admitted
 
 	mu sync.Mutex
 }
@@ -95,6 +96,7 @@ func (b *Breaker) Allow() bool {
 			if BreakerState(b.state.Load()) == BreakerOpen && time.Since(openedLocked) >= b.openTimeout {
 				b.state.Store(int32(BreakerHalfOpen))
 				b.probeInFlight.Store(true) // claim the probe slot
+				b.probeStartedAt.Store(time.Now().UnixNano())
 				b.mu.Unlock()
 				return true
 			}
@@ -108,8 +110,28 @@ func (b *Breaker) Allow() bool {
 		// RecordFailure, at which point the state transitions out of
 		// half-open (closed on success, open on failure).
 		if b.probeInFlight.CompareAndSwap(false, true) {
+			b.probeStartedAt.Store(time.Now().UnixNano())
 			return true
 		}
+		// A probe is already in flight. The caller contract is that every
+		// admitted request resolves with RecordSuccess/RecordFailure — but
+		// the WAF can block a request *after* Allow() admits it and before it
+		// reaches the backend, in which case neither is ever called and the
+		// probe slot would stay claimed forever, wedging the breaker in
+		// half-open and short-circuiting ALL traffic until restart. Guard
+		// against that: if the in-flight probe has been outstanding longer
+		// than the open timeout, treat it as abandoned and admit a fresh
+		// probe. This bounds the leak to at most one probe per open timeout
+		// while guaranteeing the breaker can always recover.
+		b.mu.Lock()
+		started := time.Unix(0, b.probeStartedAt.Load())
+		if BreakerState(b.state.Load()) == BreakerHalfOpen &&
+			b.probeInFlight.Load() && time.Since(started) >= b.openTimeout {
+			b.probeStartedAt.Store(time.Now().UnixNano())
+			b.mu.Unlock()
+			return true
+		}
+		b.mu.Unlock()
 		b.shortCircuit.Add(1)
 		return false
 	}
@@ -129,12 +151,17 @@ func (b *Breaker) RecordSuccess() {
 		b.mu.Lock()
 		if BreakerState(b.state.Load()) == BreakerHalfOpen {
 			b.state.Store(int32(BreakerClosed))
+			// Release the probe slot ONLY as part of the half-open
+			// resolution. The previous code cleared it unconditionally at
+			// the end of every RecordSuccess, so a slow request that was
+			// admitted while the breaker was Closed and completed later —
+			// after the breaker had since opened and a different probe was
+			// in flight — would free the slot mid-probe and let a second
+			// concurrent probe hit the failing backend.
+			b.probeInFlight.Store(false)
 		}
 		b.mu.Unlock()
 	}
-	// Release the probe slot after every resolution — closed-state
-	// successes don't care, but we want the flag reset for the next cycle.
-	b.probeInFlight.Store(false)
 }
 
 // RecordFailure bumps the failure count. If the threshold is reached, the
@@ -154,6 +181,10 @@ func (b *Breaker) RecordFailure() {
 		if BreakerState(b.state.Load()) == BreakerHalfOpen {
 			b.state.Store(int32(BreakerOpen))
 			b.openedAt.Store(time.Now().UnixNano())
+			// Release the probe slot only as part of the half-open
+			// resolution (see RecordSuccess for why this is gated rather
+			// than cleared unconditionally).
+			b.probeInFlight.Store(false)
 		}
 		b.mu.Unlock()
 	case BreakerClosed:
@@ -166,7 +197,6 @@ func (b *Breaker) RecordFailure() {
 			b.mu.Unlock()
 		}
 	}
-	b.probeInFlight.Store(false)
 }
 
 // State returns the current breaker state.

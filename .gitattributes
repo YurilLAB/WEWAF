@@ -1,0 +1,4 @@
+# Shell scripts must stay LF in the repo and on checkout so they run on Linux
+# regardless of a contributor's core.autocrlf setting (a CRLF shebang breaks
+# /usr/bin/env).
+*.sh text eol=lf

@@ -220,24 +220,31 @@ func (t *Tracker) Score(id string) int {
 			score = 49
 		}
 	}
+	// Capture whether the stored score actually changed WHILE we still hold
+	// the read lock. The previous code released the lock first and then read
+	// s.RiskScore unlocked to decide whether to write — a data race with the
+	// write below whenever the same session was scored concurrently (the
+	// proxy hot path and the admin /api/sessions sweep both call Score). A
+	// data race on this int is undefined behaviour per the Go memory model
+	// and the race detector flags it. Reading under the held RLock is safe
+	// because writers take the full write lock.
+	unchanged := s.RiskScore == score
 	t.mu.RUnlock()
 
-	// Promote to write lock just long enough to record the result. Skip
-	// the write entirely when nothing changed so a steady-state session
-	// doesn't fight other mutators for the lock.
-	if s.RiskScore == score {
+	// Steady-state sessions skip the write lock entirely so they don't
+	// serialise against other mutators on the tracker mutex.
+	if unchanged {
 		return score
 	}
 	t.mu.Lock()
-	prev := s.RiskScore
-	s.RiskScore = score
-	// Only refresh LastScoreBump on UPWARD movement so a decay-driven
-	// drop doesn't count as fresh activity that resets the decay clock.
-	// Without this guard the decay never converges on a stable score
-	// for a quiet session.
-	if score > prev {
+	// Only refresh LastScoreBump on UPWARD movement so a decay-driven drop
+	// doesn't count as fresh activity that resets the decay clock. Without
+	// this guard the decay never converges on a stable score for a quiet
+	// session.
+	if score > s.RiskScore {
 		s.LastScoreBump = now
 	}
+	s.RiskScore = score
 	t.mu.Unlock()
 	return score
 }

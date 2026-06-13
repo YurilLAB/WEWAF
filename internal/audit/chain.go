@@ -95,6 +95,13 @@ func validateAuditFilePath(p string) error {
 	}
 	clean := filepath.Clean(p)
 	low := strings.ToLower(clean)
+	// filepath.Clean uses the OS-native separator, so on Windows a
+	// pasted "/dev/null" is rewritten to "\dev\null" and a forward-slash
+	// comparison silently misses it — the exact platform this WAF often
+	// runs on. Normalise to forward slashes for the POSIX-device check so
+	// the refusal is identical on every OS (operators share configs across
+	// platforms, and a device path must be refused everywhere).
+	lowSlash := strings.ReplaceAll(low, `\`, "/")
 	// POSIX special files that absorb writes silently or randomly.
 	// Includes the obvious /dev/null plus the equally-bad /dev/zero
 	// and the entropy devices (writes to /dev/random / /dev/urandom
@@ -105,7 +112,7 @@ func validateAuditFilePath(p string) error {
 		"/dev/full", "/dev/tty",
 	}
 	for _, bad := range posixDevices {
-		if low == bad {
+		if lowSlash == bad {
 			return fmt.Errorf("audit: refusing to write chain to %q", p)
 		}
 	}

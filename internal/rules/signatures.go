@@ -68,13 +68,20 @@ func DefaultRules() []core.Rule {
 		{ID: "SQLI-004", Name: "SQLi Time-based Function", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Time-based SQLi function", Targets: []string{"args", "body"}, Pattern: `(?i)(sleep\s*\(|benchmark\s*\(|pg_sleep\s*\(|waitfor\s+delay)`},
 		{ID: "SQLI-005", Name: "SQLi Blind Boolean", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Blind boolean tautology", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(\band\b\s*\(?\s*1\s*=\s*1|\bor\b\s*\(?\s*1\s*=\s*1|\band\b\s*\(?\s*2\s*>\s*1|\bor\b\s*\(?\s*2\s*>\s*1)`},
 		{ID: "SQLI-006", Name: "SQLi Error Based", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Error-based SQLi information extraction", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(convert\s*\(\s*int\s*,\s*@@version|@@datadir|@@version|@@hostname|db_name\s*\()`},
-		{ID: "SQLI-007", Name: "SQLi Hex Encoding", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Hex encoded SQLi payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\b0x[0-9a-f]{4,}\b`},
-		{ID: "SQLI-008", Name: "SQLi CHAR Concatenation", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "CHAR concatenation SQLi payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)char\s*\(\s*\d{1,3}\s*(,\s*\d{1,3}\s*)*\)`},
+		// headers target dropped — `0x…` hex strings are routine in benign
+		// headers (ETags, CSRF tokens, build IDs in Referer), so scanning
+		// header values here false-positived on ordinary traffic. Still
+		// scans args + body.
+		{ID: "SQLI-007", Name: "SQLi Hex Encoding", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Hex encoded SQLi payload", Targets: []string{"args", "body"}, Pattern: `(?i)\b0x[0-9a-f]{4,}\b`},
+		{ID: "SQLI-008", Name: "SQLi CHAR Concatenation", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "CHAR concatenation SQLi payload", Targets: []string{"args", "body"}, Pattern: `(?i)char\s*\(\s*\d{1,3}\s*(,\s*\d{1,3}\s*)*\)`},
 		{ID: "SQLI-009", Name: "SQLi Inline Comment", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "MySQL inline comment obfuscation", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)/\*!\d{5}`},
 
 		// === NoSQL Injection ===
-		{ID: "NOSQL-001", Name: "NoSQL MongoDB Operators", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "MongoDB operator in payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)["']?\s*\$(where|ne|gt|regex|func|eq|lt|exists)\s*["']?`},
-		{ID: "NOSQL-002", Name: "NoSQL JSON Operators", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "NoSQL JSON-like operator payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)["']?\$(eq|gt|lt|ne|in|nin|exists|regex)\s*["']?\s*:`},
+		// headers target dropped — `$gt`/`$ne`/`$where`-style tokens occur in
+		// benign opaque cookies/headers; NoSQL injection via a header is rare.
+		// Still scans args + body.
+		{ID: "NOSQL-001", Name: "NoSQL MongoDB Operators", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "MongoDB operator in payload", Targets: []string{"args", "body"}, Pattern: `(?i)["']?\s*\$(where|ne|gt|regex|func|eq|lt|exists)\s*["']?`},
+		{ID: "NOSQL-002", Name: "NoSQL JSON Operators", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "NoSQL JSON-like operator payload", Targets: []string{"args", "body"}, Pattern: `(?i)["']?\$(eq|gt|lt|ne|in|nin|exists|regex)\s*["']?\s*:`},
 
 		// === XXE / XML ===
 		{ID: "XXE-001", Name: "XXE DOCTYPE", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "XML DOCTYPE declaration", Targets: []string{"body"}, Pattern: `(?i)<!DOCTYPE\s`},
@@ -89,7 +96,7 @@ func DefaultRules() []core.Rule {
 		{ID: "LDAP-001", Name: "LDAP Filter Injection", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "LDAP filter syntax in user input", Targets: []string{"args", "body"}, Pattern: `\(\s*[|&!]\s*\(|\(\s*(?:cn|uid|sn|objectClass|userPassword|mail|member|sAMAccountName)\s*=\s*[*]`},
 
 		// === CRLF Injection ===
-		{ID: "CRLF-001", Name: "CRLF Injection", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "CRLF line injection sequence", Targets: []string{"args", "headers", "uri"}, Pattern: `(?i)(%0[dD]%0[aA]|%0[aA]%0[dD]|\r\n)`},
+		{ID: "CRLF-001", Name: "CRLF Injection", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "CRLF line injection sequence", Targets: []string{"args", "headers", "uri", "uri_raw"}, Pattern: `(?i)(%0[dD]%0[aA]|%0[aA]%0[dD]|\r\n)`},
 
 		// === Prototype Pollution ===
 		{ID: "PROTO-001", Name: "Prototype Pollution", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Prototype pollution payload", Targets: []string{"args", "body"}, Pattern: `(?i)(__proto__|constructor\.prototype|constructor\[prototype\])`},
@@ -110,7 +117,12 @@ func DefaultRules() []core.Rule {
 
 		// === SSRF / Protocol Attacks ===
 		{ID: "SSRF-001", Name: "SSRF Cloud Metadata", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Cloud metadata endpoint", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)169\.254\.169\.254`},
-		{ID: "SSRF-002", Name: "SSRF Private IP", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Private IP in URL parameter", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})`},
+		// Targets args + body only — NOT headers. A private IP in the Host
+		// header is normal (it is the WAF's own bind address on internal /
+		// dev deployments), so scanning headers here flagged every request
+		// to an IP-addressed node. The SSRF signal that matters is a private
+		// IP in a user-supplied parameter or body (e.g. ?url=http://10.0.0.1/).
+		{ID: "SSRF-002", Name: "SSRF Private IP", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Private IP in URL parameter", Targets: []string{"args", "body"}, Pattern: `(?i)(127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})`},
 		{ID: "SSRF-003", Name: "SSRF Dangerous Protocol", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dangerous protocol in request", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(dict|gopher|ftp|tftp|ldap)://`},
 		{ID: "SSRF-004", Name: "SSRF File Protocol", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "File protocol in request", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)file://`},
 		{ID: "SSRF-005", Name: "SSRF IP Bypass", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "SSRF IP address bypass", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)http://(0[./]|0177\.|0x7f)`},
@@ -134,7 +146,7 @@ func DefaultRules() []core.Rule {
 
 		// === Path Traversal / LFI / RFI ===
 		{ID: "TRAV-001", Name: "Traversal Null Byte", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Null byte in path", Targets: []string{"args", "uri"}, Pattern: `\x00`},
-		{ID: "TRAV-002", Name: "Traversal Dot-Dot-Slash", Phase: core.PhaseRequestHeaders, Score: 75, Action: core.ActionBlock, Description: "Directory traversal sequence", Targets: []string{"args", "uri"}, Pattern: `(?i)(?:(?:\.|%2e|%252e|%c0%ae|%e0%80%ae|%f0%80%80%ae){2}(?:/|\\|%2f|%5c|%252f|%255c|%c0%af|%c1%9c|%e0%80%af|%f0%80%80%af))`},
+		{ID: "TRAV-002", Name: "Traversal Dot-Dot-Slash", Phase: core.PhaseRequestHeaders, Score: 75, Action: core.ActionBlock, Description: "Directory traversal sequence", Targets: []string{"args", "uri", "uri_raw"}, Pattern: `(?i)(?:(?:\.|%2e|%252e|%c0%ae|%e0%80%ae|%f0%80%80%ae){2}(?:/|\\|%2f|%5c|%252f|%255c|%c0%af|%c1%9c|%e0%80%af|%f0%80%80%af))`},
 		{ID: "TRAV-003", Name: "Traversal PHP Wrapper", Phase: core.PhaseRequestBody, Score: 75, Action: core.ActionBlock, Description: "PHP/file wrapper in parameter", Targets: []string{"args", "body"}, Pattern: `(?i)(file|php|expect|data|input|zip|compress)://`},
 		// Word boundary on .env so "/static/my.environment.notes.txt" no
 		// longer matches. Similarly anchor .htaccess to either end-of-path
@@ -163,7 +175,13 @@ func DefaultRules() []core.Rule {
 		{ID: "HPP-001", Name: "HTTP Parameter Pollution", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "Duplicate parameters suggesting HPP", Targets: []string{"args", "uri"}, Pattern: `(?i)([?&]id=[^&]*&.*[?&]id=|[?&]user=[^&]*&.*[?&]user=|[?&]role=[^&]*&.*[?&]role=)`},
 
 		// === XPath Injection ===
-		{ID: "XPATH-001", Name: "XPath Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "XPath injection payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(/'?\s*(?:or|and)\s+['"]?\d+['"]?\s*=\s*['"]?\d+|count\s*\(\s*child::|local-name\s*\(\s*\)|namespace-uri\s*\(\s*\)|/text\s*\(\s*\)|substring\s*\(\s*|\]\s*\|\s*//|\*/\*)`},
+		// NOTE: the `*/*` alternative was removed — it matched the universal
+		// `Accept: */*` header (and any wildcard content-type), so once the
+		// body phase began inspecting header values it blocked virtually every
+		// curl / API-client request. `*/*` is far too weak an XPath signal to
+		// justify that false-positive rate; the remaining alternatives are
+		// specific XPath function/axis syntax.
+		{ID: "XPATH-001", Name: "XPath Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "XPath injection payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(/'?\s*(?:or|and)\s+['"]?\d+['"]?\s*=\s*['"]?\d+|count\s*\(\s*child::|local-name\s*\(\s*\)|namespace-uri\s*\(\s*\)|/text\s*\(\s*\)|substring\s*\(\s*|\]\s*\|\s*//)`},
 
 		// === SSI Injection ===
 		{ID: "SSI-001", Name: "SSI Injection", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Server-Side Include directive", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)<!--#(?:include|exec|printenv|config|fsize|flastmod|echo)\s+`},
@@ -185,7 +203,11 @@ func DefaultRules() []core.Rule {
 		{ID: "RCE-008", Name: "RCE Perl Open", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Perl open command execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)perl\s+-e\s*['"][^'"]*\bopen\s*[\s\(]`},
 
 		// === XSS Template Injection / Polyglots ===
-		{ID: "XSS-012", Name: "XSS Template Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Template expression or polyglot payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\$\{[^}]{0,200}\}`},
+		// headers target dropped — `${…}` appears routinely in benign cookies
+		// and template-ish header values, so scanning headers here hard-blocked
+		// ordinary traffic. The Log4Shell-specific `${jndi:` is caught by the
+		// separate JNDI-001 rule (which DOES keep headers). Still scans args + body.
+		{ID: "XSS-012", Name: "XSS Template Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Template expression or polyglot payload", Targets: []string{"args", "body"}, Pattern: `(?i)\$\{[^}]{0,200}\}`},
 
 		// === JSON Injection ===
 		{ID: "JSON-001", Name: "JSON Injection", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Suspicious JSON privilege escalation", Targets: []string{"args", "body"}, Pattern: `(?i)\{\s*["']?(?:admin|role|isAdmin|permissions|access)\s*["']?\s*:\s*(?:true|1|null)\s*\}`},
@@ -203,9 +225,17 @@ func DefaultRules() []core.Rule {
 		{ID: "HEADER-001", Name: "IP Header Spoofing", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Private IP in forwarding header", Targets: []string{"headers"}, Pattern: `(?i)(X-Forwarded-For|X-Real-IP|True-Client-IP)\s*:\s*.*(?:127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})`},
 
 		// === Insecure Deserialization ===
-		{ID: "DESER-001", Name: "Java Serialized Object", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Java serialized object payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(rO0AB|ACED00)`},
-		{ID: "DESER-002", Name: "PHP Serialized Object", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "PHP serialized object payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(O:\d+:"|a:\d+:\{|s:\d+":)`},
-		{ID: "DESER-003", Name: "NET Serialized Object", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: ".NET serialized object payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)AAEAAAD`},
+		// headers target dropped — `rO0AB` / `ACED00` are base64 / hex prefixes
+		// that also begin benign opaque blobs in cookies and tokens. The real
+		// serialized payload lands in args/body, which this still scans.
+		{ID: "DESER-001", Name: "Java Serialized Object", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Java serialized object payload", Targets: []string{"args", "body"}, Pattern: `(?i)(rO0AB|ACED00)`},
+		// headers target dropped — PHP session cookies are legitimately PHP-
+		// serialized (`a:1:{…`), so scanning headers here false-positived on
+		// real PHP apps. Still scans args + body.
+		{ID: "DESER-002", Name: "PHP Serialized Object", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "PHP serialized object payload", Targets: []string{"args", "body"}, Pattern: `(?i)(O:\d+:"|a:\d+:\{|s:\d+:")`},
+		// headers target dropped — `AAEAAAD` is a base64 prefix that also appears
+		// in benign base64 header/cookie blobs. Still scans args/body.
+		{ID: "DESER-003", Name: "NET Serialized Object", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: ".NET serialized object payload", Targets: []string{"args", "body"}, Pattern: `(?i)AAEAAAD`},
 
 		// === Server-Side Template Injection ===
 		{ID: "SSTI-001", Name: "SSTI Jinja2 Twig", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Jinja2 or Twig template injection", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\{\{\s*(?:7\*7|config|self|_self|lipsum|joiner|namespace|cycler)\s*\}\}`},
@@ -338,7 +368,10 @@ func DefaultRules() []core.Rule {
 		{ID: "GQL-004", Name: "GraphQL Deep Nesting", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Excessively nested GraphQL query", Targets: []string{"body"}, Pattern: `(?:\{[^{}]*){8,}`},
 
 		// --- Insecure Deserialization ---
-		{ID: "DESER-JAVA-001", Name: "Java Serialized Object Header", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "aced0005 / rO0 Java serialized header", Targets: []string{"body", "headers"}, Pattern: `(?:aced0005|rO0[AB])`},
+		// headers target dropped — `aced0005` / `rO0AB` markers collide with
+		// benign hex/base64 cookie & token values. Serialized objects arrive in
+		// the body, which this still scans.
+		{ID: "DESER-JAVA-001", Name: "Java Serialized Object Header", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "aced0005 / rO0 Java serialized object", Targets: []string{"body"}, Pattern: `(?:aced0005|rO0[AB])`},
 		{ID: "DESER-PHP-001", Name: "PHP Serialized Gadget", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "PHP serialize() output with object marker", Targets: []string{"body"}, Pattern: `O:\d+:"[A-Za-z_][A-Za-z0-9_\\]{0,100}":\d+:\{`},
 		{ID: "DESER-NODE-001", Name: "Node Deserialization RCE", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "node-serialize _$$ND_FUNC$$_ gadget", Targets: []string{"body", "args"}, Pattern: `_\$\$ND_FUNC\$\$_function`},
 		{ID: "DESER-PYTHON-001", Name: "Python Pickle / base64", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Python cPickle / __reduce__ byte markers", Targets: []string{"body"}, Pattern: `(?:\\x80\\x04\\x95|cposix\nsystem|c__builtin__\nglobals)`},

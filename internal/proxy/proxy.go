@@ -17,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"wewaf/internal/audit"
@@ -643,7 +642,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Skipped for the PoW assets themselves, the verify endpoint, and
 	// anything served by the WAF's own admin/challenge surface — those
 	// MUST always pass through.
-	if wp.shouldGateWithPoW(r, scoreFor(wp, sessID)) && !isPoWBypassPath(r.URL.Path) {
+	if wp.shouldGateWithPoW(r, scoreFor(wp, sessID), sessID) && !isPoWBypassPath(r.URL.Path) {
 		wp.servePoWChallenge(w, r, scoreFor(wp, sessID))
 		return
 	}
@@ -1269,9 +1268,9 @@ func (wp *WAFProxy) errorHandler(w http.ResponseWriter, r *http.Request, err err
 	}
 	var logMsg string
 	switch {
-	case errors.Is(err, syscall.ECONNREFUSED):
+	case isConnRefused(err):
 		logMsg = "proxy: backend connection refused"
-	case errors.Is(err, syscall.ETIMEDOUT):
+	case isConnTimeout(err):
 		logMsg = "proxy: backend connection timed out"
 	default:
 		if urlErr, ok := err.(*url.Error); ok {
@@ -1404,6 +1403,7 @@ type EgressProxy struct {
 	metrics  *telemetry.Metrics
 	banList  *core.BanList
 	client   *http.Client
+	dialer   *net.Dialer
 	dnsCache *egressDNSCache
 	rl       *egressRateLimiter
 
@@ -1417,34 +1417,91 @@ type EgressProxy struct {
 // NewEgressProxy creates an egress inspection proxy.
 func NewEgressProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metrics, banList *core.BanList) *EgressProxy {
 	ep := &EgressProxy{
-		cfg:     cfg,
-		eng:     eng,
-		metrics: metrics,
-		banList: banList,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				DialContext: (&net.Dialer{
-					Timeout:   5 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   16,
-				MaxConnsPerHost:       32,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 20 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			},
-		},
+		cfg:      cfg,
+		eng:      eng,
+		metrics:  metrics,
+		banList:  banList,
 		dnsCache: newEgressDNSCache(60*time.Second, 4096),
 		rl:       newEgressRateLimiter(50, 100),
+	}
+	ep.dialer = &net.Dialer{
+		Timeout:   5 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	ep.client = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			// Pin every outbound dial to an address the SSRF classifier has
+			// just approved. The previous stock dialer re-resolved the
+			// hostname independently at connect time, so a DNS-rebinding
+			// record (TTL 0) could return a benign public IP to dangerReason's
+			// validation and 169.254.169.254 / 127.0.0.1 to the dialer — a
+			// validate-then-dial TOCTOU that defeated the metadata/loopback
+			// guards. safeDialContext resolves through the same cache, checks
+			// classifyIP, and dials the literal validated IP.
+			DialContext:           ep.safeDialContext,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   16,
+			MaxConnsPerHost:       32,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 20 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
 	}
 	// Pre-resolve allowlisted hosts into the DNS cache so the first
 	// real outbound request doesn't spend 5s waiting on LookupIP.
 	// Background goroutine — never blocks startup.
 	ep.dnsCache.Warm(cfg.EgressAllowlist)
 	return ep
+}
+
+// safeDialContext resolves and validates the destination before connecting,
+// then dials the LITERAL approved IP. This is the load-bearing half of the
+// egress SSRF defence: dangerReason validates at request time, but without a
+// pinned dial the transport would re-resolve and could connect somewhere
+// else entirely (DNS rebinding). TLS SNI is unaffected — net/http derives the
+// ServerName from the request URL host, not the dial address, so dialing a
+// literal IP keeps certificate verification correct for hostname targets.
+func (ep *EgressProxy) safeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	dialer := ep.dialer
+	if dialer == nil {
+		dialer = &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	}
+	// Literal IP target: validate and dial it directly.
+	if ip := net.ParseIP(host); ip != nil {
+		if reason := classifyIP(ip); reason != "" {
+			return nil, fmt.Errorf("egress: blocked dial to %s: %s", host, reason)
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	// Hostname: resolve through the same cache dangerReason used, then dial
+	// the first IP that passes classifyIP — as a literal address so the
+	// connection can't be rebound to an unvalidated one.
+	ips, lerr := ep.dnsCache.Lookup(ctx, host)
+	if lerr != nil || len(ips) == 0 {
+		return nil, fmt.Errorf("egress: dns resolution failed for %s", host)
+	}
+	var lastErr error
+	for _, ip := range ips {
+		if reason := classifyIP(ip); reason != "" {
+			lastErr = fmt.Errorf("egress: blocked dial to %s (%s): %s", host, ip, reason)
+			continue
+		}
+		conn, derr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if derr == nil {
+			return conn, nil
+		}
+		lastErr = derr
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("egress: no safe address for %s", host)
+	}
+	return nil, lastErr
 }
 
 func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {

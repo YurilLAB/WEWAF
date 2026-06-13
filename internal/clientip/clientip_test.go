@@ -248,16 +248,20 @@ func TestIsTLSRequest_TrustedPeerHonoured(t *testing.T) {
 	}
 }
 
-// TestIsTLSRequest_LegacyTrustAll — back-compat: when trust_xff is on
-// and no CIDRs are configured (legacy single-CDN deployments), every
-// upstream is treated as trusted, matching the existing left-most
-// XFF behaviour the trust gate inherits.
-func TestIsTLSRequest_LegacyTrustAll(t *testing.T) {
+// TestIsTLSRequest_LegacyTrustAllDoesNotTrustProto — security guard. In
+// legacy trust-all mode (trust_xff on, no trusted_proxies) the WAF keeps
+// left-most XFF parsing for client-IP back-compat, but it must NOT treat an
+// arbitrary direct peer as a trusted proxy for spoofable proof headers.
+// Honouring X-Forwarded-Proto from any client there let an attacker forge an
+// HTTPS origin (Secure-cookie misissuance), and the sibling
+// X-WEWAF-Client-Cert-Verified gate forge a verified client cert. Peer trust
+// for header-derived proof now requires an explicit trusted_proxies CIDR.
+func TestIsTLSRequest_LegacyTrustAllDoesNotTrustProto(t *testing.T) {
 	e, _ := New(true, nil)
 	r := newReq("203.0.113.7:1234", "", "")
 	r.Header.Set("X-Forwarded-Proto", "https")
-	if !e.IsTLSRequest(r) {
-		t.Fatal("legacy trust-all mode must still honour X-Forwarded-Proto")
+	if e.IsTLSRequest(r) {
+		t.Fatal("legacy trust-all mode must NOT honour X-Forwarded-Proto from an arbitrary peer (spoofable)")
 	}
 }
 

@@ -11,6 +11,11 @@ import (
 	"wewaf/internal/clientip"
 )
 
+// DefaultYpanelURL is where the WEWAF operator dashboard now lives. WEWAF no
+// longer ships a bundled UI; it is driven from ypanel — Yuril Security's
+// unified operator control panel — reached at its own subdomain.
+const DefaultYpanelURL = "https://ypanel.yurillab.dev"
+
 // Config holds all WAF runtime settings.
 type Config struct {
 	// Proxy settings
@@ -28,6 +33,12 @@ type Config struct {
 	TrustedProxies  []string `json:"trusted_proxies"`
 	ReadTimeoutSec  int    `json:"read_timeout_sec"`
 	WriteTimeoutSec int    `json:"write_timeout_sec"`
+
+	// Operator control plane (ypanel). WEWAF ships no bundled UI; the admin
+	// port's root redirects operators to ypanel — Yuril Security's unified
+	// control panel — reached at its own subdomain. Override only if you
+	// self-host ypanel at a different origin.
+	YpanelURL string `json:"ypanel_url"`
 
 	// Resource limits (0 = unlimited / use all available)
 	MaxCPUCores      int   `json:"max_cpu_cores"`      // GOMAXPROCS
@@ -300,6 +311,7 @@ func Default() *Config {
 		TrustedProxies:           nil,
 		ReadTimeoutSec:           30,
 		WriteTimeoutSec:          30,
+		YpanelURL:                DefaultYpanelURL,
 		MaxCPUCores:              runtime.NumCPU(),
 		MaxMemoryMB:              0,
 		MaxConcurrentReq:         10000,
@@ -483,6 +495,9 @@ func (c *Config) Validate() error {
 	}
 	if c.BackendURL == "" {
 		return fmt.Errorf("config: backend_url is required")
+	}
+	if c.YpanelURL == "" {
+		c.YpanelURL = DefaultYpanelURL
 	}
 	if c.BlockThreshold <= 0 {
 		c.BlockThreshold = 100
@@ -803,6 +818,7 @@ func (c *Config) Snapshot() *Config {
 		TrustedProxies:           append([]string(nil), c.TrustedProxies...),
 		ReadTimeoutSec:           c.ReadTimeoutSec,
 		WriteTimeoutSec:          c.WriteTimeoutSec,
+		YpanelURL:                c.YpanelURL,
 		MaxCPUCores:              c.MaxCPUCores,
 		MaxMemoryMB:              c.MaxMemoryMB,
 		MaxConcurrentReq:         c.MaxConcurrentReq,

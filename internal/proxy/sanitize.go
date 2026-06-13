@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"fmt"
 	"io"
 	"strings"
@@ -38,10 +40,29 @@ func maybeDecompressBody(headers map[string][]string, body []byte, ratioCap int,
 	if len(body) == 0 {
 		return nil, ""
 	}
-	enc := strings.ToLower(strings.TrimSpace(firstHeader(headers, "Content-Encoding")))
-	if enc == "" || enc == "identity" {
+	// Resolve the full Content-Encoding stack, flattening both comma-joined
+	// values ("gzip, gzip") and repeated header lines into ordered layers.
+	var layers []string
+	for _, hv := range allHeaderValues(headers, "Content-Encoding") {
+		for _, part := range strings.Split(hv, ",") {
+			part = strings.ToLower(strings.TrimSpace(part))
+			if part != "" && part != "identity" {
+				layers = append(layers, part)
+			}
+		}
+	}
+	if len(layers) == 0 {
 		return nil, ""
 	}
+	// Stacked encodings on a REQUEST body are not produced by any legitimate
+	// client — they are a WAF-evasion trick to make the bytes we inspect
+	// differ from what an origin that unwraps every layer finally parses
+	// (e.g. "gzip, gzip" hides the payload one decode deeper than we look).
+	// Refuse rather than inspect a still-compressed inner layer.
+	if len(layers) > 1 {
+		return nil, "stacked content-encoding not allowed"
+	}
+	enc := layers[0]
 	if ratioCap <= 0 {
 		ratioCap = 100
 	}
@@ -70,22 +91,27 @@ func maybeDecompressBody(headers map[string][]string, body []byte, ratioCap int,
 
 	var r io.ReadCloser
 	var err error
-	switch {
-	case enc == "gzip" || enc == "x-gzip":
+	switch enc {
+	case "gzip", "x-gzip":
 		r, err = gzip.NewReader(bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Sprintf("gzip decode: %v", err)
 		}
-	case enc == "br":
+	case "br":
 		r = io.NopCloser(brotli.NewReader(bytes.NewReader(body)))
-	case enc == "deflate":
-		// RFC 7230 says deflate may be raw deflate or zlib-wrapped; most
-		// servers emit zlib. Leave unhandled rather than guess wrong — the
-		// caller will simply inspect the compressed bytes.
-		return nil, ""
+	case "deflate":
+		// deflate may be zlib-wrapped (RFC 1950 — what most servers emit) or
+		// raw DEFLATE (RFC 1951). Try zlib first; fall back to raw flate so a
+		// deflate-encoded attack body is actually decompressed for inspection
+		// instead of sailing through as opaque bytes (which it did before).
+		if zr, zerr := zlib.NewReader(bytes.NewReader(body)); zerr == nil {
+			r = zr
+		} else {
+			r = flate.NewReader(bytes.NewReader(body))
+		}
 	default:
-		// Multi-value (e.g. "gzip, br") or unknown encoding — let the caller
-		// fall back to raw body rather than risk a wrong decode.
+		// Unknown single encoding we have no decoder for (e.g. compress,
+		// zstd). Fall back to inspecting the raw bytes rather than guessing.
 		return nil, ""
 	}
 	defer func() { _ = r.Close() }()
@@ -115,5 +141,20 @@ func firstHeader(h map[string][]string, key string) string {
 		}
 	}
 	return ""
+}
+
+// allHeaderValues returns every value for key (all repeated header lines),
+// case-insensitively. Used to detect stacked Content-Encoding spread across
+// multiple header lines, not just a single comma-joined value.
+func allHeaderValues(h map[string][]string, key string) []string {
+	if vs, ok := h[key]; ok {
+		return vs
+	}
+	for k, vs := range h {
+		if strings.EqualFold(k, key) {
+			return vs
+		}
+	}
+	return nil
 }
 

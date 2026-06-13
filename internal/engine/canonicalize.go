@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"net/url"
 	"strings"
 	"unicode"
 
@@ -30,12 +29,34 @@ func Canonicalize(s string) string {
 		return s
 	}
 	out := s
+	// Strip raw NUL bytes BEFORE decoding: a NUL embedded mid-escape
+	// ("%<NUL>3c") would otherwise break the percent-escape and hide the
+	// following %XX from the decoder, while a backend that simply drops NULs
+	// still decodes it. (Surfaced by the canonicalizer fuzzer.)
+	if strings.IndexByte(out, 0) >= 0 {
+		out = strings.ReplaceAll(out, "\x00", "")
+	}
 	for i := 0; i < 3; i++ {
-		dec, err := url.QueryUnescape(out)
-		if err != nil || dec == out {
-			break
+		// Lenient percent-decoding: decode every valid %XX and pass malformed
+		// escapes through literally. url.QueryUnescape is all-or-nothing — it
+		// errors on the FIRST bad escape and decodes NOTHING — so a payload
+		// like "%zz%3cscript%3e" reached canonicalization fully encoded and
+		// bypassed the rules, while a per-character-decoding backend still saw
+		// "<script>". (Surfaced by the canonicalizer fuzzer.)
+		if dec, changed := lenientUnescape(out); changed {
+			out = dec
+			continue
 		}
-		out = dec
+		// Then IIS / .NET %uXXXX, which percent-decoding does not cover. A
+		// payload like %u003cscript%u003e survives standard decoding unchanged
+		// but classic IIS / ASP.NET backends decode it to <script>; decoding it
+		// here lets the existing signatures match. Bounded by the same 3-pass
+		// loop so %25u003c (double-encoded) unfolds.
+		if u := decodePercentU(out); u != out {
+			out = u
+			continue
+		}
+		break
 	}
 	out = strings.ReplaceAll(out, "\\", "/")
 	if strings.IndexByte(out, 0) >= 0 {
@@ -212,6 +233,104 @@ func HasObfuscatedTransferEncoding(values []string) bool {
 		}
 	}
 	return false
+}
+
+// lenientUnescape percent-decodes every valid %XX sequence and passes
+// malformed ones through literally, and (matching the previous
+// url.QueryUnescape behaviour) treats '+' as a space. Unlike
+// url.QueryUnescape it never gives up on the whole string: a single bad
+// escape no longer prevents decoding of the valid escapes around it, which
+// was a rule-bypass (see Canonicalize). Returns (decoded, changed).
+func lenientUnescape(s string) (string, bool) {
+	if !strings.ContainsAny(s, "%+") {
+		return s, false
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	changed := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '%' && i+2 < len(s) && isHexByte(s[i+1]) && isHexByte(s[i+2]):
+			b.WriteByte(unhexByte(s[i+1])<<4 | unhexByte(s[i+2]))
+			i += 2
+			changed = true
+		case c == '+':
+			b.WriteByte(' ')
+			changed = true
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String(), changed
+}
+
+func isHexByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func unhexByte(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10
+	}
+	return 0
+}
+
+// decodePercentU rewrites IIS / .NET %uXXXX sequences into their code point.
+// %u003c -> '<'. url.QueryUnescape does not handle this non-standard form, so
+// without it a %u-encoded payload reaches a decoding backend uninspected. Only
+// well-formed %u + exactly four hex digits are decoded; everything else is
+// copied through byte-for-byte so the function never corrupts normal input.
+func decodePercentU(s string) string {
+	// Fast path — no %u / %U present.
+	if !strings.Contains(s, "%u") && !strings.Contains(s, "%U") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if s[i] == '%' && i+6 <= len(s) && (s[i+1] == 'u' || s[i+1] == 'U') {
+			if r, ok := hex4(s[i+2 : i+6]); ok {
+				b.WriteRune(r)
+				i += 6
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// hex4 parses exactly four hex digits into a rune. Returns ok=false on any
+// non-hex byte or wrong length so the caller leaves the input untouched.
+func hex4(s string) (rune, bool) {
+	if len(s) != 4 {
+		return 0, false
+	}
+	var v rune
+	for i := 0; i < 4; i++ {
+		c := s[i]
+		var d rune
+		switch {
+		case c >= '0' && c <= '9':
+			d = rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = rune(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = rune(c-'A') + 10
+		default:
+			return 0, false
+		}
+		v = v<<4 | d
+	}
+	return v, true
 }
 
 func collapseSlashes(s string) string {

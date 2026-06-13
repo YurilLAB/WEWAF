@@ -184,6 +184,21 @@ func InspectGRPCBody(body []byte, limits GRPCLimits) GRPCResult {
 		if int(length) > res.Stats.LargestFrame {
 			res.Stats.LargestFrame = int(length)
 		}
+		// Enforce the per-request frame-count and total-byte caps BEFORE the
+		// compressed-frame short-circuit below. These checks previously sat
+		// after the `continue`, so a body made entirely of compressed frames
+		// never tripped them — the documented MaxFrames / MaxTotalBytes caps
+		// silently didn't hold for compressed gRPC traffic (cap evasion).
+		if res.Stats.Frames > limits.MaxFrames {
+			res.Blocked = true
+			res.Reason = fmt.Sprintf("grpc frame count %d exceeds max %d", res.Stats.Frames, limits.MaxFrames)
+			return res
+		}
+		if res.Stats.Bytes > limits.MaxTotalBytes {
+			res.Blocked = true
+			res.Reason = fmt.Sprintf("grpc total bytes %d exceeds max %d", res.Stats.Bytes, limits.MaxTotalBytes)
+			return res
+		}
 		if flags&0x01 != 0 {
 			res.Stats.Compressed++
 			if limits.BlockCompressed {
@@ -197,16 +212,6 @@ func InspectGRPCBody(body []byte, limits GRPCLimits) GRPCResult {
 			// return noise. The rule engine won't see into them; that's
 			// the tradeoff of gRPC compression being per-frame.
 			continue
-		}
-		if res.Stats.Frames > limits.MaxFrames {
-			res.Blocked = true
-			res.Reason = fmt.Sprintf("grpc frame count %d exceeds max %d", res.Stats.Frames, limits.MaxFrames)
-			return res
-		}
-		if res.Stats.Bytes > limits.MaxTotalBytes {
-			res.Blocked = true
-			res.Reason = fmt.Sprintf("grpc total bytes %d exceeds max %d", res.Stats.Bytes, limits.MaxTotalBytes)
-			return res
 		}
 		res.ScanTargets = append(res.ScanTargets, extractPrintableRuns(payload)...)
 	}

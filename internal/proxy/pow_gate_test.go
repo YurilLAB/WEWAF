@@ -16,10 +16,9 @@ import (
 
 // signCookie reproduces internal/web/handlers_session.go:signPowCookie.
 // We duplicate it here rather than importing web (would create a cycle).
-// The two implementations are kept in lockstep by TestPoWCookieFormat
-// which encodes the same shape on both sides and checks equivalence.
-func signCookie(secret, id string, ts int64) string {
-	body := id + "." + strconv.FormatInt(ts, 10)
+// The first segment is the SESSION ID the cookie is bound to.
+func signCookie(secret, sessID string, ts int64) string {
+	body := sessID + "." + strconv.FormatInt(ts, 10)
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
@@ -38,10 +37,35 @@ func TestHasValidPoWCookieAcceptsFreshSignedCookie(t *testing.T) {
 	r := httptest.NewRequest("GET", "/", nil)
 	r.AddCookie(&http.Cookie{
 		Name:  powCookieName,
-		Value: signCookie("test-secret", "abc", time.Now().Unix()),
+		Value: signCookie("test-secret", "sess-1", time.Now().Unix()),
 	})
-	if !wp.hasValidPoWCookie(r) {
-		t.Fatal("fresh, validly-signed cookie should pass")
+	if !wp.hasValidPoWCookie(r, "sess-1") {
+		t.Fatal("fresh, validly-signed cookie for this session should pass")
+	}
+}
+
+// TestHasValidPoWCookieRejectsCrossSession is the headline fix: a pass cookie
+// minted for one session must NOT be honoured for a different session. Without
+// this, one solved cookie is a bearer token shareable across an entire botnet.
+func TestHasValidPoWCookieRejectsCrossSession(t *testing.T) {
+	wp := &WAFProxy{cfg: &config.Config{
+		PoWEnabled:      true,
+		PoWSecret:       "test-secret",
+		PoWCookieTTLSec: 3600,
+	}}
+	r := httptest.NewRequest("GET", "/", nil)
+	// Cookie was legitimately minted for sess-A (valid MAC, fresh).
+	r.AddCookie(&http.Cookie{
+		Name:  powCookieName,
+		Value: signCookie("test-secret", "sess-A", time.Now().Unix()),
+	})
+	// ...but it arrives on a request belonging to sess-B.
+	if wp.hasValidPoWCookie(r, "sess-B") {
+		t.Fatal("a pass cookie for sess-A must not be accepted for sess-B (bearer-token replay)")
+	}
+	// Sanity: it still works for its own session.
+	if !wp.hasValidPoWCookie(r, "sess-A") {
+		t.Fatal("cookie should still pass for the session it was minted for")
 	}
 }
 
@@ -53,12 +77,12 @@ func TestHasValidPoWCookieRejectsTamperedSignature(t *testing.T) {
 		PoWSecret:       "test-secret",
 		PoWCookieTTLSec: 3600,
 	}}
-	good := signCookie("test-secret", "abc", time.Now().Unix())
-	// Flip a single base64 char in the signature segment.
+	good := signCookie("test-secret", "sess-1", time.Now().Unix())
+	// Flip the last 3 base64 chars in the signature segment.
 	tampered := good[:len(good)-3] + "XXX"
 	r := httptest.NewRequest("GET", "/", nil)
 	r.AddCookie(&http.Cookie{Name: powCookieName, Value: tampered})
-	if wp.hasValidPoWCookie(r) {
+	if wp.hasValidPoWCookie(r, "sess-1") {
 		t.Fatal("tampered cookie was accepted — auth-bypass risk")
 	}
 }
@@ -72,9 +96,9 @@ func TestHasValidPoWCookieRejectsExpired(t *testing.T) {
 		PoWCookieTTLSec: 1, // 1-second TTL
 	}}
 	r := httptest.NewRequest("GET", "/", nil)
-	stale := signCookie("k", "x", time.Now().Add(-10*time.Second).Unix())
+	stale := signCookie("k", "sess-x", time.Now().Add(-10*time.Second).Unix())
 	r.AddCookie(&http.Cookie{Name: powCookieName, Value: stale})
-	if wp.hasValidPoWCookie(r) {
+	if wp.hasValidPoWCookie(r, "sess-x") {
 		t.Fatal("expired cookie was accepted")
 	}
 }
@@ -91,9 +115,9 @@ func TestHasValidPoWCookieRejectsWrongSecret(t *testing.T) {
 	r := httptest.NewRequest("GET", "/", nil)
 	r.AddCookie(&http.Cookie{
 		Name:  powCookieName,
-		Value: signCookie("attacker-key", "abc", time.Now().Unix()),
+		Value: signCookie("attacker-key", "sess-1", time.Now().Unix()),
 	})
-	if wp.hasValidPoWCookie(r) {
+	if wp.hasValidPoWCookie(r, "sess-1") {
 		t.Fatal("cookie signed with wrong key was accepted")
 	}
 }
@@ -116,7 +140,7 @@ func TestHasValidPoWCookieRejectsMalformed(t *testing.T) {
 	} {
 		r := httptest.NewRequest("GET", "/", nil)
 		r.AddCookie(&http.Cookie{Name: powCookieName, Value: val})
-		if wp.hasValidPoWCookie(r) {
+		if wp.hasValidPoWCookie(r, "sess-1") {
 			t.Errorf("malformed value %q was accepted", val)
 		}
 	}
@@ -133,7 +157,7 @@ func TestShouldGateWithPoWThresholdLogic(t *testing.T) {
 	}}
 	// pow nil → no gate even at score 100.
 	r := httptest.NewRequest("GET", "/", nil)
-	if wp.shouldGateWithPoW(r, 100) {
+	if wp.shouldGateWithPoW(r, 100, "sess-1") {
 		t.Fatal("nil issuer should never gate")
 	}
 	// Real issuer — we never call Issue() in this test, just need
@@ -144,23 +168,27 @@ func TestShouldGateWithPoWThresholdLogic(t *testing.T) {
 	}
 	wp.pow = issuer
 
-	if wp.shouldGateWithPoW(r, 59) {
+	if wp.shouldGateWithPoW(r, 59, "sess-1") {
 		t.Fatal("below trigger should not gate")
 	}
-	if !wp.shouldGateWithPoW(r, 60) {
+	if !wp.shouldGateWithPoW(r, 60, "sess-1") {
 		t.Fatal("at trigger should gate")
 	}
-	if !wp.shouldGateWithPoW(r, 95) {
+	if !wp.shouldGateWithPoW(r, 95, "sess-1") {
 		t.Fatal("above trigger should gate")
 	}
 
-	// Valid cookie suppresses the gate even at high score.
+	// Valid cookie bound to this session suppresses the gate even at high score.
 	r.AddCookie(&http.Cookie{
 		Name:  powCookieName,
-		Value: signCookie("k", "abc", time.Now().Unix()),
+		Value: signCookie("k", "sess-1", time.Now().Unix()),
 	})
-	if wp.shouldGateWithPoW(r, 95) {
-		t.Fatal("valid cookie should bypass gate")
+	if wp.shouldGateWithPoW(r, 95, "sess-1") {
+		t.Fatal("valid cookie should bypass gate for its own session")
+	}
+	// The same cookie must NOT bypass the gate for a different session.
+	if !wp.shouldGateWithPoW(r, 95, "sess-2") {
+		t.Fatal("a cookie bound to sess-1 must not bypass the gate for sess-2")
 	}
 }
 
@@ -183,4 +211,3 @@ func TestIsPoWBypassPathCoversChallengeAssets(t *testing.T) {
 		t.Fatal("normal path should not bypass")
 	}
 }
-

@@ -2,10 +2,8 @@ package web
 
 import (
 	"crypto/subtle"
-	"embed"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"log"
 	stdnet "net"
 	"net/http"
@@ -36,10 +34,9 @@ import (
 	"wewaf/internal/zerotrust"
 )
 
-//go:embed all:dist
-var distFS embed.FS
-
-// Server serves the embedded UI and JSON APIs.
+// Server serves the JSON admin API, the Prometheus /metrics endpoint, and
+// the SSE event stream. The dashboard UI is no longer bundled — WEWAF is
+// operated from ypanel (see docs/ypanel.md).
 type Server struct {
 	cfg        *config.Config
 	metrics    *telemetry.Metrics
@@ -300,70 +297,50 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/pow.js", safeSessionHandler("pow-js", s.handlePowJS))
 	mux.HandleFunc("/api/pow/verify", safeSessionHandler("pow-verify", s.handlePowVerify))
 
-	// Serve the embedded SPA.
-	spaFS, err := fs.Sub(distFS, "dist")
-	if err != nil {
-		log.Printf("web: embedded dist missing: %v", err)
-		spaFS = distFS
-	}
-	mux.Handle("/", s.spaHandler(spaFS))
+	// The bundled React dashboard has been removed: WEWAF is now operated
+	// from ypanel (docs/ypanel.md), so the admin port serves the JSON API,
+	// the Prometheus /metrics endpoint, and the SSE stream only. The old
+	// dashboard root now points operators at the ypanel control panel.
+	mux.HandleFunc("/", s.handleRoot)
 }
 
-// spaHandler serves the Vite build output, falling back to index.html for
-// client-side routes so React Router can handle them.
-func (s *Server) spaHandler(spaFS fs.FS) http.Handler {
-	fileServer := http.FileServer(http.FS(spaFS))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") {
-			http.NotFound(w, r)
-			return
-		}
-		trimmed := strings.TrimPrefix(r.URL.Path, "/")
-		if trimmed == "" {
-			trimmed = "index.html"
-		}
-		if _, err := fs.Stat(spaFS, trimmed); err != nil {
-			// Unknown path — serve the SPA entry so the router can handle it.
-			data, readErr := fs.ReadFile(spaFS, "index.html")
-			if readErr != nil {
-				http.Error(w, "UI not built. Run `npm run build` inside ui/.", http.StatusInternalServerError)
-				return
-			}
-			writeSPASecurityHeaders(w)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache")
-			_, _ = w.Write(data)
-			return
-		}
-		writeSPASecurityHeaders(w)
-		fileServer.ServeHTTP(w, r)
-	})
-}
-
-// writeSPASecurityHeaders adds the baseline browser-side hardening
-// headers to every admin SPA response. Without these, any future XSS
-// in the React build (or in a vulnerable transitive dep) would be
-// fully exploitable, and the dashboard could be framed by an attacker
-// site for clickjacking. The CSP allows inline styles because the
-// Vite-built SPA inlines a bootstrap stylesheet; if that's tightened
-// upstream we can drop 'unsafe-inline' for style-src.
-func writeSPASecurityHeaders(w http.ResponseWriter) {
+// handleRoot is the catch-all that replaced the embedded SPA. Every
+// non-API path on the admin port lands here; /api/*, /metrics, and the
+// public challenge / PoW assets are registered as more specific patterns
+// and never reach it. An operator who opens the old dashboard URL is
+// redirected to ypanel, where the UI now lives.
+func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
+	// Baseline browser hardening even though this response carries no app
+	// content — without it the response can still be framed or sniffed.
 	h := w.Header()
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Referrer-Policy", "no-referrer")
-	h.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
-	// Self-only loading; same-origin connect-src lets the SPA call /api/*.
-	h.Set("Content-Security-Policy",
-		"default-src 'self'; "+
-			"script-src 'self'; "+
-			"style-src 'self' 'unsafe-inline'; "+
-			"img-src 'self' data:; "+
-			"connect-src 'self'; "+
-			"font-src 'self' data:; "+
-			"frame-ancestors 'none'; "+
-			"base-uri 'self'; "+
-			"form-action 'self'")
+	h.Set("Cache-Control", "no-store")
+	target := s.ypanelURL()
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		http.Redirect(w, r, target, http.StatusFound)
+	default:
+		http.Error(w, "WEWAF is operated from ypanel: "+target, http.StatusGone)
+	}
+}
+
+// ypanelDefaultURL is where the WEWAF operator dashboard now lives. WEWAF no
+// longer ships a bundled UI; it is driven from ypanel — Yuril Security's
+// unified operator control panel — which is reached at its own subdomain.
+// See docs/ypanel.md.
+const ypanelDefaultURL = "https://ypanel.yurillab.dev"
+
+// ypanelURL returns the operator-configured ypanel control-panel URL, falling
+// back to the default ypanel subdomain when unset.
+func (s *Server) ypanelURL() string {
+	if s != nil && s.cfg != nil {
+		if u := strings.TrimSpace(s.cfg.YpanelURL); u != "" {
+			return u
+		}
+	}
+	return ypanelDefaultURL
 }
 
 // withAuth gates admin endpoints on the WAF_API_KEY environment
@@ -1041,6 +1018,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"status": "ok",
 		"mode":   s.cfg.ModeSnapshot(),
+		// Advertise the control plane: this node has no local UI; it is
+		// operated from ypanel. A reporter or browser hitting the old
+		// dashboard surface can discover where the UI now lives.
+		"dashboard":  "ypanel",
+		"ypanel_url": s.ypanelURL(),
 	})
 }
 

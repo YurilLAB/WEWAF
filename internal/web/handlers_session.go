@@ -382,9 +382,21 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, reason, http.StatusBadRequest)
 		return
 	}
-	// Success: emit a signed cookie that proves PoW pass for the
-	// session's natural cookie lifetime, capped at 1 hour.
-	cookieValue := signPowCookie(s.cfg.PoWSecret, verified.ID, time.Now().Unix())
+	// Success: bind the pass cookie to THIS session so it can't be lifted and
+	// replayed by other clients/IPs. A single solved cookie shared fleet-wide
+	// would otherwise let an entire botnet skip the gate for the cookie's
+	// lifetime (the previous design signed the throwaway token ID, making the
+	// cookie a pure bearer credential). The gate honours the cookie only for a
+	// request carrying the same __wewaf_sid; sharing it now requires sharing
+	// the session, which the tracker's IP / JA3-drift scoring already resists.
+	sessID := ""
+	if s.sessions != nil {
+		if sess := s.sessions.EnsureSession(w, r); sess != nil {
+			sessID = sess.ID
+			s.sessions.RecordPowPass(sessID)
+		}
+	}
+	cookieValue := signPowCookie(s.cfg.PoWSecret, sessID, time.Now().Unix())
 	if cookieValue == "" {
 		// PoWSecret was empty — refuse to issue rather than fall back
 		// to a hardcoded constant (the previous bug). PoWSecret is
@@ -403,11 +415,6 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   3600,
 	})
-	if s.sessions != nil {
-		if sess := s.sessions.EnsureSession(w, r); sess != nil {
-			s.sessions.RecordPowPass(sess.ID)
-		}
-	}
 	if s.metrics != nil {
 		s.metrics.RecordBlockWithCategory(clientIP, r.Method, r.URL.Path,
 			"POW-VERIFIED", "pow",

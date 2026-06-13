@@ -112,6 +112,15 @@ func (e *Extractor) ClientIP(r *http.Request) string {
 	}
 	c := configOrZero(e)
 	peer := splitHost(r.RemoteAddr)
+	if peer == "" {
+		// splitHost can reduce a malformed RemoteAddr (e.g. whitespace-only)
+		// to empty. The documented contract is to never return empty for a
+		// non-nil request, and an empty value would be a useless rate-limit /
+		// ban key, so fall back to the raw RemoteAddr. (Surfaced by the
+		// clientip fuzzer — not reachable from a real net.Conn, but the
+		// guarantee must hold regardless.)
+		peer = r.RemoteAddr
+	}
 	if !c.trustXFF {
 		return peer
 	}
@@ -177,12 +186,16 @@ func (e *Extractor) IsTrustedPeer(r *http.Request) bool {
 	if c == nil || !c.trustXFF {
 		return false
 	}
-	if c.trustedAll {
-		// Legacy mode: every upstream is "trusted" so the answer is
-		// always yes when trust_xff is on. Keeps observable behaviour
-		// consistent with the legacy XFF parsing.
-		return true
-	}
+	// Deliberately NOT honouring trustedAll here. Legacy "trust_xff with no
+	// allowlist" mode keeps left-most XFF parsing for backward-compatible
+	// client-IP resolution, but peer-trust gates a far more dangerous
+	// decision: whether to believe spoofable proof headers like
+	// X-WEWAF-Client-Cert-Verified (mTLS verdict) and X-Forwarded-Proto.
+	// Treating every direct connection as a trusted proxy there would let an
+	// attacker who reaches the WAF directly forge a verified client
+	// certificate or an HTTPS origin. Require an explicit trusted_proxies
+	// CIDR before any peer is trusted for header-derived proof — an empty
+	// trustedNets set makes this correctly return false.
 	return ipInNets(splitHost(r.RemoteAddr), c.trustedNets)
 }
 

@@ -682,7 +682,13 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	core.SafeGo("admin-server", func() {
-		log.Printf("admin dashboard listening on http://%s", cfg.AdminAddr)
+		// WEWAF no longer ships a bundled dashboard — it is operated from
+		// ypanel (the Yuril control panel) at its own subdomain. The admin
+		// port serves the JSON API, /metrics, and the SSE stream that the
+		// ypanel reporter consumes; opening the old dashboard URL on this
+		// port redirects the operator to ypanel.
+		log.Printf("admin API listening on http://%s — operate this node from ypanel: %s",
+			cfg.AdminAddr, cfg.YpanelURL)
 		if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("admin server error: %v", err)
 		}
