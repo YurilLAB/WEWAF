@@ -351,6 +351,10 @@ func (bl *BanList) ConfigureBackoff(enabled bool, multiplier int, window, maxDur
 // repeat bans on the same IP within the backoff window apply an exponential
 // multiplier to the duration, capped at maxDuration.
 func (bl *BanList) Ban(ip, reason string, duration time.Duration) {
+	// Canonicalise to the same per-client key the ingress path uses (IPv6 ->
+	// /64) so a ban actually covers the prefix an attacker rotates through,
+	// and so an admin/threat-feed/mesh ban matches the key IsBanned checks.
+	ip = clientip.NormalizeIPKey(ip)
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 	now := time.Now().UTC()
@@ -459,13 +463,17 @@ func (bl *BanList) Ban(ip, reason string, duration time.Duration) {
 
 // Unban removes a ban for the given IP.
 func (bl *BanList) Unban(ip string) {
+	ip = clientip.NormalizeIPKey(ip)
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 	delete(bl.entries, ip)
 }
 
 // IsBanned returns true if the IP exists in the ban list and has not expired.
+// The IP is normalised to the per-client key (IPv6 -> /64) before lookup so a
+// /64 ban matches any address in the prefix.
 func (bl *BanList) IsBanned(ip string) bool {
+	ip = clientip.NormalizeIPKey(ip)
 	bl.mu.RLock()
 	defer bl.mu.RUnlock()
 	entry, ok := bl.entries[ip]

@@ -103,10 +103,21 @@ func (e *Extractor) HasTrustedProxies() bool {
 	return len(c.trustedNets) > 0
 }
 
-// ClientIP returns the best-guess client IP for the request. Never
-// returns an empty string for a non-nil request — falls back to the
-// raw RemoteAddr when nothing else is parseable.
+// ClientIP returns the best-guess client IP for the request, canonicalised
+// for use as a per-client key. IPv6 addresses are masked to their /64 prefix
+// (see NormalizeIPKey) so a single end site — routinely allocated an entire
+// /64 — cannot rotate the low 64 bits to mint 2^64 distinct identities and
+// evade per-IP rate limiting, bans, and brute-force counting. IPv4 is returned
+// as the full address. Never returns an empty string for a non-nil request —
+// falls back to the raw RemoteAddr when nothing else is parseable.
 func (e *Extractor) ClientIP(r *http.Request) string {
+	return NormalizeIPKey(e.clientIPRaw(r))
+}
+
+// clientIPRaw resolves the client IP per the trust policy WITHOUT prefix
+// normalisation. ClientIP wraps it; callers that need the literal address
+// (none today outside ClientIP) could use it directly.
+func (e *Extractor) clientIPRaw(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
@@ -127,12 +138,20 @@ func (e *Extractor) ClientIP(r *http.Request) string {
 
 	// Legacy compatibility branch: trustXFF on but no allowlist
 	// configured. Walk left-most so existing single-CDN setups keep
-	// the same observable behaviour.
+	// the same observable behaviour. The header value is validated as a
+	// parseable IP before it is trusted: without this, an attacker in this
+	// (already-discouraged) mode could send a UNIQUE non-IP string per
+	// request (e.g. "X-Forwarded-For: a<rand>") and have every request
+	// attributed to a distinct key, defeating per-IP rate limiting, bans,
+	// and brute-force counting wholesale. Unparseable values fall back to
+	// the real TCP peer. (Spoofing with VALID IPs is inherent to this mode;
+	// the strict trusted_proxies branch below is the fix operators should
+	// adopt — this only removes the garbage-key amplification.)
 	if c.trustedAll {
-		if v := leftmostXFF(r); v != "" {
+		if v := leftmostXFF(r); v != "" && net.ParseIP(v) != nil {
 			return v
 		}
-		if v := strings.TrimSpace(r.Header.Get("X-Real-Ip")); v != "" {
+		if v := strings.TrimSpace(r.Header.Get("X-Real-Ip")); v != "" && net.ParseIP(v) != nil {
 			return v
 		}
 		return peer
@@ -227,6 +246,38 @@ func (e *Extractor) IsTLSRequest(r *http.Request) bool {
 }
 
 // --- Helpers -----------------------------------------------------------
+
+// ipv6KeyPrefixBits is the prefix length IPv6 client IPs are masked to before
+// being used as a per-client key (rate limiter, DDoS per-IP maps, brute-force
+// detector, ban matcher). A single end site is routinely allocated an entire
+// /64 (or larger) and rotating the low 64 bits is free, so keying on the full
+// /128 would let one client present 2^64 distinct identities and slip past
+// every per-IP control. Masking to /64 makes the prefix the unit of accounting.
+const ipv6KeyPrefixBits = 64
+
+// NormalizeIPKey canonicalises an IP string for use as a per-client key.
+// IPv4 (incl. IPv4-mapped IPv6) addresses are returned unchanged — a single
+// /32 is already one host. IPv6 addresses are masked to their /64 prefix.
+// Unparseable input is returned unchanged so callers that already fell back to
+// a raw peer string keep a stable (if coarse) key. The operation is idempotent:
+// NormalizeIPKey(NormalizeIPKey(x)) == NormalizeIPKey(x).
+func NormalizeIPKey(ipStr string) string {
+	if ipStr == "" {
+		return ipStr
+	}
+	parsed := net.ParseIP(ipStr)
+	if parsed == nil {
+		return ipStr
+	}
+	if parsed.To4() != nil {
+		return ipStr // IPv4 / IPv4-mapped: full /32, unchanged.
+	}
+	masked := parsed.Mask(net.CIDRMask(ipv6KeyPrefixBits, 128))
+	if masked == nil {
+		return ipStr
+	}
+	return masked.String()
+}
 
 func configOrZero(e *Extractor) config {
 	if e == nil {

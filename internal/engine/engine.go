@@ -176,6 +176,41 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 	// blocks before the body is buffered; this closes the body-phase gap.
 	targets := e.buildRequestHeaderTargets(tx.Request)
 	targets["body"] = body
+
+	// If the proxy decompressed a Content-Encoding'd request body, inspect the
+	// decoded plaintext as well. The proxy stores the still-compressed bytes
+	// under "body" and the inflated form under "decoded_body"; without folding
+	// the latter into the body target, every gzip/deflate/br-encoded payload
+	// bypasses all body-phase signatures (they only ever saw compressed bytes,
+	// which never match) while the backend decompresses and processes the
+	// attack normally. The compressed bytes are kept too — they are inert under
+	// the signatures, so appending the decoded form is purely additive.
+	if val, ok := tx.MetadataValue("decoded_body"); ok {
+		if db, ok := val.([]byte); ok && len(db) > 0 {
+			if targets["body"] == "" {
+				targets["body"] = string(db)
+			} else {
+				targets["body"] += "\n" + string(db)
+			}
+		}
+	}
+
+	// gRPC deep-inspection: the proxy extracts printable string runs from
+	// protobuf frames into "grpc_targets". Fold them into the body inspection
+	// surface so the existing XSS / SQLi / RCE signatures evaluate proto string
+	// fields — otherwise the advertised gRPC rule coverage never executes (the
+	// raw length-prefixed protobuf framing does not match canonicalised rules).
+	if val, ok := tx.MetadataValue("grpc_targets"); ok {
+		if runs, ok := val.([]string); ok && len(runs) > 0 {
+			joined := strings.Join(runs, "\n")
+			if targets["body"] == "" {
+				targets["body"] = joined
+			} else {
+				targets["body"] += "\n" + joined
+			}
+		}
+	}
+
 	return e.evaluatePhase(tx, core.PhaseRequestBody, targets)
 }
 
@@ -569,6 +604,22 @@ func (e *Engine) buildRequestHeaderTargets(r *http.Request) map[string]string {
 			if !add("args."+key, argVals[key]) {
 				break
 			}
+		}
+		// Inspect parameter NAMES too, not just values. A payload hidden in a
+		// query-parameter name (e.g. ?<script>alert(1)>=1, or ?a' OR '1'='1=x)
+		// is otherwise invisible to args-targeted signatures, which only ever
+		// see the value — yet backends that read parameter names (PHP extract,
+		// key-binding frameworks, log/echo sinks) treat the name as a sink. The
+		// decoded, homoglyph-folded names are joined into one synthetic args
+		// target so the existing XSS/SQLi/NoSQL rules (which target "args", and
+		// therefore "args.*") evaluate them.
+		if len(argKeys) > 0 {
+			var names strings.Builder
+			for _, key := range argKeys {
+				names.WriteString(FoldHomoglyphs(Canonicalize(key)))
+				names.WriteByte('\n')
+			}
+			add("args._names", names.String())
 		}
 	}
 	for k, v := range r.Header {

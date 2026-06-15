@@ -330,6 +330,12 @@ func main() {
 	stopBanCleanup := banList.StartCleanup(time.Minute)
 	defer stopBanCleanup()
 
+	// Enforce bans on the ingress path. Without this the ban list is only
+	// ever read by the admin/auto-mitigation/mesh layers, so a banned IP keeps
+	// reaching the backend. Wiring it here makes every ban source (manual,
+	// threat-feed, mesh, auto-mitigate) actually block the offender.
+	wp.AttachBanList(banList)
+
 	// Auto-updating threat-intel feeds. The supervisor pulls FREE
 	// community lists (FireHOL, Spamhaus DROP, SSLBL JA3, blocklist.de,
 	// ET compromised, mitchellkrogza bad-UAs, CISA KEV) on a schedule

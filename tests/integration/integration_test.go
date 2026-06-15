@@ -11,6 +11,7 @@ package integration_test
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"net"
@@ -106,6 +107,7 @@ func newTestProxy(t *testing.T) (frontend, backend *httptest.Server, metrics *te
 	if err != nil {
 		t.Fatalf("NewWAFProxy: %v", err)
 	}
+	wp.AttachBanList(bans)
 
 	frontend = httptest.NewServer(wp)
 
@@ -439,6 +441,129 @@ func TestPrometheusExposition(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("Prometheus output missing %q; got:\n%s", want, out)
 		}
+	}
+}
+
+// TestBannedIPIsBlocked asserts that an IP placed in the shared ban list is
+// actually rejected on the ingress path (403) before reaching the backend.
+// Before ban enforcement was wired into WAFProxy.ServeHTTP, bans were purely
+// decorative — listed in /api/bans and synced to peers but never blocking a
+// single request. The httptest client connects from loopback, so we ban
+// 127.0.0.1 and confirm the next request is forbidden, then unban and confirm
+// it is allowed again.
+func TestBannedIPIsBlocked(t *testing.T) {
+	frontend, _, metrics, bans, stop := newTestProxy(t)
+	defer stop()
+
+	// Sanity: an un-banned request reaches the backend.
+	resp, err := http.Get(frontend.URL + "/ok")
+	if err != nil {
+		t.Fatalf("pre-ban request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 before ban, got %d", resp.StatusCode)
+	}
+
+	bans.Ban("127.0.0.1", "integration test ban", time.Hour)
+
+	resp, err = http.Get(frontend.URL + "/ok")
+	if err != nil {
+		t.Fatalf("post-ban request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("banned IP must be blocked with 403, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("ban block should set Retry-After")
+	}
+	if metrics.BlockedRequests == 0 {
+		t.Fatalf("ban block should increment BlockedRequests")
+	}
+
+	bans.Unban("127.0.0.1")
+	resp, err = http.Get(frontend.URL + "/ok")
+	if err != nil {
+		t.Fatalf("post-unban request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 after unban, got %d", resp.StatusCode)
+	}
+}
+
+// TestGzipBodyPayloadInspected asserts the request-body decompression result
+// is actually inspected. A gzip-encoded body carrying a <script> payload must
+// be blocked (403) — before the engine consumed the decoded_body metadata, the
+// signatures only ever saw the compressed bytes (which never match) while the
+// backend would decompress and process the attack. The plaintext control is
+// already caught and proves the same payload is a real body-phase block.
+func TestGzipBodyPayloadInspected(t *testing.T) {
+	frontend, _, _, _, stop := newTestProxy(t)
+	defer stop()
+
+	payload := "<script>alert(document.cookie)</script>"
+
+	// Control: the same payload sent as a plaintext body must block.
+	resp, err := http.Post(frontend.URL+"/submit", "text/plain", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("plaintext post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("plaintext <script> body should block (403), got %d", resp.StatusCode)
+	}
+
+	// The real test: gzip the payload and declare Content-Encoding: gzip.
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write([]byte(payload)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, frontend.URL+"/submit", bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("Content-Encoding", "gzip")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("gzip post: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("gzip-encoded <script> body should block (403); got %d: %s", resp.StatusCode, b)
+	}
+}
+
+// TestBanCoversIPv6Prefix confirms a ban placed on one address in an IPv6 /64
+// covers any other address in that prefix — so an attacker cannot evade the
+// ban by rotating the low 64 bits. Exercised at the ban-list level since the
+// loopback httptest client cannot present arbitrary IPv6 sources.
+func TestBanCoversIPv6Prefix(t *testing.T) {
+	bl := core.NewBanList()
+	bl.Ban("2001:db8:abcd:1234::5", "scanner", time.Hour)
+	if !bl.IsBanned("2001:db8:abcd:1234::5") {
+		t.Fatalf("banned address itself must be banned")
+	}
+	if !bl.IsBanned("2001:db8:abcd:1234:dead:beef:cafe:f00d") {
+		t.Fatalf("a different host in the same /64 must be covered by the ban")
+	}
+	if bl.IsBanned("2001:db8:abcd:9999::5") {
+		t.Fatalf("a host in a DIFFERENT /64 must NOT be banned")
+	}
+	// IPv4 bans stay exact (/32).
+	bl.Ban("203.0.113.7", "scanner", time.Hour)
+	if !bl.IsBanned("203.0.113.7") {
+		t.Fatalf("IPv4 ban must match exactly")
+	}
+	if bl.IsBanned("203.0.113.8") {
+		t.Fatalf("IPv4 ban must not bleed to a neighbour")
 	}
 }
 

@@ -54,6 +54,11 @@ type WAFProxy struct {
 	sessions  *session.Tracker
 	gql       *graphql.Validator
 	audit     *audit.Chain
+	// banList is the shared, tamper-evident IP ban list. It is enforced at
+	// the very top of the ingress request path: a banned client IP is
+	// rejected before any inspection or backend contact. Nil-tolerant — when
+	// unset (e.g. in a minimal test harness) banning is simply not enforced.
+	banList *core.BanList
 	// ipExtractor encapsulates the trust_xff + trusted_proxies policy
 	// used to derive the real client IP. Always non-nil after
 	// construction; nil-safe for defensive callers.
@@ -104,6 +109,17 @@ func (wp *WAFProxy) AttachSessionTracker(t *session.Tracker) {
 		return
 	}
 	wp.sessions = t
+}
+
+// AttachBanList wires in the shared IP ban list so the ingress path can
+// reject banned clients. Without this, bans are written (and shown in the
+// dashboard / synced to peers) but never actually block a request. Pass nil
+// to leave ban enforcement off.
+func (wp *WAFProxy) AttachBanList(bl *core.BanList) {
+	if wp == nil {
+		return
+	}
+	wp.banList = bl
 }
 
 // AttachGraphQLValidator wires in the GraphQL validator used before the
@@ -682,6 +698,20 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	semaWait := time.Since(semaStart)
 
 	clientIP := wp.ipExtractor.ClientIP(r)
+
+	// Ban enforcement. A banned client IP is rejected here — before DDoS
+	// classification, rate limiting, zero-trust, the rule engine, and any
+	// backend contact. This is the stage that makes manual bans, threat-feed
+	// imports, mesh-synced peer bans, and auto-mitigation actually stop the
+	// offender they were created for; without it every Ban() call is
+	// decorative (listed in the dashboard, never blocking).
+	if wp.banList != nil && wp.banList.IsBanned(clientIP) {
+		w.Header().Set("Retry-After", "300")
+		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "BANNED", "client IP is banned", 100)
+		wp.auditWrite("ban_block", clientIP, "client IP is banned", "")
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
 
 	// DDoS detection: classify the request before we spend any effort on it.
 	// The detector tracks three independent signals (volumetric, per-IP
@@ -1742,8 +1772,21 @@ func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	// Dial through safeDialContext, NOT net.DialTimeout(r.Host): a raw dial
+	// performs a second, independent DNS resolution at connect time, so a
+	// rebinding record (TTL-0 / rotating answers) can pass the dangerReason
+	// validation above with a public IP and then resolve to 127.0.0.1 /
+	// 169.254.169.254 here. safeDialContext resolves through the same cache,
+	// re-runs classifyIP on the chosen address, and dials the LITERAL
+	// validated IP — pinning the connection so the CONNECT tunnel gets the
+	// same DNS-rebinding SSRF protection as the plain-HTTP egress path.
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	destConn, err := ep.safeDialContext(ctx, "tcp", r.Host)
 	if err != nil {
+		if ep.eng != nil {
+			ep.eng.LogError("egress: CONNECT dial blocked/failed for %s: %v", r.Host, err)
+		}
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
 	}

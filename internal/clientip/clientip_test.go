@@ -119,10 +119,13 @@ func TestIPv6Peer(t *testing.T) {
 	if got := e.ClientIP(r); got != "203.0.113.77" {
 		t.Fatalf("IPv6 trusted peer: %q", got)
 	}
-	// Same peer, no XFF — should return the bracketed IPv6 sans port.
+	// Same peer, no XFF — returns the IPv6 sans port, masked to its /64 key
+	// (ClientIP canonicalises IPv6 to /64 so a /64 sprayer can't mint
+	// unlimited per-IP keys). A clean masked address proves the port and
+	// brackets were stripped before parsing.
 	r2 := newReq("[2001:db8::1]:54321", "", "")
-	if got := e.ClientIP(r2); got != "2001:db8::1" {
-		t.Fatalf("IPv6 peer without XFF: %q", got)
+	if got := e.ClientIP(r2); got != "2001:db8::" {
+		t.Fatalf("IPv6 peer without XFF (expect /64 key): %q", got)
 	}
 }
 
@@ -286,7 +289,61 @@ func TestBracketedIPv6InXFF(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	r := newReq("10.0.0.5:1234", "[2001:db8::abcd]", "")
-	if got := e.ClientIP(r); got != "2001:db8::abcd" {
-		t.Fatalf("bracketed IPv6 in XFF should strip brackets: %q", got)
+	// Brackets are stripped, the entry parses as IPv6, and ClientIP returns
+	// the /64 key. A clean masked result is only reachable if the brackets
+	// were removed before parsing — so this still exercises bracket handling.
+	if got := e.ClientIP(r); got != "2001:db8::" {
+		t.Fatalf("bracketed IPv6 in XFF should strip brackets (expect /64 key): %q", got)
+	}
+}
+
+// TestNormalizeIPKey covers the per-client key canonicalisation: IPv4 is
+// unchanged (one /32 == one host) and IPv6 collapses to its /64 prefix so a
+// single end site cannot rotate the low 64 bits to mint unlimited keys.
+func TestNormalizeIPKey(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"203.0.113.7", "203.0.113.7"},                          // IPv4 unchanged
+		{"10.0.0.1", "10.0.0.1"},                                // IPv4 unchanged
+		{"2001:db8:abcd:1234::1", "2001:db8:abcd:1234::"},       // IPv6 -> /64
+		{"2001:db8:abcd:1234:ffff:ffff:ffff:ffff", "2001:db8:abcd:1234::"}, // top of /64 -> same key
+		{"2001:db8:abcd:1234::beef", "2001:db8:abcd:1234::"},    // different host, same /64
+		{"::1", "::"},                                           // IPv6 loopback -> /64 key
+		{"::ffff:1.2.3.4", "::ffff:1.2.3.4"},                    // IPv4-mapped treated as IPv4
+		{"not-an-ip", "not-an-ip"},                              // unparseable returned as-is
+		{"", ""},                                                // empty stays empty
+	}
+	for _, c := range cases {
+		if got := NormalizeIPKey(c.in); got != c.want {
+			t.Errorf("NormalizeIPKey(%q) = %q, want %q", c.in, got, c.want)
+		}
+		// Idempotent.
+		if got := NormalizeIPKey(NormalizeIPKey(c.in)); got != c.want {
+			t.Errorf("NormalizeIPKey not idempotent for %q: %q", c.in, got)
+		}
+	}
+	// Two distinct hosts in one /64 must produce the SAME key (the whole point).
+	a := NormalizeIPKey("2001:db8:abcd:1234::5")
+	b := NormalizeIPKey("2001:db8:abcd:1234:dead:beef:cafe:f00d")
+	if a != b {
+		t.Fatalf("two hosts in one /64 must share a key: %q != %q", a, b)
+	}
+}
+
+// TestLegacyXFFGarbageRejected confirms the legacy trust-all branch ignores a
+// non-IP X-Forwarded-For value and falls back to the real peer, so an attacker
+// cannot mint unlimited keys with random garbage headers.
+func TestLegacyXFFGarbageRejected(t *testing.T) {
+	e, err := New(true, nil) // trust_xff on, no trusted_proxies => legacy trust-all
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	r := newReq("203.0.113.50:1234", "garbage-not-an-ip-9f3a", "")
+	if got := e.ClientIP(r); got != "203.0.113.50" {
+		t.Fatalf("garbage XFF must fall back to peer, got %q", got)
+	}
+	// A VALID spoofed IP is still honoured in this (discouraged) legacy mode.
+	r2 := newReq("203.0.113.50:1234", "198.51.100.9", "")
+	if got := e.ClientIP(r2); got != "198.51.100.9" {
+		t.Fatalf("valid XFF in legacy mode should be honoured, got %q", got)
 	}
 }
