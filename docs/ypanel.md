@@ -61,8 +61,12 @@ the worker on an interval; ypanel reads them.
 | WEWAF engine: rules, DDoS detector, bans, `/metrics`, SSE, history store | **implemented** (this repo) |
 | Bundled React admin dashboard (`ui/`, `internal/web/dist`) | **removed** — node ships no local UI; the admin root redirects to ypanel |
 | ypanel WEWAF section (Sites/Rules/Events/Connectors/Settings) | **implemented** — honest demo today; fully operable in demo |
-| Node → worker snapshot reporter + operator job queue | **planned** — this doc defines the contract |
+| Node → worker snapshot reporter | **implemented** — the ypanel-agent (`--product wewaf --product-api :8443 --wewaf-admin-key`) reads this node's admin API and pushes a worker-valid snapshot (sites/rules/packs/events/bans) |
+| Operator job queue (ban controls applied to the node) | **implemented** — the agent applies `ban.add` / `ban.release` / `ban.purge` to `/api/bans`; rule/site-config verbs report an honest `ok:false` until the node exposes those endpoints |
 
-Until the operator-plane endpoints for WEWAF are deployed, ypanel's WEWAF
-screens run on honest **Demo data**. When they're live, ypanel switches to live
-reads with no panel change.
+The reporter is the [ypanel-agent](../../DireC/ypanel-agent) `--product wewaf`
+mode: it reads this node's admin API locally (the admin key never leaves the
+host) and pushes snapshots to the worker, which ypanel reads. Until an operator
+runs the agent against a node, ypanel's WEWAF screens run on honest **Demo
+data**; once a node checks in, ypanel switches to live reads with no panel
+change.

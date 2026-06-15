@@ -395,20 +395,39 @@ opened.
 
 ## Quick start
 
+Put WEWAF in front of a site in one command. It generates a strong admin key,
+writes a `config.json` pointed at your origin (admin API bound to loopback by
+default), builds the daemon, and prints the exact run command plus the
+ypanel-agent command to wire the node into the console:
+
 ```bash
-# Build and run the Go daemon from the repo root. There is no UI to build —
-# WEWAF is operated from ypanel.
-go build -o waf.exe ./cmd/waf
-./waf.exe -config config.json
+# Linux / macOS
+./scripts/quickstart.sh http://localhost:3000
+# Windows
+./scripts/quickstart.ps1 -Origin http://localhost:3000
 ```
 
-After startup the proxy listens on `:8080` and the admin API on `:8443`.
-Point your application traffic at `http://<host>:8080`. Operate the node from
-ypanel (`https://ypanel.yurillab.dev`, override with `ypanel_url` in the
-config); opening `http://<host>:8443` in a browser redirects there. The admin
-port serves the JSON API, Prometheus `/metrics`, and the SSE event stream the
-ypanel reporter consumes — keep it on a private interface or behind
-`WAF_API_KEY` in production.
+Or do it by hand:
+
+```bash
+go build -o waf.exe ./cmd/waf
+WAF_API_KEY="$(openssl rand -hex 32)" ./waf.exe -config config.json   # POSIX
+```
+
+After startup the proxy listens on `:8080` and the admin API on `:8443`
+(`127.0.0.1:8443` if you used the quickstart). Point your application traffic at
+`http://<host>:8080`. Operate the node from ypanel (`https://ypanel.yurillab.dev`,
+override with `ypanel_url`); opening the admin port in a browser redirects there.
+
+**Admin authentication is required.** The admin API (JSON + Prometheus
+`/metrics` + SSE) refuses to serve unless `WAF_API_KEY` is set to **at least 32
+bytes** of entropy. The only exception is local development: set
+`WAF_ALLOW_NO_AUTH=1` **and** bind `admin_addr` to loopback — any other
+combination is refused at startup. Keep the admin port on a private interface.
+
+To wire the node live into ypanel, run the [ypanel-agent](../DireC/ypanel-agent)
+on the host with `--product-api http://127.0.0.1:8443 --wewaf-admin-key <key>`;
+the admin key stays on the host and is never sent to the panel.
 
 ## Configuration
 
