@@ -545,6 +545,121 @@ func TestGzipBodyPayloadInspected(t *testing.T) {
 // covers any other address in that prefix — so an attacker cannot evade the
 // ban by rotating the low 64 bits. Exercised at the ban-list level since the
 // loopback httptest client cannot present arbitrary IPv6 sources.
+// TestResponseGzipLeakInspected confirms a gzip-compressed RESPONSE body is
+// decompressed before the response-phase leak rules run. A backend leaking a
+// PEM private key over Content-Encoding: gzip must be blocked (CRS-950140) — the
+// key must not reach the client. Before the fix, modifyResponse scanned the
+// compressed bytes (which never match) so the key sailed through. The client
+// sends Accept-Encoding: gzip so the WAF receives the body still compressed
+// (Go's transport only auto-inflates when IT added the header).
+func TestResponseGzipLeakInspected(t *testing.T) {
+	pemKey := "-----BEGIN PRIVATE KEY-----\n" +
+		strings.Repeat("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAo", 6) +
+		"\n-----END PRIVATE KEY-----\n"
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	if _, err := zw.Write([]byte("leading benign padding... " + pemKey)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	gzPayload := gz.Bytes()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(gzPayload)
+	}))
+	defer backend.Close()
+
+	cfg := config.Default()
+	cfg.BackendURL = backend.URL
+	cfg.Mode = "active"
+	cfg.ShaperEnabled = false
+	cfg.DecompressInspect = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("config validate: %v", err)
+	}
+	rs, err := rules.NewRuleSet(append(rules.DefaultRules(), rules.CRSRules()...))
+	if err != nil {
+		t.Fatalf("NewRuleSet: %v", err)
+	}
+	eng, err := engine.NewEngine(cfg, rs, &testLogger{t})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	bf := bruteforce.NewDetector(time.Minute)
+	defer bf.Stop()
+	wp, err := proxy.NewWAFProxy(cfg, eng, telemetry.NewMetrics(), bf)
+	if err != nil {
+		t.Fatalf("NewWAFProxy: %v", err)
+	}
+	frontend := httptest.NewServer(wp)
+	defer frontend.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, frontend.URL+"/secret-keys", nil)
+	req.Header.Set("Accept-Encoding", "gzip") // force the compressed (pre-fix uninspected) path
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	// If the WAF forwarded the original gzip stream, inflate it to check for leak.
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Encoding")), "gzip") {
+		if zr, e := gzip.NewReader(bytes.NewReader(body)); e == nil {
+			if dec, e2 := io.ReadAll(zr); e2 == nil {
+				body = dec
+			}
+		}
+	}
+	if bytes.Contains(body, []byte("BEGIN PRIVATE KEY")) {
+		t.Fatalf("gzip response leaked the PEM private key past the WAF (status %d, rule %q)",
+			resp.StatusCode, resp.Header.Get("X-WAF-Rule-ID"))
+	}
+}
+
+// TestEgressChunkedBodyOverLimitRejected confirms a CHUNKED egress request
+// body over EgressMaxBodyBytes is rejected (413) rather than silently truncated
+// and forwarded. The ContentLength guard can't see a chunked body's size
+// (ContentLength == -1), so without the LimitReader(limit+1) + 413 check, the
+// body was cut to exactly the limit and what got inspected differed from what
+// was sent — letting exfil content past the cutoff slip by.
+func TestEgressChunkedBodyOverLimitRejected(t *testing.T) {
+	cfg := config.Default()
+	cfg.EgressBlockPrivateIPs = false // skip DNS resolution; isolate the body check
+	cfg.EgressMaxBodyBytes = 16
+	rs, err := rules.NewRuleSet(rules.DefaultRules())
+	if err != nil {
+		t.Fatalf("NewRuleSet: %v", err)
+	}
+	eng, err := engine.NewEngine(cfg, rs, &testLogger{t})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	ep := proxy.NewEgressProxy(cfg, eng, telemetry.NewMetrics(), core.NewBanList())
+	srv := httptest.NewServer(ep)
+	defer srv.Close()
+	addr := strings.TrimPrefix(srv.URL, "http://")
+
+	// Chunked POST whose body (32 bytes) exceeds the 16-byte cap. 0x20 == 32.
+	chunked := "20\r\n" + strings.Repeat("A", 32) + "\r\n0\r\n\r\n"
+	raw := "POST /exfil HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Transfer-Encoding: chunked\r\n" +
+		"Connection: close\r\n\r\n" + chunked
+	conn, err := rawDial(addr, raw)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	status := readStatusLine(t, conn)
+	if !strings.Contains(status, "413") {
+		t.Fatalf("oversized chunked egress body must be rejected (413), got %q", status)
+	}
+}
+
 func TestBanCoversIPv6Prefix(t *testing.T) {
 	bl := core.NewBanList()
 	bl.Ban("2001:db8:abcd:1234::5", "scanner", time.Hour)

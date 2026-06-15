@@ -1129,13 +1129,38 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 		return err
 	}
 
-	if intr := wp.eng.ProcessResponseBody(tx, inspectBody); intr != nil {
+	// Decompress a Content-Encoding'd response prefix for INSPECTION ONLY.
+	// Without this, gzip/br/deflate responses (the common case once an attacker
+	// sends Accept-Encoding: gzip, which is forwarded to the origin) bypass the
+	// response-phase leak rules and the credential-redaction regex, because the
+	// engine scans compressed bytes that never match. We inspect the decoded
+	// prefix but forward the ORIGINAL compressed stream unchanged. Gated on the
+	// same decompress_inspect flag as the request path; res.Uncompressed means
+	// Go's transport already inflated the body, so we leave it alone.
+	scanBody := inspectBody
+	compressed := false
+	if wp.cfg.DecompressInspect && !res.Uncompressed {
+		if decoded, reason := maybeDecompressBody(res.Header, inspectBody,
+			wp.cfg.DecompressRatioCap, wp.cfg.MaxDecompressBytes); reason == "" && len(decoded) > 0 {
+			scanBody = decoded
+			compressed = true
+		}
+	}
+
+	if intr := wp.eng.ProcessResponseBody(tx, scanBody); intr != nil {
 		wp.recordBlockFromResponse(tx, intr)
 		return wp.replaceWithSynthetic(res, intr)
 	}
 
-	// Redact leaked credentials from the response body before forwarding.
-	inspectBody = credLeakRE.ReplaceAll(inspectBody, []byte("${1}=[REDACTED]"))
+	// Redact leaked credentials before forwarding. This only works on a
+	// plaintext body we pass through as-is; a compressed body was inspected
+	// (decoded) for BLOCK decisions above but cannot be redacted in place
+	// without re-compressing, so we forward it unredacted — the block path
+	// already neutralises the worst case (e.g. a PEM private key replaces the
+	// whole response).
+	if !compressed {
+		inspectBody = credLeakRE.ReplaceAll(inspectBody, []byte("${1}=[REDACTED]"))
+	}
 	res.Header.Del("Content-Length")
 	res.ContentLength = -1
 
@@ -1625,13 +1650,25 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if limit <= 0 {
 			limit = 10 * 1024 * 1024
 		}
-		limited := io.LimitReader(r.Body, limit)
+		// Read limit+1 so we can DETECT (not silently truncate) a body over the
+		// cap. The ContentLength guard above only fires for a known positive
+		// length; a CHUNKED request (ContentLength == -1) bypasses it, so
+		// without the +1 an oversized chunked body would be truncated to `limit`
+		// and forwarded — inspection would then run on a prefix that differs
+		// from what's sent, letting exfil content past the cutoff slip by.
+		limited := io.LimitReader(r.Body, limit+1)
 		var readErr error
 		body, readErr = io.ReadAll(limited)
 		_ = r.Body.Close()
 		if readErr != nil {
 			// Don't forward a truncated body as if it were complete.
 			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+		if int64(len(body)) > limit {
+			ep.recordEgressBlock(targetURL, "payload too large")
+			ep.eng.LogError("egress: blocked request to %s: payload too large (chunked over limit)", targetURL)
+			http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
