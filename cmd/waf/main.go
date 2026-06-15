@@ -472,6 +472,11 @@ func main() {
 	var powAdaptive *pow.AdaptiveTier
 	if cfg.PoWEnabled && cfg.PoWAdaptiveEnabled && powIssuer != nil {
 		powAdaptive = pow.NewAdaptiveTier(powIssuer)
+		powAdaptive.Configure(uint32(cfg.PoWAdaptiveTier2Failures), uint8(cfg.PoWAdaptiveTier2PenaltyBits))
+		// Wire it into the proxy that SERVES the gate so Recommend (per-IP
+		// fail-rate + load + tier-2) sets the difficulty; the web verify handler
+		// records solve outcomes into the same tier (RecordFailure/Success).
+		wp.AttachPoWAdaptive(powAdaptive)
 		log.Printf("pow: adaptive tier-2 enabled (failures=%d penalty=%d bits)",
 			cfg.PoWAdaptiveTier2Failures, cfg.PoWAdaptiveTier2PenaltyBits)
 	}

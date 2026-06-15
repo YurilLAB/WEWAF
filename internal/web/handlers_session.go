@@ -379,6 +379,12 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 		if s.proxy != nil {
 			s.proxy.IncPoWRejected()
 		}
+		// Feed the adaptive tier so repeated failed solves from one IP escalate
+		// its future difficulty (and trip the tier-2 penalty). Without this the
+		// gate cost stays flat no matter how much an attacker grinds it.
+		if s.powAdapt != nil {
+			s.powAdapt.RecordFailure(clientIP)
+		}
 		http.Error(w, reason, http.StatusBadRequest)
 		return
 	}
@@ -422,6 +428,11 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.proxy != nil {
 		s.proxy.IncPoWVerified()
+	}
+	// A successful solve decays this IP's failure counter in the adaptive tier
+	// (and clears any tier-2 escalation once it drops below threshold).
+	if s.powAdapt != nil {
+		s.powAdapt.RecordSuccess(clientIP)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

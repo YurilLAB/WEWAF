@@ -72,6 +72,22 @@ func NewAdaptiveTier(issuer *Issuer) *AdaptiveTier {
 	}
 }
 
+// Configure overrides the Tier-2 escalation parameters from operator config.
+// Non-positive values keep the baked-in defaults. Call once at startup before
+// the tier is shared with request handlers (it is not lock-protected because
+// the fields are only read on the hot path, never written there).
+func (a *AdaptiveTier) Configure(tier2Failures uint32, tier2PenaltyBits uint8) {
+	if a == nil {
+		return
+	}
+	if tier2Failures > 0 {
+		a.tier2Failures = tier2Failures
+	}
+	if tier2PenaltyBits > 0 {
+		a.tier2Penalty = tier2PenaltyBits
+	}
+}
+
 // SetLoadHint takes a 0..1 system-load value (typically derived from
 // DDoSDetector.Stats() — fraction of windows in attack state). Concurrent-
 // safe; cheaper than a config reload because it's hit on every Issue.

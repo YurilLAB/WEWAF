@@ -76,6 +76,10 @@ type WAFProxy struct {
 	// Proof-of-work issuer for high-risk session challenges. Nil when
 	// disabled; threshold is read directly from cfg on each request.
 	pow *pow.Issuer
+	// powAdapt layers per-IP fail-rate, global load, and tier-2 "you've been
+	// bad" escalation on top of the base Issuer difficulty. Nil when adaptive
+	// PoW is off; servePoWChallenge falls back to the base SuggestDifficulty.
+	powAdapt *pow.AdaptiveTier
 
 	// Counters (atomic so admin-API reads don't contend with hot path).
 	ja3Inspect    atomic.Uint64
@@ -162,6 +166,16 @@ func (wp *WAFProxy) AttachPoW(p *pow.Issuer) {
 		return
 	}
 	wp.pow = p
+}
+
+// AttachPoWAdaptive wires the adaptive difficulty tier so the gate escalates
+// per-IP on repeated failed solves and globally under attack load. Pass nil to
+// keep the base (risk-score-only) difficulty.
+func (wp *WAFProxy) AttachPoWAdaptive(a *pow.AdaptiveTier) {
+	if wp == nil {
+		return
+	}
+	wp.powAdapt = a
 }
 
 // IPExtractor returns the proxy's client-IP extractor so other

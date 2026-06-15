@@ -211,3 +211,56 @@ func TestIsPoWBypassPathCoversChallengeAssets(t *testing.T) {
 		t.Fatal("normal path should not bypass")
 	}
 }
+
+// TestPowDifficultyUsesAdaptiveTier is the regression guard for the adaptive
+// PoW wiring: with an AdaptiveTier attached, repeated failed solves from an IP
+// must raise its challenge difficulty (it was previously a flat
+// SuggestDifficulty no matter how much an attacker ground the gate). With no
+// tier attached, it must equal the base SuggestDifficulty.
+func TestPowDifficultyUsesAdaptiveTier(t *testing.T) {
+	iss, err := pow.NewIssuer([]byte("adaptive-wiring-secret-32-bytes!!"), 18, 30, time.Minute)
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	wp := &WAFProxy{cfg: &config.Config{PoWEnabled: true}, pow: iss}
+
+	// No adaptive tier -> base map.
+	if got, want := wp.powDifficulty("203.0.113.5", 70), iss.SuggestDifficulty(70); got != want {
+		t.Fatalf("without adaptive tier, difficulty should equal SuggestDifficulty: got=%d want=%d", got, want)
+	}
+
+	// Attach the tier and escalate one IP via repeated failures.
+	adapt := pow.NewAdaptiveTier(iss)
+	adapt.Configure(3, 5)
+	wp.AttachPoWAdaptive(adapt)
+	const ip = "203.0.113.5"
+	base := wp.powDifficulty(ip, 70)
+	adapt.RecordFailure(ip)
+	adapt.RecordFailure(ip)
+	adapt.RecordFailure(ip)
+	escalated := wp.powDifficulty(ip, 70)
+	if escalated <= base {
+		t.Fatalf("adaptive tier must escalate difficulty after failures: base=%d escalated=%d", base, escalated)
+	}
+}
+
+// TestPowAdaptiveConfigureAppliesTier2 confirms Configure overrides the tier-2
+// penalty so the operator's config is honoured (it was previously only logged).
+func TestPowAdaptiveConfigureAppliesTier2(t *testing.T) {
+	// max must be <= 32 (issuer safety cap); 28 leaves headroom for tier-2 bits.
+	iss, err := pow.NewIssuer([]byte("adaptive-wiring-secret-32-bytes!!"), 18, 28, time.Minute)
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	small := pow.NewAdaptiveTier(iss)
+	small.Configure(2, 1) // +1 bit penalty
+	big := pow.NewAdaptiveTier(iss)
+	big.Configure(2, 8) // +8 bit penalty
+	for _, a := range []*pow.AdaptiveTier{small, big} {
+		a.RecordFailure("9.9.9.9")
+		a.RecordFailure("9.9.9.9")
+	}
+	if big.Recommend("9.9.9.9", 50, 0) <= small.Recommend("9.9.9.9", 50, 0) {
+		t.Fatalf("a larger configured tier-2 penalty must yield higher difficulty")
+	}
+}

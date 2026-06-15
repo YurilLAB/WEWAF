@@ -113,7 +113,7 @@ func (wp *WAFProxy) servePoWChallenge(w http.ResponseWriter, r *http.Request, sc
 		return
 	}
 
-	difficulty := wp.pow.SuggestDifficulty(score)
+	difficulty := wp.powDifficulty(ip, score)
 	tok, ser, err := wp.pow.Issue(difficulty)
 	if err != nil {
 		// RNG failure is the only documented Issue() error; fail open
@@ -140,6 +140,25 @@ func (wp *WAFProxy) servePoWChallenge(w http.ResponseWriter, r *http.Request, sc
 	wp.metrics.RecordBlockWithCategory(ip, r.Method, r.URL.Path,
 		"POW-ISSUED", "pow",
 		fmt.Sprintf("pow gate fired (difficulty=%d score=%d)", difficulty, score), 0)
+}
+
+// powDifficulty selects the challenge bit-count for an IP at a given session
+// risk score. When the adaptive tier is wired it composes the base risk->bits
+// difficulty with per-IP recent fail-rate, global attack load (fed from the
+// DDoS detector), and the tier-2 "you've been bad" penalty — so a client
+// grinding the gate or a fleet under attack faces escalating cost instead of a
+// flat floor. Without the adaptive tier it falls back to the base map. rareFP
+// is 0 until JA4 popularity is wired (see the JA3N/JA4 task).
+func (wp *WAFProxy) powDifficulty(ip string, score int) uint8 {
+	if wp.powAdapt != nil {
+		if wp.ddos != nil && wp.ddos.IsUnderAttack() {
+			wp.powAdapt.SetLoadHint(1)
+		} else {
+			wp.powAdapt.SetLoadHint(0)
+		}
+		return wp.powAdapt.Recommend(ip, score, 0)
+	}
+	return wp.pow.SuggestDifficulty(score)
 }
 
 // allowPoWIssuance decides whether ip is permitted another challenge
