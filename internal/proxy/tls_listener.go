@@ -39,13 +39,16 @@ func JA3TLSConfig(base *tls.Config, cache *ja3.Cache) (*tls.Config, bool, error)
 		// tlsdial version can never bring the listener down.
 		defer func() { _ = recover() }()
 
-		jaString, jaHash := ja3.FromClientHello(chi)
-		if jaHash != "" && chi != nil && chi.Conn != nil {
-			cache.Put(chi.Conn.RemoteAddr().String(), ja3.Fingerprint{
-				Hash:    jaHash,
-				String:  jaString,
-				Version: 0, // computed inside ja3.Compute
-			})
+		// Compute the FULL fingerprint (classic JA3 + JA3N + JA4), not just
+		// classic JA3. Classic JA3 is unstable for Chrome 110+ (per-handshake
+		// extension shuffling) and trivially mimicked; JA3N (sorted extensions)
+		// and JA4 are the spoofing-resistant forms the detector and the UA↔TLS
+		// anomaly check rely on. Storing the whole fingerprint is what lets
+		// inspectJA3 call EvaluateAll instead of matching one churny hash.
+		fp := ja3.FullFromClientHello(chi)
+		if (fp.Hash != "" || fp.JA4 != "") && chi != nil && chi.Conn != nil {
+			cache.Put(chi.Conn.RemoteAddr().String(), fp)
+			hookStats.captures.Add(1)
 		}
 		if prev != nil {
 			return prev(chi)

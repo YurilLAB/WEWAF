@@ -72,6 +72,10 @@ type WAFProxy struct {
 	ja3Detector *ja3.Detector
 	ja3Trust    *ja3.TrustChecker
 	ja3Header   string
+	// ja3Anomaly flags UA↔TLS-fingerprint disagreements (UA claims a browser
+	// but the JA3/JA4 is a CLI tool). Stateless; its score bump is folded into
+	// the session score. Non-nil after construction.
+	ja3Anomaly *ja3.AnomalyDetector
 
 	// Proof-of-work issuer for high-risk session challenges. Nil when
 	// disabled; threshold is read directly from cfg on each request.
@@ -191,9 +195,9 @@ func (wp *WAFProxy) IPExtractor() *clientip.Extractor {
 // JA3 returns the fingerprint observed for r, plus the detector verdict.
 // Returns ("","") if JA3 is disabled or no fingerprint is available
 // (handshake not seen, edge header missing/untrusted). Never panics.
-func (wp *WAFProxy) inspectJA3(r *http.Request) (hash string, verdict ja3.Verdict) {
+func (wp *WAFProxy) inspectJA3(r *http.Request) (fp ja3.Fingerprint, verdict ja3.Verdict) {
 	if wp == nil || wp.ja3Detector == nil || r == nil {
-		return "", ja3.Verdict{}
+		return ja3.Fingerprint{}, ja3.Verdict{}
 	}
 	defer func() {
 		// JA3 must never crash the proxy. Cache lookups touch a map under
@@ -202,32 +206,43 @@ func (wp *WAFProxy) inspectJA3(r *http.Request) (hash string, verdict ja3.Verdic
 		// change could regress that. Belt and braces.
 		if rec := recover(); rec != nil {
 			wp.eng.LogError("proxy: panic in inspectJA3: %v", rec)
-			hash, verdict = "", ja3.Verdict{}
+			fp, verdict = ja3.Fingerprint{}, ja3.Verdict{}
 		}
 	}()
 	// Native: native TLS cache lookup keyed by RemoteAddr. Use the cache
 	// in priority over the trusted header — own observation is more
-	// trustworthy than anything proxied through.
+	// trustworthy than anything proxied through. The cache now holds the
+	// full fingerprint (JA3 + JA3N + JA4), so we evaluate ALL forms — JA4 and
+	// JA3N are stable where classic JA3 churns for modern Chrome.
+	fromCache := false
 	if wp.ja3Cache != nil {
-		if fp, ok := wp.ja3Cache.Get(r.RemoteAddr); ok {
-			hash = fp.Hash
+		if cached, ok := wp.ja3Cache.Get(r.RemoteAddr); ok {
+			fp = cached
+			fromCache = true
 		}
 	}
-	if hash == "" && wp.ja3Header != "" {
-		hash = ja3.HashFromHeader(r, wp.ja3Header, wp.ja3Trust)
+	if !fromCache && wp.ja3Header != "" {
+		if h := ja3.HashFromHeader(r, wp.ja3Header, wp.ja3Trust); h != "" {
+			fp = ja3.Fingerprint{Hash: h}
+		}
 	}
-	if hash == "" {
-		return "", ja3.Verdict{}
+	if fp.Hash == "" && fp.JA4 == "" {
+		return ja3.Fingerprint{}, ja3.Verdict{}
 	}
 	wp.ja3Inspect.Add(1)
-	verdict = wp.ja3Detector.Evaluate(hash)
+	if fromCache {
+		verdict = wp.ja3Detector.EvaluateAll(fp)
+	} else {
+		// Header path carries only a classic JA3 hash.
+		verdict = wp.ja3Detector.Evaluate(fp.Hash)
+	}
 	if verdict.Match == "bad" {
 		wp.ja3MatchBad.Add(1)
 		if verdict.Blocked {
 			wp.ja3Blocked.Add(1)
 		}
 	}
-	return hash, verdict
+	return fp, verdict
 }
 
 // applyHeadersForTest mirrors the response-header injection path for
@@ -472,6 +487,11 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 		}),
 	}
 
+	// UA↔TLS anomaly detector — stateless, cheap, always on. It only fires
+	// inside the JA3 inspection block (gated by ja3Detector), so it costs
+	// nothing when JA3 is disabled.
+	wp.ja3Anomaly = ja3.NewAnomalyDetector()
+
 	wp.proxy = httputil.NewSingleHostReverseProxy(backend)
 	// A reverse proxy left on DefaultTransport has no per-connection timeouts
 	// and no pool caps — a slow backend can park proxy goroutines for the full
@@ -643,9 +663,31 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// any error (panic/lookup miss) — JA3 is a *signal*, never the sole
 	// reason to block.
 	if wp.ja3Detector != nil {
-		if hash, verdict := wp.inspectJA3(r); hash != "" {
+		if fp, verdict := wp.inspectJA3(r); fp.Hash != "" || fp.JA4 != "" {
+			hash := fp.Hash
 			if sessID != "" {
-				wp.sessions.RecordJA3(sessID, hash, verdict.Match, verdict.Reason)
+				// Track drift on the spoofing-resistant JA4 when present (it is
+				// stable where classic JA3 churns for modern Chrome); fall back
+				// to the JA3 hash. This stops legit Chrome from accruing false
+				// drift while still catching a session arriving on a new stack.
+				driftKey := fp.JA4
+				if driftKey == "" {
+					driftKey = hash
+				}
+				wp.sessions.RecordJA3(sessID, driftKey, verdict.Match, verdict.Reason)
+			}
+			// UA↔TLS anomaly: a UA claiming a browser while the JA3/JA4 is a CLI
+			// tool is a strong, low-FP automation tell that neither signal
+			// catches alone. Fold its bump into the session score (never blocks
+			// on its own). Runs on the cache path where the full fingerprint
+			// (incl. JA4 ALPN/version) is available.
+			if wp.ja3Anomaly != nil && sessID != "" {
+				if ar := wp.ja3Anomaly.Check(r.UserAgent(), fp); ar.ScoreBump > 0 {
+					wp.sessions.RecordUAAnomaly(sessID, ar.ScoreBump, ar.HumanReason)
+					ip := wp.ipExtractor.ClientIP(r)
+					wp.metrics.RecordBlockWithCategory(ip, r.Method, r.URL.Path,
+						"JA3-UA-ANOMALY", "ja3", "ua/tls disagreement: "+ar.HumanReason, 0)
+				}
 			}
 			if verdict.Blocked {
 				ip := wp.ipExtractor.ClientIP(r)

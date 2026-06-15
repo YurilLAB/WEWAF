@@ -35,6 +35,7 @@ const beaconImplausibleEventsPerSec = 100
 //   - Block ratio:          up to +30 (blocks ÷ requests, min 5 reqs)
 //   - JA3 verdict bad:      +15
 //   - JA3 drift:            +25 per drift, capped +50 (high-signal cookie sharing)
+//   - UA↔TLS anomaly:       up to +25 (UA claims a browser, JA3/JA4 says a CLI tool)
 //
 // Plus a time-decay step: scoreDecayPerMin points fade per minute of
 // inactivity so a session that earned a spike from one bad burst
@@ -185,6 +186,13 @@ func (t *Tracker) Score(id string) int {
 			bump = 50
 		}
 		score += bump
+	}
+
+	// UA↔TLS-fingerprint disagreement (e.g. UA claims Chrome, JA3/JA4 is curl).
+	// Capped at +25 by the detector; a low-FP automation tell that no single
+	// signal catches on its own.
+	if s.UAAnomalyBump > 0 {
+		score += s.UAAnomalyBump
 	}
 
 	if score > 100 {

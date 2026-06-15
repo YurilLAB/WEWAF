@@ -521,3 +521,34 @@ func TestBlockRatioRequiresMinSample(t *testing.T) {
 		t.Fatalf("post-sample block bump must apply: low=%d high=%d", low, high)
 	}
 }
+
+// TestUAAnomalyBumpsScore confirms a recorded UA↔TLS-fingerprint disagreement
+// is folded into the session risk score, that only the highest bump is kept
+// (not summed across requests), and that a zero bump is a no-op.
+func TestUAAnomalyBumpsScore(t *testing.T) {
+	tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute, MaxSessions: 1000})
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/", nil)
+	s := tr.EnsureSession(w, r)
+	if s == nil {
+		t.Fatal("EnsureSession returned nil")
+	}
+	id := s.ID
+
+	before := tr.Score(id)
+	tr.RecordUAAnomaly(id, 20, "ua-claims-browser-ja3-curl")
+	after := tr.Score(id)
+	if after < before+20 {
+		t.Fatalf("UA anomaly bump (20) must raise the score: before=%d after=%d", before, after)
+	}
+
+	// A weaker subsequent bump must NOT lower the score (we keep the max).
+	tr.RecordUAAnomaly(id, 5, "weaker")
+	if got := tr.Score(id); got < after {
+		t.Fatalf("a lower bump must not reduce the kept anomaly score: was=%d now=%d", after, got)
+	}
+
+	// Zero/negative bumps are no-ops and must not panic.
+	tr.RecordUAAnomaly(id, 0, "")
+	tr.RecordUAAnomaly("", 30, "no-such-session")
+}

@@ -91,6 +91,14 @@ type Session struct {
 	FirstJA3   string
 	JA3Drifts  int
 
+	// UAAnomalyBump is the highest UA↔TLS-fingerprint disagreement score this
+	// session has shown (e.g. a UA claiming Chrome while the JA3/JA4 is curl).
+	// A disagreement between two independent signals is a strong, low-FP
+	// automation tell; the bump is folded into the risk score. UAAnomalyReason
+	// records the matched tags for the admin UI.
+	UAAnomalyBump   int
+	UAAnomalyReason string
+
 	// PoW state. PowPassedAt non-zero means the proof-of-work gate was
 	// cleared and the session is allowed through even at high score.
 	PowPassedAt time.Time
@@ -493,6 +501,25 @@ func (t *Tracker) RecordJA3(id, hash, verdict, reason string) {
 		s.JA3 = hash
 		s.JA3Verdict = verdict
 		s.JA3Reason = reason
+	}
+	t.mu.Unlock()
+}
+
+// RecordUAAnomaly folds a UA↔TLS-fingerprint disagreement into the session.
+// We keep the HIGHEST bump observed (not a sum) so repeated requests from the
+// same anomalous client don't runaway-inflate the score, while a single strong
+// disagreement still contributes its full weight. A zero/negative bump is a
+// no-op so the caller can pass the AnomalyResult straight through.
+func (t *Tracker) RecordUAAnomaly(id string, bump int, reason string) {
+	if t == nil || id == "" || bump <= 0 {
+		return
+	}
+	t.mu.Lock()
+	if s, ok := t.sessions[id]; ok {
+		if bump > s.UAAnomalyBump {
+			s.UAAnomalyBump = bump
+			s.UAAnomalyReason = reason
+		}
 	}
 	t.mu.Unlock()
 }
