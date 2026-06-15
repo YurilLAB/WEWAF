@@ -71,9 +71,9 @@ func New(cfg *config.Config, conn *connection.Manager, hist *history.Store, sslM
 func (c *Checker) CheckDNS(ctx context.Context, domain, expectedIP string) CheckResult {
 	now := time.Now().UTC()
 	res := CheckResult{Step: "dns", At: now}
-	if domain == "" {
+	if reason := guardProbeDomain(domain); reason != "" {
 		res.Status = StatusFail
-		res.Message = "no domain provided"
+		res.Message = reason
 		return res
 	}
 	resolver := net.Resolver{}
@@ -84,6 +84,16 @@ func (c *Checker) CheckDNS(ctx context.Context, domain, expectedIP string) Check
 		res.Status = StatusFail
 		res.Message = fmt.Sprintf("DNS lookup failed: %v", err)
 		return res
+	}
+	// SSRF guard: refuse to reflect or act on a domain that resolves to an
+	// internal address. Without this, the authenticated /api/setup/checks/dns
+	// endpoint is an oracle for mapping the WAF host's internal network.
+	for _, ip := range ips {
+		if isInternalIP(ip) {
+			res.Status = StatusFail
+			res.Message = fmt.Sprintf("%s resolves to an internal address; refusing to probe", domain)
+			return res
+		}
 	}
 	addrs := make([]string, 0, len(ips))
 	for _, ip := range ips {
@@ -200,19 +210,28 @@ func (c *Checker) CheckSSL(ctx context.Context, domain string) CheckResult {
 		return res
 	}
 
-	// Bonus: live TLS probe if the caller supplied a domain and it's
-	// DNS-resolvable to an address we can dial.
+	// Bonus: live TLS probe if the caller supplied a domain. SSRF-guarded —
+	// the domain must be a hostname that resolves to an EXTERNAL address, and
+	// we dial that resolved literal IP (ServerName still set to the hostname
+	// so certificate verification is correct) so the probe cannot be steered
+	// to an internal TLS service via a literal IP or a rebinding record.
 	if domain != "" {
-		dialer := &tls.Dialer{Config: &tls.Config{ServerName: domain, MinVersion: tls.VersionTLS12}}
-		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		conn, err := dialer.DialContext(probeCtx, "tcp", domain+":443")
-		if err == nil {
-			defer conn.Close()
-			if tlsConn, ok := conn.(*tls.Conn); ok {
-				state := tlsConn.ConnectionState()
-				res.Detail["tls_version"] = state.Version
-				res.Detail["negotiated_protocol"] = state.NegotiatedProtocol
+		if reason := guardProbeDomain(domain); reason != "" {
+			res.Detail["tls_probe_skipped"] = reason
+		} else if extIP, perr := c.firstExternalIP(ctx, domain); perr != nil {
+			res.Detail["tls_probe_skipped"] = perr.Error()
+		} else {
+			dialer := &tls.Dialer{Config: &tls.Config{ServerName: domain, MinVersion: tls.VersionTLS12}}
+			probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			conn, err := dialer.DialContext(probeCtx, "tcp", net.JoinHostPort(extIP.String(), "443"))
+			if err == nil {
+				defer conn.Close()
+				if tlsConn, ok := conn.(*tls.Conn); ok {
+					state := tlsConn.ConnectionState()
+					res.Detail["tls_version"] = state.Version
+					res.Detail["negotiated_protocol"] = state.NegotiatedProtocol
+				}
 			}
 		}
 	}
@@ -369,3 +388,52 @@ var _ = url.Parse
 var _ = errors.New
 var _ = runtime.GOOS
 var _ = rules.DefaultRules
+
+// --- SSRF guards for caller-supplied probe targets ------------------------
+
+// isInternalIP reports whether ip is in a range the authenticated setup probes
+// must refuse to reach: loopback, private (RFC1918 / IPv6 ULA), link-local
+// (including the 169.254.169.254 cloud-metadata address), or unspecified.
+// Without this guard /api/setup/checks/dns and /ssl are an SSRF oracle: an
+// operator-token holder (or anyone, under WAF_ALLOW_NO_AUTH) could resolve or
+// dial arbitrary internal hosts from the WAF's trusted network position and
+// read the result back from the reflected response.
+func isInternalIP(ip net.IP) bool {
+	return ip == nil || ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+// guardProbeDomain rejects an empty or literal-IP probe target. A literal IP
+// would let a caller bypass DNS and point the probe straight at an internal
+// address; only hostnames are accepted, and their resolved IPs are then
+// screened with isInternalIP.
+func guardProbeDomain(domain string) string {
+	d := strings.TrimSpace(domain)
+	if d == "" {
+		return "no domain provided"
+	}
+	if net.ParseIP(strings.Trim(d, "[]")) != nil {
+		return "literal IP targets are not allowed; provide a hostname"
+	}
+	return ""
+}
+
+// firstExternalIP resolves domain and returns the first address that is NOT an
+// internal range, or an error if resolution fails or every address is internal.
+// The returned literal IP is what callers should dial (with ServerName pinned
+// to the hostname) so a rebinding record can't swap in an internal address
+// between validation and connect.
+func (c *Checker) firstExternalIP(ctx context.Context, domain string) (net.IP, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(probeCtx, "ip", domain)
+	if err != nil {
+		return nil, fmt.Errorf("dns resolution failed: %w", err)
+	}
+	for _, ip := range ips {
+		if !isInternalIP(ip) {
+			return ip, nil
+		}
+	}
+	return nil, fmt.Errorf("%s resolves only to internal addresses", domain)
+}

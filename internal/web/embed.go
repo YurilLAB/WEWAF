@@ -1,6 +1,7 @@
 package web
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"strconv"
@@ -67,6 +69,12 @@ type Server struct {
 	errMu     sync.Mutex
 	errBuf    []ErrorEvent
 	errBufCap int
+
+	// adminAuthFailures counts rejected admin API-key attempts so operators
+	// can alert on admin-auth brute force. An atomic counter (not an audit
+	// append per failure) keeps this observability O(1) and immune to being
+	// turned into a write-amplification DoS by an attacker spraying bad keys.
+	adminAuthFailures atomic.Uint64
 }
 
 // ErrorEvent is one recorded engine error surfaced to the UI.
@@ -358,7 +366,12 @@ func (s *Server) ypanelURL() string {
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	expected := os.Getenv("WAF_API_KEY")
 	allowNoAuth := os.Getenv("WAF_ALLOW_NO_AUTH") == "1"
-	expectedBytes := []byte(expected)
+	// Compare SHA-256 digests, not the raw keys: subtle.ConstantTimeCompare
+	// short-circuits on a length mismatch, so comparing raw keys leaks the
+	// configured key length through timing. Hashing both sides to a fixed
+	// 32 bytes makes the comparison constant-time regardless of the submitted
+	// key's length, removing the length oracle.
+	expectedHash := sha256.Sum256([]byte(expected))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if expected == "" {
 			if allowNoAuth {
@@ -371,7 +384,9 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			return
 		}
 		key := r.Header.Get("X-API-Key")
-		if key == "" || subtle.ConstantTimeCompare([]byte(key), expectedBytes) != 1 {
+		keyHash := sha256.Sum256([]byte(key))
+		if key == "" || subtle.ConstantTimeCompare(keyHash[:], expectedHash[:]) != 1 {
+			s.adminAuthFailures.Add(1)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -1048,6 +1063,7 @@ func (s *Server) handleBans(w http.ResponseWriter, r *http.Request) {
 		// above. /api/bans is a high-blast-radius endpoint; rejecting
 		// surprise fields means a future code reader can't accidentally
 		// add a field that an attacker has already been smuggling.
+		r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&payload); err != nil {
@@ -1143,6 +1159,7 @@ func (s *Server) handleConnectionConfig(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, s.connection.ConfigSnapshot())
 	case http.MethodPut, http.MethodPost:
 		var patch connection.Config
+		r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 		if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
@@ -1884,6 +1901,7 @@ func (s *Server) handleAutoMitigate(w http.ResponseWriter, r *http.Request) {
 		Threshold   int `json:"threshold"`
 		DurationSec int `json:"duration_sec"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	if req.Threshold <= 0 {
 		req.Threshold = 10
@@ -2075,6 +2093,10 @@ func (s *Server) handleZeroTrustPolicies(w http.ResponseWriter, r *http.Request)
 		var payload struct {
 			Policies []*zerotrust.Policy `json:"policies"`
 		}
+		// Cap the policy bundle. This is the largest admin write surface (an
+		// arbitrarily long slice of pointer structs), so it was the worst-case
+		// memory-exhaustion vector; 512 KiB is far above any real policy set.
+		r.Body = http.MaxBytesReader(w, r.Body, 512*1024)
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
@@ -2108,6 +2130,7 @@ func (s *Server) handleSetupCheckDNS(w http.ResponseWriter, r *http.Request) {
 			Domain     string `json:"domain"`
 			ExpectedIP string `json:"expected_ip"`
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		if payload.Domain != "" {
 			domain = payload.Domain
@@ -2172,6 +2195,7 @@ func (s *Server) handleSetupCheckAll(w http.ResponseWriter, r *http.Request) {
 			Domain     string `json:"domain"`
 			ExpectedIP string `json:"expected_ip"`
 		}
+		r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 		_ = json.NewDecoder(r.Body).Decode(&p)
 		if p.Domain != "" {
 			domain = p.Domain
@@ -2206,13 +2230,18 @@ func (s *Server) handleHealthDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.watchdog == nil {
-		writeJSON(w, map[string]interface{}{"overall": "unknown", "subsystems": []watchdog.Health{}})
+		writeJSON(w, map[string]interface{}{
+			"overall":             "unknown",
+			"subsystems":          []watchdog.Health{},
+			"admin_auth_failures": s.adminAuthFailures.Load(),
+		})
 		return
 	}
 	writeJSON(w, map[string]interface{}{
-		"overall":    s.watchdog.Overall(),
-		"failures":   s.watchdog.Failures(),
-		"subsystems": s.watchdog.Snapshot(),
+		"overall":             s.watchdog.Overall(),
+		"failures":            s.watchdog.Failures(),
+		"subsystems":          s.watchdog.Snapshot(),
+		"admin_auth_failures": s.adminAuthFailures.Load(),
 	})
 }
 

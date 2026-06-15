@@ -83,6 +83,25 @@ func main() {
 			cfg.AdminAddr)
 	}
 
+	// Fail closed on the dangerous no-auth-on-exposed-admin combination, and
+	// reject a weak admin key. WAF_ALLOW_NO_AUTH=1 serves the entire admin
+	// surface (config writes, bans, SSL upload, mesh, zero-trust) with NO
+	// authentication — it is a local-dev escape hatch only and must never be
+	// combined with a non-loopback admin bind, where the whole network could
+	// reach it. A short WAF_API_KEY is brute-forceable, so enforce a floor.
+	if os.Getenv("WAF_ALLOW_NO_AUTH") == "1" && os.Getenv("WAF_API_KEY") == "" {
+		if !isLoopbackListenAddr(cfg.AdminAddr) {
+			log.Fatalf("refusing to start: WAF_ALLOW_NO_AUTH=1 disables admin authentication, "+
+				"but admin_addr=%q is not loopback. Set WAF_API_KEY (>=32 random bytes) or bind "+
+				"admin_addr to 127.0.0.1.", cfg.AdminAddr)
+		}
+		log.Printf("WARN: WAF_ALLOW_NO_AUTH=1 — admin API authentication is DISABLED (loopback bind only)")
+	}
+	if k := os.Getenv("WAF_API_KEY"); k != "" && len(k) < 32 {
+		log.Fatalf("refusing to start: WAF_API_KEY is too short (%d bytes); use at least 32 random "+
+			"bytes (e.g. `openssl rand -hex 32`).", len(k))
+	}
+
 	if err := limits.Apply(cfg.MaxCPUCores, cfg.MaxMemoryMB); err != nil {
 		log.Fatalf("failed to apply resource limits: %v", err)
 	}
@@ -933,4 +952,21 @@ func isWildcardListenAddr(addr string) bool {
 		return true
 	}
 	return false
+}
+
+// isLoopbackListenAddr reports whether addr binds ONLY to the loopback
+// interface (127.0.0.0/8, ::1, or "localhost"). Used to gate the
+// WAF_ALLOW_NO_AUTH dev escape hatch — disabling admin auth is only
+// acceptable when nothing off-box can reach the admin port.
+func isLoopbackListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// ":8443" / no-host form binds the wildcard, not loopback.
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.EqualFold(host, "localhost")
 }
