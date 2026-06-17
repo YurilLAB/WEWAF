@@ -120,10 +120,10 @@ func (e *Extractor) ClientIP(r *http.Request) string {
 	// configured. Walk left-most so existing single-CDN setups keep
 	// the same observable behaviour.
 	if c.trustedAll {
-		if v := leftmostXFF(r); v != "" {
+		if v := leftmostXFF(r); validIP(v) {
 			return v
 		}
-		if v := strings.TrimSpace(r.Header.Get("X-Real-Ip")); v != "" {
+		if v := strings.TrimSpace(r.Header.Get("X-Real-Ip")); validIP(v) {
 			return v
 		}
 		return peer
@@ -147,20 +147,32 @@ func (e *Extractor) ClientIP(r *http.Request) string {
 			if h == "" {
 				continue
 			}
+			// A hop that doesn't parse as an IP is client-injected garbage
+			// (e.g. "X-Forwarded-For: not-an-ip" to corrupt the rate-limit
+			// key). Skip it rather than returning it as the client IP — the
+			// previous code returned any non-trusted token verbatim, which
+			// let an attacker behind a trusted proxy rotate arbitrary keys to
+			// dodge per-IP rate-limits and bans.
+			if !validIP(h) {
+				continue
+			}
 			if !ipInNets(h, c.trustedNets) {
 				return h
 			}
 		}
-		// Every hop was trusted — fall back to the left-most non-empty.
+		// Every hop was trusted (or invalid) — fall back to the left-most
+		// entry that is a valid IP.
 		for _, h := range hops {
-			if h != "" {
+			if validIP(h) {
 				return h
 			}
 		}
 	}
-	if v := strings.TrimSpace(r.Header.Get("X-Real-Ip")); v != "" {
-		// X-Real-Ip is single-valued and only emitted by edge proxies,
-		// so when the peer is trusted we accept it as-is.
+	if v := strings.TrimSpace(r.Header.Get("X-Real-Ip")); validIP(v) {
+		// X-Real-Ip is single-valued and only emitted by edge proxies, so
+		// when the peer is trusted we accept it — but only if it actually
+		// parses as an IP. An unvalidated value here would become the
+		// rate-limit / ban key, so a forged non-IP string must not pass.
 		return v
 	}
 	return peer
@@ -268,6 +280,16 @@ func splitXFF(xff string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// validIP reports whether s parses as an IPv4 or IPv6 address. Forwarding
+// headers are attacker-influenced, so any value used as a client-IP (and
+// therefore as a rate-limit / ban / metrics key) must pass this first.
+func validIP(s string) bool {
+	if s == "" {
+		return false
+	}
+	return net.ParseIP(s) != nil
 }
 
 func ipInNets(ipStr string, nets []*net.IPNet) bool {

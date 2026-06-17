@@ -166,6 +166,70 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 	targets := map[string]string{
 		"body": body,
 	}
+
+	// Decompressed body inspection. When DecompressInspect is enabled the
+	// proxy decodes a gzip/brotli request body and stores the plaintext
+	// under "decoded_body" *specifically so body rules can run against the
+	// content the backend will actually process*. The raw "body" target is
+	// the compressed bytes, which match no signature — so without inspecting
+	// the decoded form here, any attack wrapped in Content-Encoding: gzip
+	// bypasses every body rule. Keyed as "body.decoded" so existing rules
+	// that target "body" match it via the evaluator's prefix rule, with no
+	// rule changes required. Only added when it differs from the raw body so
+	// a single match can't be scored twice.
+	if val, ok := tx.MetadataValue("decoded_body"); ok {
+		if b, ok := val.([]byte); ok && len(b) > 0 && string(b) != body {
+			targets["body.decoded"] = string(b)
+		}
+	}
+
+	// Form-urlencoded body decoding. Query-string args are URL-decoded and
+	// homoglyph-folded before matching (see buildRequestHeaderTargets); the
+	// raw body is not. So `comment=%3Cscript%3E...` in an
+	// application/x-www-form-urlencoded POST reaches the backend decoded to
+	// `<script>...` while the engine only ever saw the percent-encoded form —
+	// a clean bypass of every body/args rule. Parse the body the same way the
+	// backend will and expose each value under an "args.NAME" key so the
+	// existing arg/body signatures fire. Bounded to maxFormFields so a body
+	// packed with parameters can't blow up the target map.
+	if e.isFormURLEncoded(tx.Request) && body != "" {
+		const maxFormFields = 256
+		if values, err := url.ParseQuery(body); err == nil {
+			added := 0
+			for k, vs := range values {
+				if added >= maxFormFields {
+					e.logger.Warnf("engine: form-field limit (%d) reached", maxFormFields)
+					break
+				}
+				decoded := strings.Join(vs, ", ")
+				targets["args."+k] = FoldHomoglyphs(Canonicalize(decoded))
+				added++
+			}
+		}
+	}
+
+	// gRPC string-field inspection. The DPI layer extracts printable runs
+	// from protobuf frames into "grpc_targets" so XSS/SQLi signatures get a
+	// chance to fire on string fields that the framing bytes would otherwise
+	// split apart. Each run is fed under a "body.grpc.N" key (matched by the
+	// "body" prefix rule). Capped so a frame full of short runs can't blow up
+	// the target map.
+	if val, ok := tx.MetadataValue("grpc_targets"); ok {
+		if runs, ok := val.([]string); ok {
+			const maxGRPCTargets = 256
+			for i, s := range runs {
+				if i >= maxGRPCTargets {
+					e.logger.Warnf("engine: gRPC target limit (%d) reached", maxGRPCTargets)
+					break
+				}
+				if s == "" {
+					continue
+				}
+				targets[fmt.Sprintf("body.grpc.%d", i)] = s
+			}
+		}
+	}
+
 	return e.evaluatePhase(tx, core.PhaseRequestBody, targets)
 }
 
@@ -597,6 +661,16 @@ func (e *Engine) readBodyString(r *http.Request) (string, error) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 	return string(body), nil
+}
+
+// isFormURLEncoded reports whether the request body is
+// application/x-www-form-urlencoded so it can be parsed into args targets.
+func (e *Engine) isFormURLEncoded(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	return strings.HasPrefix(ct, "application/x-www-form-urlencoded")
 }
 
 func trunc(s string, n int) string {

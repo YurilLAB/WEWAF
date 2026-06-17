@@ -108,6 +108,43 @@ func TestTrustedPeerAllHopsTrusted(t *testing.T) {
 	}
 }
 
+// TestForgedNonIPHeadersRejected — an attacker transiting a trusted proxy
+// sends a non-IP X-Real-Ip / XFF token to corrupt the derived client IP
+// (which keys rate-limits, bans, and metrics). The extractor must reject the
+// garbage and fall back to a real value rather than honour it verbatim.
+func TestForgedNonIPHeadersRejected(t *testing.T) {
+	// Strict mode: trusted peer, but X-Real-Ip is junk and there is no XFF.
+	// Must fall back to the peer, not return "admin".
+	e, err := New(true, []string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	r := newReq("10.0.0.5:54321", "", "admin")
+	if got := e.ClientIP(r); got != "10.0.0.5" {
+		t.Fatalf("forged non-IP X-Real-Ip must not be honoured, got %q", got)
+	}
+
+	// Strict mode: attacker injects a non-IP token as the left-most XFF
+	// entry, the real client sits next to it, the trusted hop is closest.
+	// The garbage must be skipped and the genuine untrusted IP returned —
+	// never the "not-an-ip" token.
+	r2 := newReq("10.0.0.5:54321", "not-an-ip, 203.0.113.99, 10.0.0.7", "")
+	if got := e.ClientIP(r2); got != "203.0.113.99" {
+		t.Fatalf("forged non-IP XFF hop must be skipped, got %q", got)
+	}
+
+	// Legacy mode (trust_xff, no allowlist): a garbage left-most XFF must
+	// not become the key; fall through to a valid value.
+	eLegacy, err := New(true, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	r3 := newReq("203.0.113.10:54321", "garbage", "8.8.8.8")
+	if got := eLegacy.ClientIP(r3); got != "8.8.8.8" {
+		t.Fatalf("legacy: garbage XFF should fall back to valid X-Real-Ip, got %q", got)
+	}
+}
+
 // TestIPv6Peer covers the IPv6 SplitHostPort path that the previous
 // hand-rolled LastIndexByte parsers got wrong.
 func TestIPv6Peer(t *testing.T) {
