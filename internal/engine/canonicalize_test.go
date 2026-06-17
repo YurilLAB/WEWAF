@@ -18,6 +18,27 @@ func TestCanonicalizeCollapsesEncoding(t *testing.T) {
 	}
 }
 
+// TestCanonicalizeFoldsOverlongUTF8 covers the traversal-evasion class where
+// "%c0%af" / "%e0%80%af" etc. decode to invalid bytes that dodge the literal
+// "../" rules. After folding, the canonical form contains real slashes/dots.
+func TestCanonicalizeFoldsOverlongUTF8(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		// %c0%af -> '/', so "..%c0%af.." canonicalises with real slashes.
+		{"..%c0%af..%c0%afetc%c0%afpasswd", "../../etc/passwd"},
+		// %e0%80%ae -> '.'
+		{"%e0%80%ae%e0%80%ae%c0%afetc", "../etc"},
+		// classic IIS %c1%9c -> '/'
+		{"..%c1%9c..%c1%9cwindows", "../../windows"},
+	}
+	for _, c := range cases {
+		if got := Canonicalize(c.in); got != c.want {
+			t.Errorf("Canonicalize(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestCanonicalizePathResolvesTraversal(t *testing.T) {
 	cases := []struct {
 		in, want string

@@ -45,6 +45,21 @@ func NewRuleSet(raw []core.Rule) (*RuleSet, error) {
 	return rs, nil
 }
 
+// cmdInjectionPattern matches a shell metacharacter (";", "|", backtick,
+// newline, or the "&&" / "||" operators) followed by a common Unix command.
+// Single "&" is intentionally excluded — it is the URL/form parameter
+// separator and would false-positive on "&id=5"-style input. The command
+// ends on a word boundary so prose like "to id the file" (a space, not a
+// metacharacter, before the word) does not match. Used by RCE-014 (body
+// phase) and RCE-015 (header phase) to cover both body and query-arg
+// command injection.
+var cmdInjectionPattern = "(?i)(?:[;|`\\n]|&&|\\|\\|)\\s*" +
+	"(?:id|whoami|uname|hostname|ifconfig|ipconfig|netstat|pwd|printenv|crontab|" +
+	"dmesg|lsof|mount|umount|iptables|systemctl|nslookup|traceroute|tracert|ping|" +
+	"ls|dir|cat|head|tail|grep|egrep|fgrep|find|locate|chmod|chown|rm|mkdir|rmdir|" +
+	"touch|ps|kill|killall|pkill|base64|xxd|od|strings|md5sum|sha1sum|sha256sum|" +
+	"arp|route|ifup|ifdown|service|nmap|dig)\\b"
+
 // DefaultRules returns the built-in high-value signatures.
 func DefaultRules() []core.Rule {
 	return []core.Rule{
@@ -114,6 +129,14 @@ func DefaultRules() []core.Rule {
 		{ID: "SSRF-003", Name: "SSRF Dangerous Protocol", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dangerous protocol in request", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(dict|gopher|ftp|tftp|ldap)://`},
 		{ID: "SSRF-004", Name: "SSRF File Protocol", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "File protocol in request", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)file://`},
 		{ID: "SSRF-005", Name: "SSRF IP Bypass", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "SSRF IP address bypass", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)http://(0[./]|0177\.|0x7f)`},
+		// Decimal / integer-encoded IP host, e.g. http://2130706433/ ==
+		// 127.0.0.1. A documented SSRF filter bypass: SSRF-005 caught the
+		// hex/octal forms but not the dotless decimal integer. A bare 8-10
+		// digit host has no legitimate use, so blocking is FP-safe. SSRF-007
+		// runs in the body phase (form/JSON bodies); SSRF-008 in the header
+		// phase so ?url=http://2130706433/ in a GET query is also caught.
+		{ID: "SSRF-007", Name: "SSRF Decimal IP (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dotless decimal/integer-encoded IP host in URL", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)https?://(?:0x[0-9a-f]{6,8}|0[0-7]{8,11}|\d{8,10})(?:[:/?#]|$)`},
+		{ID: "SSRF-008", Name: "SSRF Decimal IP (args/uri)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Dotless decimal/integer-encoded IP host in query args", Targets: []string{"args", "uri"}, Pattern: `(?i)https?://(?:0x[0-9a-f]{6,8}|0[0-7]{8,11}|\d{8,10})(?:[:/?#]|$)`},
 
 		// === HTTP Smuggling ===
 		{ID: "SMUG-001", Name: "HTTP Smuggling TE.CL", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Transfer-Encoding + Content-Length conflict", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic, not regex
@@ -387,6 +410,26 @@ func DefaultRules() []core.Rule {
 		{ID: "RCE-011", Name: "bash curl|sh", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Classic curl ... | (sh|bash) install pattern", Targets: []string{"args", "body"}, Pattern: `(?i)(?:curl|wget|fetch)\s+[^|&]{3,}\s*\|\s*(?:sh|bash|zsh|python|perl|ruby|php)\b`},
 		{ID: "RCE-012", Name: "Shellshock", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Bash Shellshock (CVE-2014-6271) function definition", Targets: []string{"headers"}, Pattern: `\(\s*\)\s*\{\s*[:_].*?\}\s*;`},
 		{ID: "RCE-013", Name: "Python one-liner revshell", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Python socket-based reverse shell one-liner", Targets: []string{"args", "body"}, Pattern: `(?i)python.{0,20}-c.{0,50}(?:socket|subprocess).{0,100}(?:connect|dup2)`},
+		// Unix command injection: a shell metacharacter immediately followed
+		// by a common command. RCE-003 only covers a small binary list and
+		// requires a trailing space, so recon one-liners like ";id", "| id",
+		// "&& whoami", "; ls -la /" slipped through (confirmed by the engine
+		// fuzz corpus). Aligned with OWASP CRS 932160. The trigger set is
+		// deliberately {; | backtick newline && ||} and NOT a bare "&" —
+		// single "&" is the URL/form parameter separator, so allowing it
+		// would false-positive on "&id=5"-style query strings. The command
+		// ends on a word boundary so prose ("to id the file", "chmod the
+		// chicken") with a space — not a metacharacter — before the word does
+		// not match. Two phases mirror the SQLi rules: RCE-014 inspects the
+		// buffered body, RCE-015 inspects query args / the URI.
+		{ID: "RCE-014", Name: "Unix command injection (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Shell metacharacter followed by a common Unix command", Targets: []string{"args", "body"}, Pattern: cmdInjectionPattern},
+		{ID: "RCE-015", Name: "Unix command injection (args/uri)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Shell metacharacter followed by a common Unix command in query args", Targets: []string{"args", "uri"}, Pattern: cmdInjectionPattern},
+		// Ruby / JSP "#{...}" string interpolation probe. The dangerous
+		// variants (with java/runtime/exec) are blocked by EL-001; this
+		// log-only rule flags the bare interpolation canary ("#{7*7}") that
+		// EL-001 misses. Kept ActionLog + a word/operator inside the braces so
+		// it doesn't fire on every "#{" that appears in posted SCSS/Ruby code.
+		{ID: "SSTI-RUBY-001", Name: "Ruby/JSP interpolation probe", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "#{...} template interpolation with an expression", Targets: []string{"args", "body"}, Pattern: `#\{[^}]*[-+*/0-9][^}]*\}`},
 
 		// --- Request shape anomalies ---
 		// ANOM-001 (GET with body) was removed in 2026-04 — as a pure regex

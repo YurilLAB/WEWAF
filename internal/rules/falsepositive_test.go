@@ -144,6 +144,25 @@ var legitCases = []caseInput{
 	{name: "scroll_tracking_event", phase: core.PhaseRequestBody, targets: map[string]string{
 		"body": `{"event":"scroll","depth":0.75,"page":"/docs/intro"}`,
 	}},
+	// Form body whose parameters are separated by a single "&", with an
+	// "id" parameter — the dominant shape that a careless command-injection
+	// rule using "&" as a trigger would false-positive on.
+	{name: "form_with_id_and_ps_params", phase: core.PhaseRequestBody, targets: map[string]string{
+		"body":     "user=alice&id=42&ps=1&ls_view=grid&cat=books",
+		"args.id":  "42",
+		"args.cat": "books",
+	}},
+	{name: "query_with_id_and_pipe_prose", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":    "/search?q=jobs+%7C+careers+%7C+apply&id=99",
+		"path":   "/search",
+		"args.q": "jobs | careers | apply",
+		"args.id": "99",
+	}},
+	// Large integer that is NOT an http:// host — must not trip the decimal
+	// SSRF rule (which requires the http(s):// prefix).
+	{name: "large_numeric_ids_body", phase: core.PhaseRequestBody, targets: map[string]string{
+		"body": `{"order_id":2130706433,"timestamp":1700000000,"ref":"https://example.com:8080/v1/orders/12345678"}`,
+	}},
 }
 
 // maliciousCases — inputs that MUST fire at least one rule. Confirms we
@@ -224,6 +243,26 @@ var maliciousCases = []caseInput{
 		"path":               "/",
 		"method":             "GET",
 		"headers.User-Agent": "Nuclei - Open-source project (github.com/projectdiscovery/nuclei)",
+	}},
+	// Unix command injection — recon one-liners that RCE-003 missed.
+	{name: "cmd_injection_pipe_id", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":      "/run?host=x%7C+id",
+		"path":     "/run",
+		"args.host": "x| id",
+	}},
+	{name: "cmd_injection_semicolon_whoami_body", phase: core.PhaseRequestBody, targets: map[string]string{
+		"body":     "host=8.8.8.8;whoami",
+		"args.host": "8.8.8.8;whoami",
+	}},
+	{name: "cmd_injection_and_operator_body", phase: core.PhaseRequestBody, targets: map[string]string{
+		"body":     "x=1&&ping -c 1 evil.com",
+		"args.x":   "1",
+	}},
+	// SSRF via decimal-encoded IP (127.0.0.1 == 2130706433).
+	{name: "ssrf_decimal_ip_query", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":      "/fetch?url=http://2130706433/latest/meta-data/",
+		"path":     "/fetch",
+		"args.url": "http://2130706433/latest/meta-data/",
 	}},
 }
 

@@ -37,6 +37,7 @@ func Canonicalize(s string) string {
 		}
 		out = dec
 	}
+	out = foldOverlongUTF8(out)
 	out = strings.ReplaceAll(out, "\\", "/")
 	if strings.IndexByte(out, 0) >= 0 {
 		out = strings.ReplaceAll(out, "\x00", "")
@@ -212,6 +213,36 @@ func HasObfuscatedTransferEncoding(values []string) bool {
 		}
 	}
 	return false
+}
+
+// foldOverlongUTF8 maps the overlong / invalid UTF-8 encodings of '/', '\'
+// and '.' to their ASCII forms so path-traversal rules still match after the
+// canonicalizer's URL-decode pass. Attackers send "%c0%af" / "%e0%80%af" etc.
+// because url.QueryUnescape decodes them into raw invalid bytes (0xC0 0xAF …)
+// that no longer match the literal "../" patterns; legacy backends (old IIS /
+// Tomcat) then re-interpret them as a slash. These exact byte sequences are
+// invalid UTF-8 and never occur in legitimate text, so the mapping cannot
+// introduce false positives.
+func foldOverlongUTF8(s string) string {
+	if strings.IndexByte(s, 0xC0) < 0 && strings.IndexByte(s, 0xC1) < 0 &&
+		!strings.Contains(s, "\xe0\x80") && !strings.Contains(s, "\xf0\x80\x80") {
+		return s
+	}
+	replacer := strings.NewReplacer(
+		// overlong '/'
+		"\xc0\xaf", "/",
+		"\xe0\x80\xaf", "/",
+		"\xf0\x80\x80\xaf", "/",
+		// overlong '\' (incl. the classic IIS %c1%9c)
+		"\xc1\x9c", "/",
+		"\xc0\x9c", "/",
+		"\xe0\x80\x9c", "/",
+		// overlong '.'
+		"\xc0\xae", ".",
+		"\xe0\x80\xae", ".",
+		"\xf0\x80\x80\xae", ".",
+	)
+	return replacer.Replace(s)
 }
 
 func collapseSlashes(s string) string {
