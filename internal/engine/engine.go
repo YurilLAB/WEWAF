@@ -73,6 +73,21 @@ func (e *Engine) Reload(rs *rules.RuleSet) {
 var (
 	headlessUARe = regexp.MustCompile(`(?i)(headlesschrome|phantomjs|selenium|webdriver|puppeteer|playwright|cypress)`)
 	toolUARe     = regexp.MustCompile(`(?i)(scrapy|curl|wget|python-requests|java|libwww|httpclient|okhttp|axios)`)
+
+	// crlfInjectionRe detects HTTP response-splitting / header-injection in the
+	// RAW (still percent-encoded) request target: an encoded or literal CR/LF
+	// — single, paired, or multiply-encoded (%0d, %0a, %250d, …) — followed by
+	// an HTTP-header-like "token:". Requiring the trailing header token keeps
+	// legitimate multi-line GET parameters (plain "%0a"-separated text) from
+	// matching, while catching "%0d%0aSet-Cookie:", "%0d%0aLocation:", etc.
+	crlfInjectionRe = regexp.MustCompile(`(?i)(?:%(?:25)*0[ad]|[\r\n])(?:%(?:25)*0[ad]|[\r\n])?(?:%(?:25)*20|\+|\s)*[a-z][a-z0-9-]{1,40}\s*(?:%(?:25)*3a|:)`)
+
+	// nullByteRe detects a NUL byte in the RAW request target — encoded
+	// (%00, %2500, …) or literal. The canonicalizer strips NUL before rules
+	// run, hiding null-byte injection (CWE-158, e.g. "shell.php%00.jpg" to
+	// truncate an extension check). A NUL in a URL has no legitimate use, so
+	// flagging it cannot cause false positives.
+	nullByteRe = regexp.MustCompile(`(?i)%(?:25)*00|\x00`)
 )
 
 // DetectBot analyzes the request for bot signatures.
@@ -424,6 +439,47 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 	case core.PhaseRequestHeaders:
 		if tx.Request == nil {
 			return matches
+		}
+
+		// CRLF / HTTP response-splitting in the raw request target. The
+		// canonicalizer URL-decodes "%0d%0a" and then normalises the resulting
+		// CR/LF to spaces, so by the time the CRLF-001 regex sees a query arg
+		// the evidence is gone. Inspect the RAW request-target (still
+		// percent-encoded) instead. We only flag a CR/LF that is followed by a
+		// header-like "token:" (the OWASP CRS 921160 approach) so a legitimate
+		// multi-line value in a GET parameter does not false-positive.
+		rawURI := tx.Request.RequestURI
+		if rawURI == "" && tx.Request.URL != nil {
+			rawURI = tx.Request.URL.RequestURI()
+		}
+		if crlfInjectionRe.MatchString(rawURI) {
+			addMatch(core.Match{
+				RuleID:    "CRLF-002",
+				RuleName:  "CRLF Header Injection",
+				Phase:     phase,
+				Target:    "uri",
+				Value:     trunc(rawURI, 64),
+				Score:     80,
+				Action:    core.ActionBlock,
+				Message:   "CR/LF followed by header injection in request target",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
+		// NUL-byte injection in the raw request target (canonicalisation strips
+		// it before the rule engine sees it).
+		if nullByteRe.MatchString(rawURI) {
+			addMatch(core.Match{
+				RuleID:    "NULL-001",
+				RuleName:  "Null Byte Injection",
+				Phase:     phase,
+				Target:    "uri",
+				Value:     trunc(rawURI, 64),
+				Score:     80,
+				Action:    core.ActionBlock,
+				Message:   "NUL byte in request target",
+				Timestamp: time.Now().UTC(),
+			})
 		}
 
 		// HTTP Smuggling: Transfer-Encoding + Content-Length
