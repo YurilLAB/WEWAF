@@ -167,6 +167,19 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 		"body": body,
 	}
 
+	// Whitespace / zero-width normalized body. The raw "body" target is kept
+	// verbatim so structural rules that rely on exact bytes (e.g. the SMUG
+	// chunked-smuggling rules that match literal "\r\n0\r\n") still fire. This
+	// adds a parallel normalized view so injection rules also catch the
+	// "UNION\vSELECT" / "U​NION" / NBSP-separator evasions that the raw
+	// body would slip past (RE2 \s excludes \v, and the body is otherwise
+	// matched un-normalized). Added only when normalization actually changed
+	// something, so ordinary ASCII bodies cost nothing extra. Keyed under
+	// "body.norm" so it is matched by the "body" target prefix.
+	if norm := NormalizeForMatch(body); norm != body {
+		targets["body.norm"] = norm
+	}
+
 	// Decompressed body inspection. When DecompressInspect is enabled the
 	// proxy decodes a gzip/brotli request body and stores the plaintext
 	// under "decoded_body" *specifically so body rules can run against the

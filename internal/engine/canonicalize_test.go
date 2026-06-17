@@ -64,6 +64,47 @@ func TestCanonicalizePreservesSchemeSlashes(t *testing.T) {
 	}
 }
 
+// TestCanonicalizeNormalizesWhitespace guards the fix where control chars were
+// deleted (merging "UNION\nSELECT" into "UNIONSELECT") and \v/\f slipped past
+// RE2's \s class. Whitespace-class runes must become a single ASCII space so
+// keyword boundaries survive; zero-width/format runes must still be removed.
+func TestCanonicalizeNormalizesWhitespace(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"UNION\nSELECT", "UNION SELECT"},
+		{"UNION\rSELECT", "UNION SELECT"},
+		{"UNION\x0cSELECT", "UNION SELECT"}, // form feed
+		{"UNION\x0bSELECT", "UNION SELECT"}, // vertical tab
+		{"UNION\tSELECT", "UNION SELECT"},   // tab
+		{"a b", "a b"},                      // NBSP
+		{"U​NION", "UNION"},                 // ZWSP deleted (keyword reassembles)
+	}
+	for _, c := range cases {
+		if got := Canonicalize(c.in); got != c.want {
+			t.Errorf("Canonicalize(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestNormalizeForMatch covers the body-normalization helper: Unicode
+// compatibility + homoglyph folding + whitespace collapse, but NO URL-decode.
+func TestNormalizeForMatch(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"ＵＮＩＯＮ ＳＥＬＥＣＴ", "UNION SELECT"},    // fullwidth -> ASCII via NFKC
+		{"sеlеct", "select"},                // Cyrillic e -> ASCII
+		{"UNION\x0bSELECT", "UNION SELECT"}, // vertical tab -> space
+		{"a%20b", "a%20b"},                  // NOT url-decoded (body must stay intact)
+	}
+	for _, c := range cases {
+		if got := NormalizeForMatch(c.in); got != c.want {
+			t.Errorf("NormalizeForMatch(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestCanonicalizePathResolvesTraversal(t *testing.T) {
 	cases := []struct {
 		in, want string
@@ -146,13 +187,13 @@ func TestFoldHomoglyphsLowercaseGreek(t *testing.T) {
 		in   string
 		want string
 	}{
-		{"αlert", "alert"},   // Greek small alpha
-		{"κey", "key"},       // Greek small kappa
+		{"αlert", "alert"}, // Greek small alpha
+		{"κey", "key"},     // Greek small kappa
 		{"ρassword", "password"},
-		{"μser", "user"},     // Greek small mu (looks like Latin u)
-		{"νode", "vode"},     // Greek small nu (looks like v)
-		{"τest", "test"},     // Greek small tau
-		{"χss", "xss"},       // Greek small chi
+		{"μser", "user"}, // Greek small mu (looks like Latin u)
+		{"νode", "vode"}, // Greek small nu (looks like v)
+		{"τest", "test"}, // Greek small tau
+		{"χss", "xss"},   // Greek small chi
 	}
 	for _, tc := range cases {
 		got := FoldHomoglyphs(tc.in)
