@@ -137,6 +137,19 @@ func DefaultRules() []core.Rule {
 		// phase so ?url=http://2130706433/ in a GET query is also caught.
 		{ID: "SSRF-007", Name: "SSRF Decimal IP (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dotless decimal/integer-encoded IP host in URL", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)https?://(?:0x[0-9a-f]{6,8}|0[0-7]{8,11}|\d{8,10})(?:[:/?#]|$)`},
 		{ID: "SSRF-008", Name: "SSRF Decimal IP (args/uri)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Dotless decimal/integer-encoded IP host in query args", Targets: []string{"args", "uri"}, Pattern: `(?i)https?://(?:0x[0-9a-f]{6,8}|0[0-7]{8,11}|\d{8,10})(?:[:/?#]|$)`},
+		// Header-phase SSRF coverage for the QUERY STRING. SSRF-001..006 and
+		// CLOUD-001/002 list "args" as a target but run in the body phase, so
+		// they only see form-parsed POST args — a GET ?url=http://127.0.0.1/
+		// or ?url=http://169.254.170.2/ slipped straight through (verified by
+		// a header-phase probe). These mirror the body-phase patterns at the
+		// header phase. They target "args" only (the parsed query params), NOT
+		// "uri", so an app's own path (e.g. /devices/192.168.1.1/status or a
+		// legitimate /metadata/instance route) does not false-positive — only
+		// a private/loopback IP, dangerous protocol, or metadata endpoint that
+		// appears inside a request PARAMETER is blocked.
+		{ID: "SSRF-010", Name: "SSRF Private/Loopback IP (args)", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Private/loopback/link-local IP in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})`},
+		{ID: "SSRF-011", Name: "SSRF Dangerous Protocol (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Dangerous URL scheme in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(dict|gopher|ftp|tftp|ldap|file)://`},
+		{ID: "SSRF-012", Name: "SSRF Metadata Endpoint (args)", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Cloud metadata endpoint or path in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(169\.254\.169\.254|169\.254\.170\.2|100\.100\.100\.200|192\.0\.0\.192|metadata\.google\.internal|metadata\.azure\.com|/latest/(?:meta-data|user-data|dynamic)|/computeMetadata/|/metadata/(?:instance|identity)|api-version=[^&]*metadata)`},
 
 		// === HTTP Smuggling ===
 		{ID: "SMUG-001", Name: "HTTP Smuggling TE.CL", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Transfer-Encoding + Content-Length conflict", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic, not regex

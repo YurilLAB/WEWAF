@@ -230,7 +230,61 @@ func TestCorpusAllBlocked(t *testing.T) {
 	}
 }
 
-// TestFuzzCorpusReport is exploratory: it logs every payload not blocked in
+// TestSSRFQueryStringBlocked asserts that SSRF payloads delivered in a GET
+// query parameter are blocked at the header phase. The body-phase SSRF rules
+// list "args" as a target but never see query-string args, so this guards the
+// header-phase coverage (SSRF-008/010/011/012) against regression.
+func TestSSRFQueryStringBlocked(t *testing.T) {
+	eng := newFuzzEngine(t)
+	payloads := []string{
+		"http://169.254.169.254/latest/meta-data/",
+		"http://metadata.google.internal/computeMetadata/v1/",
+		"http://127.0.0.1:8080/admin",
+		"http://192.168.1.1/",
+		"http://10.0.0.5/internal",
+		"http://172.16.0.1/",
+		"gopher://127.0.0.1:6379/_INFO",
+		"dict://127.0.0.1:11211/stats",
+		"http://169.254.170.2/v2/credentials",
+		"http://[::1]/admin",
+		"http://2130706433/",
+		"/latest/meta-data/iam/security-credentials/",
+		"/metadata/instance?api-version=2021-02-01",
+	}
+	for _, p := range payloads {
+		p := p
+		t.Run(p, func(t *testing.T) {
+			if !blockedInArg(eng, p) {
+				t.Errorf("query-string SSRF not blocked at header phase: %q", p)
+			}
+		})
+	}
+}
+
+// TestSSRFQueryStringNoFalsePositive confirms the header-phase SSRF rules do
+// not fire on legitimate query strings (public URLs/IPs, ordinary params).
+func TestSSRFQueryStringNoFalsePositive(t *testing.T) {
+	eng := newFuzzEngine(t)
+	legit := []string{
+		"https://app.example.com/dashboard",
+		"https://cdn.example.org/assets/logo.png",
+		"8.8.8.8",
+		"203.0.113.42",
+		"us-east-1",
+		"2021-02-01",
+		"/account/settings",
+		"order_12345678",
+	}
+	for _, p := range legit {
+		p := p
+		t.Run(p, func(t *testing.T) {
+			if blockedInArg(eng, p) {
+				t.Errorf("legitimate query param wrongly blocked as SSRF: %q", p)
+			}
+		})
+	}
+}
+
 // ANY placement so new evasions surface during development. It never fails.
 func TestFuzzCorpusReport(t *testing.T) {
 	eng := newFuzzEngine(t)

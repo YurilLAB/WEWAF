@@ -163,6 +163,19 @@ var legitCases = []caseInput{
 	{name: "large_numeric_ids_body", phase: core.PhaseRequestBody, targets: map[string]string{
 		"body": `{"order_id":2130706433,"timestamp":1700000000,"ref":"https://example.com:8080/v1/orders/12345678"}`,
 	}},
+	// Legitimate redirect/callback params with PUBLIC hosts/IPs must not trip
+	// the header-phase SSRF rules (SSRF-010/011/012).
+	{name: "legit_public_redirect_query", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":            "/login?redirect=https://app.example.com/dashboard",
+		"path":           "/login",
+		"args.redirect":  "https://app.example.com/dashboard",
+	}},
+	{name: "legit_public_ip_query", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":       "/lookup?ip=8.8.8.8&region=us-east-1",
+		"path":      "/lookup",
+		"args.ip":   "8.8.8.8",
+		"args.region": "us-east-1",
+	}},
 }
 
 // maliciousCases — inputs that MUST fire at least one rule. Confirms we
@@ -263,6 +276,28 @@ var maliciousCases = []caseInput{
 		"uri":      "/fetch?url=http://2130706433/latest/meta-data/",
 		"path":     "/fetch",
 		"args.url": "http://2130706433/latest/meta-data/",
+	}},
+	// SSRF delivered in a GET query parameter (header phase). These were
+	// previously caught only in a POST body; now covered by SSRF-010/011/012.
+	{name: "ssrf_query_loopback", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":      "/fetch?url=http://127.0.0.1:8080/admin",
+		"path":     "/fetch",
+		"args.url": "http://127.0.0.1:8080/admin",
+	}},
+	{name: "ssrf_query_private_ip", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":      "/fetch?target=http://192.168.1.1/",
+		"path":     "/fetch",
+		"args.target": "http://192.168.1.1/",
+	}},
+	{name: "ssrf_query_gopher", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":      "/fetch?u=gopher://127.0.0.1:6379/_INFO",
+		"path":     "/fetch",
+		"args.u":   "gopher://127.0.0.1:6379/_INFO",
+	}},
+	{name: "ssrf_query_ecs_metadata", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":      "/fetch?url=http://169.254.170.2/v2/credentials",
+		"path":     "/fetch",
+		"args.url": "http://169.254.170.2/v2/credentials",
 	}},
 }
 

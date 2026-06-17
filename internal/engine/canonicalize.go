@@ -245,21 +245,29 @@ func foldOverlongUTF8(s string) string {
 	return replacer.Replace(s)
 }
 
+// collapseSlashes squeezes runs of consecutive forward slashes down to one,
+// which normalises path-confusion tricks like "/foo//bar" and "//foo". The
+// one exception is the "://" scheme separator: collapsing it to ":/" turned
+// "http://169.254.169.254" into "http:/169.254.169.254" and silently defeated
+// every scheme-anchored rule (https?://, gopher://, the decimal-IP SSRF rule,
+// open-redirect rules, …) whenever they matched a canonicalised arg/uri. The
+// second slash of a "://" run is therefore preserved.
 func collapseSlashes(s string) string {
 	if !strings.Contains(s, "//") {
 		return s
 	}
+	runes := []rune(s)
 	var b strings.Builder
 	b.Grow(len(s))
-	prevSlash := false
-	for _, r := range s {
-		if r == '/' {
-			if prevSlash {
-				continue
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		if r == '/' && i > 0 && runes[i-1] == '/' {
+			// 2nd+ slash of a run. Keep it only when it is the 2nd slash of a
+			// "://" scheme separator (the char before the run is ':').
+			if i >= 2 && runes[i-2] == ':' {
+				b.WriteRune(r)
 			}
-			prevSlash = true
-		} else {
-			prevSlash = false
+			continue
 		}
 		b.WriteRune(r)
 	}

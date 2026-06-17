@@ -39,6 +39,31 @@ func TestCanonicalizeFoldsOverlongUTF8(t *testing.T) {
 	}
 }
 
+// TestCanonicalizePreservesSchemeSlashes guards the fix where collapseSlashes
+// used to turn "http://host" into "http:/host", defeating every scheme-
+// anchored rule. The "://" separator must survive while real path slashes
+// still collapse.
+func TestCanonicalizePreservesSchemeSlashes(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"http://2130706433/", "http://2130706433/"},
+		{"http://169.254.169.254/latest/meta-data/", "http://169.254.169.254/latest/meta-data/"},
+		{"gopher://attacker.com/x", "gopher://attacker.com/x"},
+		{"http://127.0.0.1:8080/admin", "http://127.0.0.1:8080/admin"},
+		// Real path slash-runs must still collapse.
+		{"/foo//bar///baz", "/foo/bar/baz"},
+		{"//foo/bar", "/foo/bar"},
+		// Scheme separator with extra slashes collapses to exactly "://".
+		{"http:////evil", "http://evil"},
+	}
+	for _, c := range cases {
+		if got := Canonicalize(c.in); got != c.want {
+			t.Errorf("Canonicalize(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestCanonicalizePathResolvesTraversal(t *testing.T) {
 	cases := []struct {
 		in, want string
