@@ -153,7 +153,7 @@ func DefaultRules() []core.Rule {
 
 		// === HTTP Smuggling ===
 		{ID: "SMUG-001", Name: "HTTP Smuggling TE.CL", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Transfer-Encoding + Content-Length conflict", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic, not regex
-		{ID: "SMUG-002", Name: "HTTP Smuggling Double CL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Duplicate Content-Length headers", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic
+		{ID: "SMUG-002", Name: "HTTP Smuggling Double CL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Duplicate Content-Length headers", Targets: []string{"headers"}, Pattern: `(?i)\A\z`},        // handled by special logic
 
 		// === Scanner / Bot UA ===
 		{ID: "SCAN-001", Name: "Known Scanner UA", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Known malicious scanner User-Agent", Targets: []string{"headers"}, Pattern: `(?i)(sqlmap|nikto|nmap|gobuster|dirbuster|wfuzz|burpsuite|burp|masscan|zgrab|commix)`},
@@ -208,7 +208,7 @@ func DefaultRules() []core.Rule {
 		{ID: "CACHE-001", Name: "Cache Poisoning Headers", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Suspicious cache poisoning headers", Targets: []string{"headers"}, Pattern: `(?i)(X-Original-Url|X-Rewrite-Url|X-Forwarded-Host|X-Forwarded-Scheme|X-HTTP-Method-Override|Transfer-Encoding)\s*:\s*[^:\r\n]{2,}`},
 
 		// === HTTP Method Override ===
-		{ID: "METHOD-001", Name: "HTTP Method Override", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "HTTP method override header", Targets: []string{"headers"}, Pattern: `(?i)(X-HTTP-Method|X-HTTP-Method-Override|X-Method-Override|_method)\s*:\s*(?:GET|POST|PUT|DELETE|PATCH|TRACE|CONNECT|OPTIONS)`},
+		{ID: "METHOD-001", Name: "HTTP Method Override", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "HTTP method-override header (can bypass method-based access control)", Targets: []string{"headers.x-http-method", "headers.x-http-method-override", "headers.x-method-override"}, Pattern: `(?i)^\s*(?:GET|POST|PUT|DELETE|PATCH|TRACE|TRACK|CONNECT|OPTIONS|HEAD|PROPFIND)\s*$`},
 
 		// === Spring4Shell ===
 		{ID: "SPRING-001", Name: "Spring4Shell", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Spring4Shell classloader manipulation", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)class\.module\.classLoader\.`},
@@ -310,7 +310,7 @@ func DefaultRules() []core.Rule {
 		{ID: "PROTO-002", Name: "HTTP2 Pseudo Header Abuse", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "HTTP/2 pseudo-header in HTTP/1.1 request", Targets: []string{"headers"}, Pattern: `(?i)[\r\n]:(authority|method|path|scheme)\s*:`},
 		{ID: "SMUG-003", Name: "HTTP Smuggling Chunked Abuse", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Chunked encoding body containing embedded HTTP request", Targets: []string{"body"}, Pattern: `(?i)\r\n0\r\n[\s\S]{0,1000}(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+/`},
 		{ID: "HOST-002", Name: "Host Header Injection", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Multiple or injected Host headers", Targets: []string{"headers"}, Pattern: `(?i)Host\s*:[^:\r\n]*[\r\n][\s\S]{0,200}Host\s*:`},
-		{ID: "HOST-003", Name: "X-Forwarded-Host Poisoning", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "X-Forwarded-Host pointing to loopback or metadata", Targets: []string{"headers"}, Pattern: `(?i)X-Forwarded-Host\s*:\s*[^:\r\n]*(?:127\.0\.0\.1|0\.0\.0\.0|localhost|::1|\.local|\.internal|169\.254\.\d+\.\d+)`},
+		{ID: "HOST-003", Name: "X-Forwarded-Host Poisoning", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Forwarding/host header pointing at an internal, loopback, or metadata host (web-cache / password-reset poisoning, SSRF)", Targets: []string{"headers.x-forwarded-host", "headers.x-host", "headers.x-forwarded-server", "headers.forwarded"}, Pattern: `(?i)(?:\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|::1|\b169\.254\.\d{1,3}\.\d{1,3}\b|\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b|\blocalhost\b|\.(?:local|internal)\b|\bmetadata\.google\.internal\b)`},
 
 		// === Cloud Metadata Attacks ===
 		{ID: "CLOUD-001", Name: "AWS Metadata Access", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "AWS metadata endpoint or token in request", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:/latest/meta-data|/latest/user-data|/latest/dynamic/instance-identity|X-aws-ec2-metadata-token)`},
@@ -405,6 +405,20 @@ func DefaultRules() []core.Rule {
 		// the per-segment count below 1000 — that would push CPU into
 		// false-positive territory on legitimate large session cookies.
 		{ID: "HDR-003", Name: "Oversized Cookie Header", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Cookie header >4KB used in scanner probes", Targets: []string{"headers.Cookie"}, Pattern: `.{1000}.{1000}.{1000}.{1000}`},
+		// URL-override access-control bypass. IIS (URL Rewrite) and Symfony
+		// honour X-Original-URL / X-Rewrite-URL as the effective request path,
+		// so a request to an allowed path (e.g. "/") with one of these headers
+		// set to "/admin" is routed to /admin AFTER the edge made its decision.
+		// A client should never send these — they are internal-proxy headers —
+		// so their mere presence is a strong bypass signal. Matched against the
+		// specific header value (presence) rather than a Name:value blob.
+		{ID: "HDR-004", Name: "URL Override Header", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Client-supplied X-Original-URL / X-Rewrite-URL path override (front-end access-control bypass)", Targets: []string{"headers.x-original-url", "headers.x-rewrite-url", "headers.x-original-uri", "headers.x-override-url", "headers.x-forwarded-prefix"}, Pattern: `\S`},
+		// Source-IP spoofing. A forged client-IP forwarding header carrying a
+		// private/loopback range from an external client is used to defeat IP
+		// allowlists, rate limits, and audit trails. The trusted-proxy policy in
+		// clientip decides which of these to honour; this rule records the
+		// attempt. Log-level — a legitimate edge sets these to the real client.
+		{ID: "HDR-005", Name: "Spoofed Client-IP Header", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "Private/loopback IP in True-Client-IP / X-Real-IP / X-Client-IP header (source-IP spoofing)", Targets: []string{"headers.true-client-ip", "headers.x-real-ip", "headers.x-client-ip", "headers.x-cluster-client-ip"}, Pattern: `(?i)(?:\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|::1|\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b|\b169\.254\.\d{1,3}\.\d{1,3}\b|\blocalhost\b)`},
 
 		// --- Path traversal / file inclusion variants ---
 		{ID: "LFI-010", Name: "Unicode traversal", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Unicode / alt-encoded ../ sequences", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:%c0%ae|%c1%9c|%uff0e|%u002e|\.\\\.\\|\.\./\\)`},
@@ -421,7 +435,15 @@ func DefaultRules() []core.Rule {
 		// --- RCE / command injection extensions ---
 		{ID: "RCE-010", Name: "Powershell encoded command", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PowerShell -EncodedCommand / IEX DownloadString", Targets: []string{"args", "body"}, Pattern: `(?i)(?:-EncodedCommand|iex\s*\(\s*new-object\s+net\.webclient|DownloadString\s*\()`},
 		{ID: "RCE-011", Name: "bash curl|sh", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Classic curl ... | (sh|bash) install pattern", Targets: []string{"args", "body"}, Pattern: `(?i)(?:curl|wget|fetch)\s+[^|&]{3,}\s*\|\s*(?:sh|bash|zsh|python|perl|ruby|php)\b`},
-		{ID: "RCE-012", Name: "Shellshock", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Bash Shellshock (CVE-2014-6271) function definition", Targets: []string{"headers"}, Pattern: `\(\s*\)\s*\{\s*[:_].*?\}\s*;`},
+		// Shellshock works because a CGI/cgi-bin backend exports each request
+		// header into a bash environment variable, and vulnerable bash executes
+		// a value shaped like a function definition. The *technique* marker is
+		// the empty-parameter function prelude "() {" — independent of the body
+		// (":;", "_;", "ignored;", the CVE-2014-7169 ">_[...]" form, etc.) — so
+		// matching the full "() { :; };" payload (as the old RCE-012/CRS-932150
+		// did) missed every variant. We anchor "()" to a non-word boundary so a
+		// legitimate "function() {" in a header value does not false-positive.
+		{ID: "RCE-012", Name: "Shellshock", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Bash Shellshock env-var function definition in a header (CVE-2014-6271/6278/7169)", Targets: []string{"headers"}, Pattern: `(?:^|[^\w$])\(\s*\)\s*\{`},
 		{ID: "RCE-013", Name: "Python one-liner revshell", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Python socket-based reverse shell one-liner", Targets: []string{"args", "body"}, Pattern: `(?i)python.{0,20}-c.{0,50}(?:socket|subprocess).{0,100}(?:connect|dup2)`},
 		// Unix command injection: a shell metacharacter immediately followed
 		// by a common command. RCE-003 only covers a small binary list and
