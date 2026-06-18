@@ -591,6 +591,37 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 			})
 		}
 
+	case core.PhaseRequestBody:
+		// Raw Java serialization magic bytes (0xAC 0xED 0x00 0x05 = STREAM_MAGIC
+		// + STREAM_VERSION). The DESER-001 / DESER-JAVA-001 rules only match the
+		// base64 ("rO0AB") and hex-text ("aced0005") representations; an
+		// endpoint that accepts raw serialized objects (custom binary APIs,
+		// some RMI/JMX-over-HTTP bridges) receives the literal bytes, which
+		// Go's UTF-8-oriented regexp cannot express. A body that STARTS with the
+		// magic is unambiguous; embedded (e.g. multipart) we additionally
+		// require the following TC_OBJECT/TC_BLOCKDATA type byte so a stray
+		// 4-byte coincidence in a binary upload can't false-positive.
+		if b, ok := targets["body"]; ok && b != "" {
+			const javaMagic = "\xac\xed\x00\x05"
+			hit := strings.HasPrefix(b, javaMagic) ||
+				strings.Contains(b, javaMagic+"\x73") || // TC_OBJECT
+				strings.Contains(b, javaMagic+"\x77") || // TC_BLOCKDATA
+				strings.Contains(b, javaMagic+"\x7a") // TC_BLOCKDATALONG
+			if hit {
+				addMatch(core.Match{
+					RuleID:    "DESER-JAVA-002",
+					RuleName:  "Java Serialized Object (raw)",
+					Phase:     phase,
+					Target:    "body",
+					Value:     "raw java serialization stream header",
+					Score:     90,
+					Action:    core.ActionBlock,
+					Message:   "Raw Java serialized object stream (0xACED0005)",
+					Timestamp: time.Now().UTC(),
+				})
+			}
+		}
+
 	case core.PhaseResponseBody:
 		body := targets["response_body"]
 		if body == "" {

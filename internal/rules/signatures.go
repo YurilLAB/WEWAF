@@ -421,7 +421,18 @@ func DefaultRules() []core.Rule {
 		{ID: "DESER-NODE-001", Name: "Node Deserialization RCE", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "node-serialize _$$ND_FUNC$$_ gadget", Targets: []string{"body", "args"}, Pattern: `_\$\$ND_FUNC\$\$_function`},
 		{ID: "DESER-PYTHON-001", Name: "Python Pickle / base64", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Python cPickle / __reduce__ byte markers", Targets: []string{"body"}, Pattern: `(?:\\x80\\x04\\x95|cposix\nsystem|c__builtin__\nglobals)`},
 		{ID: "DESER-RUBY-001", Name: "Ruby Marshal Gadget", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Ruby Marshal.load / DeprecatedInstance gadget", Targets: []string{"body"}, Pattern: `(?i)Gem::DependencyList|Rails::Info|DeprecatedInstanceVariableProxy`},
-		{ID: "DESER-YAML-001", Name: "YAML Ruby tag injection", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "!!ruby/object or !!python/object tag", Targets: []string{"body"}, Pattern: `(?i)!!(?:ruby|python)/(?:object|struct|module)(?::[^\s]+)?\s`},
+		// The previous pattern required ":tag" or whitespace right after
+		// "object", so the actual PyYAML RCE forms "!!python/object/apply:os.
+		// system" and "!!python/object/new:" (the /apply and /new suffixes)
+		// slipped through. The "!!ruby/" and "!!python/" deserialization tags
+		// are never legitimate request input, so matching the prefix (with any
+		// /apply, /new, :tag continuation) is both broader and FP-safe.
+		{ID: "DESER-YAML-001", Name: "YAML deserialization tag", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "!!ruby/* or !!python/* deserialization tag (incl. /apply, /new)", Targets: []string{"args", "body"}, Pattern: `(?i)!!(?:ruby|python)/(?:object|struct|module|hash|exec|sym|name|new|apply)\b`},
+		// Json.NET (and other .NET JSON) TypeNameHandling gadget: a "$type"
+		// directive naming a known deserialization gadget chain. "$type" alone
+		// is used legitimately by apps with TypeNameHandling enabled, so we
+		// require a dangerous gadget type to stay FP-safe.
+		{ID: "DESER-NET-002", Name: "Json.NET $type gadget", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: ".NET TypeNameHandling deserialization gadget in $type", Targets: []string{"args", "body"}, Pattern: `(?i)"\$type"\s*:\s*"[^"]*\b(?:ObjectDataProvider|WindowsIdentity|WindowsPrincipal|ClaimsIdentity|FileSystemWatcher|ProcessStartInfo|XamlReader|LosFormatter|ObjectStateFormatter|ActivitySurrogateSelector|TextFormattingRunProperties|AxHostState|ResourceDictionary|SortedSet|TypeConfuseDelegate|PSObject)\b`},
 
 		// --- Server-Side Includes / Edge-Side Includes ---
 		{ID: "SSI-002", Name: "SSI exec cmd", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "<!--#exec cmd= SSI injection", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)<!--#\s*(?:exec|include|printenv|config)\s`},

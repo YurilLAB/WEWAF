@@ -148,3 +148,52 @@ func TestCSSScriptExecutionBlocked(t *testing.T) {
 		})
 	}
 }
+
+// TestDeserializationGadgetsBlocked covers deserialization gaps found in
+// round-4 fuzzing: PyYAML !!python/object/apply RCE form, Json.NET $type
+// gadget chains, and the RAW Java serialization magic bytes (which Go's
+// UTF-8 regexp can't express, so an engine byte-check handles them).
+func TestDeserializationGadgetsBlocked(t *testing.T) {
+	eng := newFuzzEngine(t)
+	mal := []string{
+		`!!python/object/apply:os.system ["id"]`,
+		`!!python/object/new:os.system`,
+		`!!ruby/object:Gem::Requirement`,
+		`{"$type":"System.Windows.Data.ObjectDataProvider, PresentationFramework","MethodName":"Start"}`,
+		`{"x":{"$type":"System.IO.FileSystemWatcher"}}`,
+		string([]byte{0xac, 0xed, 0x00, 0x05}),                  // raw java magic
+		string([]byte{0xac, 0xed, 0x00, 0x05, 0x73, 0x72}),      // magic + TC_OBJECT
+		"prefix" + string([]byte{0xac, 0xed, 0x00, 0x05, 0x73}), // embedded
+	}
+	for _, p := range mal {
+		p := p
+		t.Run("block", func(t *testing.T) {
+			if !rceBodyBlocked(eng, p) && !deserRaw(eng, p) {
+				t.Errorf("deserialization gadget not blocked: %.40q", p)
+			}
+		})
+	}
+	legit := []string{
+		`{"$type":"MyApp.Models.User, MyApp","name":"alice"}`, // legit Json.NET $type
+		`python object oriented tutorial`,
+		`use !! for emphasis`,
+		string([]byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}), // PNG magic
+	}
+	for _, p := range legit {
+		p := p
+		t.Run("allow", func(t *testing.T) {
+			if deserRaw(eng, p) {
+				t.Errorf("legit input wrongly blocked as deserialization: %.40q", p)
+			}
+		})
+	}
+}
+
+// deserRaw posts a raw (non-form) body so binary magic bytes survive intact.
+func deserRaw(eng *Engine, body string) bool {
+	r := httptest.NewRequest(http.MethodPost, "/api", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/octet-stream")
+	tx := core.NewTransaction(nil, r, nil)
+	tx.SetMetadata("body", []byte(body))
+	return eng.ProcessRequestHeaders(tx) != nil || eng.ProcessRequestBody(tx) != nil
+}
