@@ -2,6 +2,7 @@ package limits
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -158,4 +159,37 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// TestBreakerHalfOpenSingleProbeUnderConcurrency validates the breaker's
+// core invariant under the real scenario it exists for: when an open breaker's
+// cool-down elapses and a burst of requests arrives at once, EXACTLY ONE may
+// probe the (still-suspect) backend — the rest must short-circuit. A bug here
+// would let a thundering herd hammer a recovering backend.
+func TestBreakerHalfOpenSingleProbeUnderConcurrency(t *testing.T) {
+	for trial := 0; trial < 50; trial++ {
+		b := NewBreaker(1, 10*time.Millisecond)
+		b.RecordFailure() // open it
+		time.Sleep(15 * time.Millisecond)
+
+		const goroutines = 64
+		var wg sync.WaitGroup
+		var allowed int64
+		start := make(chan struct{})
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if b.Allow() {
+					atomic.AddInt64(&allowed, 1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if allowed != 1 {
+			t.Fatalf("trial %d: half-open admitted %d probes, want exactly 1", trial, allowed)
+		}
+	}
 }

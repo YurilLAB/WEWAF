@@ -563,6 +563,25 @@ func (d *Detector) checkBotnet(ip, path string) Verdict {
 			}
 		}
 	}
+
+	// Hard cap on the per-path IP set. After the prune above, len(ips) is the
+	// fresh unique-IP count; once it is several multiples over the threshold
+	// the path is unambiguously under a distributed flood. Short-circuit here
+	// (without growing the map further) so a 100k-source botnet cannot force
+	// an O(n) prune+count under botMu on EVERY subsequent request — a self-DoS
+	// amplification that gets worse the larger the attack. This bounds both the
+	// per-path map size and the per-request cost at O(botCap) regardless of the
+	// botnet's real size, and never changes WHEN detection first fires (still
+	// at the threshold check below).
+	botCap := d.cfg.BotnetUniqueIPThreshold * 4
+	if botCap < 512 {
+		botCap = 512
+	}
+	if len(ips) >= botCap {
+		d.flaggedBotnet.Add(1)
+		return VerdictBotnet
+	}
+
 	ips[ip] = now
 
 	if len(ips) >= d.cfg.BotnetUniqueIPThreshold {

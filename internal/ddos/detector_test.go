@@ -228,3 +228,25 @@ func TestRecordPathHit_CapDoesNotEvictExistingKeys(t *testing.T) {
 		t.Fatalf("/p0 count = %v, want 11", got)
 	}
 }
+
+// TestBotnetPerPathMapBounded verifies the hard cap added to checkBotnet: a
+// distributed flood with far more unique IPs than the threshold must not let
+// the per-path IP map (or the per-request scan it drives) grow without bound.
+func TestBotnetPerPathMapBounded(t *testing.T) {
+	d := New(Config{BotnetUniqueIPThreshold: 10, BotnetMaxPaths: 16})
+	path := "/login"
+	// botCap = max(threshold*4, 512) = 512 for threshold 10.
+	for i := 0; i < 5000; i++ {
+		// /24-spread unique IPs so each is distinct.
+		ip := "10." + strconv.Itoa(i/65536%256) + "." + strconv.Itoa(i/256%256) + "." + strconv.Itoa(i%256)
+		if v := d.checkBotnet(ip, path); v != VerdictBotnet && i >= 10 {
+			t.Fatalf("expected VerdictBotnet once over threshold (i=%d), got %v", i, v)
+		}
+	}
+	d.botMu.Lock()
+	got := len(d.botPaths[path])
+	d.botMu.Unlock()
+	if got > 512 {
+		t.Fatalf("per-path IP map grew past the cap: len=%d (want <= 512)", got)
+	}
+}
