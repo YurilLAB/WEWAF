@@ -107,7 +107,24 @@ var (
 	// truncate an extension check). A NUL in a URL has no legitimate use, so
 	// flagging it cannot cause false positives.
 	nullByteRe = regexp.MustCompile(`(?i)%(?:25)*00|\x00`)
+
+	// openRedirectRe matches a redirect-param value pointing off-site: a
+	// protocol-relative "//host" / "/\host" / "\/host" / "\\host", an absolute
+	// "scheme://host", or a scheme with a single slash/backslash ("https:/",
+	// "https:\"). Tested against the RAW (decoded-once) query value, because
+	// the canonicalizer collapses "//evil.com" to "/evil.com" and hides it. A
+	// single-slash relative path ("/dashboard") deliberately does NOT match.
+	openRedirectRe = regexp.MustCompile(`(?i)^[\s\x00-\x20]*(?:(?:https?|ftp):?)?[\\/]{2}|^[\s\x00-\x20]*https?:[\\/]`)
 )
+
+// redirectParamNames are the query parameters commonly used for redirects; an
+// off-site value in one of these is an open-redirect indicator.
+var redirectParamNames = map[string]bool{
+	"redirect": true, "redirect_uri": true, "redirect_url": true, "redirecturl": true,
+	"redir": true, "url": true, "next": true, "return": true, "returnurl": true,
+	"return_url": true, "returnto": true, "goto": true, "continue": true, "dest": true,
+	"destination": true, "callback": true, "forward": true, "location": true, "rurl": true,
+}
 
 // DetectBot analyzes the request for bot signatures.
 func (e *Engine) DetectBot(tx *core.Transaction) (isBot bool, botName string, score int) {
@@ -507,6 +524,43 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 				Message:   "CR/LF followed by header injection in request target",
 				Timestamp: time.Now().UTC(),
 			})
+		}
+
+		// Open-redirect detection. REDIR-001/002 embed the param NAME in their
+		// regex and run against per-arg VALUES, so they never fire on a query
+		// param; and the canonicalizer collapses "//evil.com" to "/evil.com",
+		// hiding the protocol-relative form. Inspect the RAW (decoded-once)
+		// query values of redirect-style params instead. Log-level: legitimate
+		// apps DO redirect off-site (OAuth, SSO, share links), so this is
+		// visibility, not a block.
+		if tx.Request.URL != nil {
+			const maxRedirChecks = 32
+			checked := 0
+			for name, vals := range tx.Request.URL.Query() {
+				if checked >= maxRedirChecks {
+					break
+				}
+				if !redirectParamNames[strings.ToLower(name)] {
+					continue
+				}
+				for _, v := range vals {
+					checked++
+					if openRedirectRe.MatchString(v) {
+						addMatch(core.Match{
+							RuleID:    "REDIR-003",
+							RuleName:  "Open Redirect (off-site param value)",
+							Phase:     phase,
+							Target:    "args." + name,
+							Value:     trunc(v, 64),
+							Score:     40,
+							Action:    core.ActionLog,
+							Message:   "Redirect parameter points to an off-site/protocol-relative URL",
+							Timestamp: time.Now().UTC(),
+						})
+						break
+					}
+				}
+			}
 		}
 
 		// JWT header attacks. JWTs are base64url-encoded, so alg:none / kid
