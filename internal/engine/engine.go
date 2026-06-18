@@ -268,6 +268,35 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 			}
 			targets["headers.cookie"] = NormalizeForMatch(c)
 		}
+
+		// Request-header injection sinks. The injection signatures (XSS / SQLi /
+		// RCE / …) run in the body phase, where the cookie was the only header
+		// they saw. But apps routinely read other client-controlled headers into
+		// the very same sinks: the User-Agent and Referer land in access logs and
+		// admin dashboards (stored XSS) and analytics queries (SQLi); the
+		// forwarding / real-IP headers are written verbatim into databases (SQLi)
+		// and trusted for access decisions. Expose a curated allowlist of these
+		// sink-carrying headers to the body-phase rule set under
+		// "headers.<name>" (matched by the "headers" prefix) so the same
+		// signatures that protect args / body / cookie cover them too. The list
+		// is an allowlist — structured negotiation / auth headers (Accept*,
+		// Content-*, Authorization, Sec-*) are intentionally excluded to stay
+		// false-positive free — and uses the no-URL-decode NormalizeForMatch
+		// treatment (NFKC + homoglyph + whitespace fold) so base64 tokens aren't
+		// mangled into rule hits.
+		const maxHeaderSinkLen = 8192
+		for _, name := range injectionSinkHeaders {
+			if vs := tx.Request.Header.Values(name); len(vs) > 0 {
+				joined := strings.Join(vs, ", ")
+				if joined == "" {
+					continue
+				}
+				if len(joined) > maxHeaderSinkLen {
+					joined = joined[:maxHeaderSinkLen]
+				}
+				targets["headers."+strings.ToLower(name)] = NormalizeForMatch(joined)
+			}
+		}
 	}
 
 	// Decompressed body inspection. When DecompressInspect is enabled the
@@ -1036,6 +1065,29 @@ func (e *Engine) isFormURLEncoded(r *http.Request) bool {
 	}
 	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
 	return strings.HasPrefix(ct, "application/x-www-form-urlencoded")
+}
+
+// injectionSinkHeaders is the curated set of client-controlled request headers
+// that commonly reach injection sinks — access logs, admin dashboards,
+// analytics SQL, and IP allowlists. They are inspected by the body-phase
+// signature rules in addition to the cookie. Structured negotiation / auth /
+// fetch-metadata headers are deliberately omitted to avoid false positives,
+// since they carry tokens and q-value lists that no app feeds to an injection
+// sink.
+var injectionSinkHeaders = []string{
+	"User-Agent",
+	"Referer",
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Real-IP",
+	"X-Client-IP",
+	"X-Originating-IP",
+	"True-Client-IP",
+	"CF-Connecting-IP",
+	"Forwarded",
+	"Via",
+	"From",
+	"X-Requested-With",
 }
 
 // utf7Charset reports whether the request explicitly declares a UTF-7 body
