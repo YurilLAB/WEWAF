@@ -195,6 +195,30 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 		targets["body.norm"] = norm
 	}
 
+	// Cookie inspection with the full body-phase rule set. Header-phase rules
+	// only cover a subset of injection signatures (XSS-001/SQLI-001/RCE-001/…
+	// declare a "headers" target but run in the BODY phase, so they never see
+	// header values). Apps routinely read cookie values into SQL queries, HTML,
+	// shell commands, or template engines, so a cookie is a first-class
+	// injection sink. Expose it under "headers.cookie" (matched by the
+	// "headers" target prefix) using NormalizeForMatch — NFKC + homoglyph +
+	// whitespace folding, but NO URL-decode, since apps read the raw cookie
+	// value rather than a percent-decoded one. Avoids the "+"→space mangling
+	// that would otherwise false-positive base64 cookies on the crypto rule.
+	if tx.Request != nil {
+		if c := tx.Request.Header.Get("Cookie"); c != "" {
+			// PathUnescape (not QueryUnescape) decodes %XX while leaving "+"
+			// intact, so a percent-encoded payload in a cookie is caught
+			// without "+"→space mangling that would false-positive base64 /
+			// JWT cookies on the crypto rule. Fall back to raw on a malformed
+			// escape (e.g. a literal "%").
+			if dec, err := url.PathUnescape(c); err == nil {
+				c = dec
+			}
+			targets["headers.cookie"] = NormalizeForMatch(c)
+		}
+	}
+
 	// Decompressed body inspection. When DecompressInspect is enabled the
 	// proxy decodes a gzip/brotli request body and stores the plaintext
 	// under "decoded_body" *specifically so body rules can run against the

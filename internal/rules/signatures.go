@@ -150,6 +150,23 @@ func DefaultRules() []core.Rule {
 		{ID: "SSRF-010", Name: "SSRF Private/Loopback IP (args)", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Private/loopback/link-local IP in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})`},
 		{ID: "SSRF-011", Name: "SSRF Dangerous Protocol (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Dangerous URL scheme in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(dict|gopher|ftp|tftp|ldap|file)://`},
 		{ID: "SSRF-012", Name: "SSRF Metadata Endpoint (args)", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Cloud metadata endpoint or path in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(169\.254\.169\.254|169\.254\.170\.2|100\.100\.100\.200|192\.0\.0\.192|metadata\.google\.internal|metadata\.azure\.com|/latest/(?:meta-data|user-data|dynamic)|/computeMetadata/|/metadata/(?:instance|identity)|api-version=[^&]*metadata)`},
+		// Path-embedded SSRF: open-redirect / proxy / image-fetch endpoints that
+		// take the target URL as a PATH segment ("/proxy/http://169.254.169.254/")
+		// rather than a query parameter. SSRF-010..012 are args-only, so these
+		// slipped through. Targets the "uri" view (which preserves "://" — the
+		// "path" view collapses it during ../ resolution). FP-safe because it
+		// requires either a dangerous scheme (gopher/dict/file/…) OR an http(s)
+		// URL whose host is internal/loopback/metadata — a legitimate path that
+		// merely contains an external URL or a bare IP (e.g. /devices/10.0.0.1)
+		// does not match.
+		{ID: "SSRF-013", Name: "SSRF URL in path", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "SSRF target URL embedded in the request path (internal host or dangerous scheme)", Targets: []string{"uri"}, Pattern: `(?i)(?:gopher|dict|tftp|ldap|file)://|(?:https?)://(?:[^/?#@]*@)?(?:127\.0\.0\.1|0\.0\.0\.0|localhost|\[?::1\]?|169\.254\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|metadata\.google\.internal|169\.254\.169\.254)`},
+		// Session fixation / session-ID-in-URL marker (OWASP ASVS 3.x: session
+		// tokens must never travel in the URL). Flags framework session tokens
+		// in the query, path matrix (";jsessionid="), or args. Log-level, not a
+		// block — apps that (badly) use URL-rewriting sessions emit these and
+		// legitimate clients echo them back; the value is in the visibility, and
+		// blocking would break those apps.
+		{ID: "SESSIONID-001", Name: "Session ID in URL", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Session token in URL/path (session fixation / session exposure)", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:[?&;]|^)(?:jsessionid|phpsessid|aspsessionid[a-z0-9]*|asp\.net_sessionid|cfid|cftoken|sessionid|session_id|sessid)=`},
 
 		// === HTTP Smuggling ===
 		{ID: "SMUG-001", Name: "HTTP Smuggling TE.CL", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Transfer-Encoding + Content-Length conflict", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic, not regex

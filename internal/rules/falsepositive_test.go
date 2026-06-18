@@ -187,6 +187,16 @@ var legitCases = []caseInput{
 	{name: "legit_named_function_header", phase: core.PhaseRequestHeaders, targets: map[string]string{
 		"headers.X-Debug": "handler = function() { return ok; }",
 	}},
+	// A path containing an EXTERNAL URL or a bare private IP must not trip the
+	// path-embedded SSRF rule (which requires scheme://internal-host).
+	{name: "legit_external_url_in_path", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":  "/cache/http://cdn.example.com/assets/logo.png",
+		"path": "/cache/http:/cdn.example.com/assets/logo.png",
+	}},
+	// A normal JWT cookie (base64url with +,/,= ) must not trip any rule.
+	{name: "legit_jwt_cookie", phase: core.PhaseRequestBody, targets: map[string]string{
+		"headers.cookie": "jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.abc+def/ghi==",
+	}},
 }
 
 // maliciousCases — inputs that MUST fire at least one rule. Confirms we
@@ -279,6 +289,15 @@ var maliciousCases = []caseInput{
 	// URL-override access-control bypass.
 	{name: "url_override_admin", phase: core.PhaseRequestHeaders, targets: map[string]string{
 		"headers.X-Original-Url": "/admin",
+	}},
+	// Path-embedded SSRF (target URL is a path segment, not a query arg).
+	{name: "path_embedded_ssrf", phase: core.PhaseRequestHeaders, targets: map[string]string{
+		"uri":  "/proxy/http://169.254.169.254/latest/meta-data/",
+		"path": "/proxy/http:/169.254.169.254/latest/meta-data",
+	}},
+	// SQLi carried in a Cookie value (body-phase headers.cookie target).
+	{name: "sqli_in_cookie", phase: core.PhaseRequestBody, targets: map[string]string{
+		"headers.cookie": "sid=1 UNION SELECT password FROM users",
 	}},
 	// Unix command injection — recon one-liners that RCE-003 missed.
 	{name: "cmd_injection_pipe_id", phase: core.PhaseRequestHeaders, targets: map[string]string{
