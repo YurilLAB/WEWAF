@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"wewaf/internal/config"
 	"wewaf/internal/core"
@@ -307,6 +308,22 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 				targets["args."+k] = FoldHomoglyphs(Canonicalize(decoded))
 				added++
 			}
+		}
+	}
+
+	// UTF-7 decoded body view. A payload like "+ADw-script+AD4-" is inert ASCII
+	// to every signature rule, but a backend that honors charset=utf-7 decodes
+	// it to "<script>" — the classic UTF-7 XSS smuggle (confirmed by fuzzing:
+	// the bytes reach the app as live <script>/<img onerror> markup). Decode the
+	// same content the backend will, but ONLY when the request explicitly
+	// declares charset=utf-7. No modern legitimate client sends that charset, so
+	// gating on the declaration keeps this zero-false-positive while still
+	// covering the attacker who sets it hoping a charset-sniffing backend
+	// decodes the body. Keyed "body.utf7" (matched by the "body" prefix) and
+	// added only when decoding actually changes the bytes.
+	if utf7Charset(tx.Request) {
+		if dec := decodeUTF7(body); dec != body {
+			targets["body.utf7"] = NormalizeForMatch(dec)
 		}
 	}
 
@@ -1019,6 +1036,80 @@ func (e *Engine) isFormURLEncoded(r *http.Request) bool {
 	}
 	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
 	return strings.HasPrefix(ct, "application/x-www-form-urlencoded")
+}
+
+// utf7Charset reports whether the request explicitly declares a UTF-7 body
+// charset. UTF-7 is honored by essentially no modern client, so gating the
+// decode-and-inspect pass on this declaration keeps it zero-false-positive:
+// ordinary traffic never enters the path.
+func utf7Charset(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	ct := strings.ToLower(r.Header.Get("Content-Type"))
+	// Tolerate "charset=utf-7", quoted, and the non-hyphenated "utf7" spelling.
+	return strings.Contains(ct, "charset=utf-7") ||
+		strings.Contains(ct, "charset=\"utf-7\"") ||
+		strings.Contains(ct, "charset=utf7")
+}
+
+// decodeUTF7 decodes RFC 2152 modified-UTF-7 into UTF-8. A '+' opens a
+// modified-base64 run encoding UTF-16BE code units, closed by '-' (or any
+// non-base64 byte); "+-" is a literal '+'. Anything that isn't a valid
+// sequence is passed through, so the result is always usable as a matching
+// target. Used only when the body explicitly declares charset=utf-7.
+func decodeUTF7(s string) string {
+	rev := func(c byte) int {
+		switch {
+		case c >= 'A' && c <= 'Z':
+			return int(c - 'A')
+		case c >= 'a' && c <= 'z':
+			return int(c-'a') + 26
+		case c >= '0' && c <= '9':
+			return int(c-'0') + 52
+		case c == '+':
+			return 62
+		case c == '/':
+			return 63
+		}
+		return -1
+	}
+	var out strings.Builder
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c != '+' {
+			out.WriteByte(c)
+			i++
+			continue
+		}
+		i++ // consume '+'
+		if i < len(s) && s[i] == '-' {
+			out.WriteByte('+') // "+-" => literal '+'
+			i++
+			continue
+		}
+		var bits uint32
+		var nbits int
+		var units []uint16
+		for i < len(s) {
+			v := rev(s[i])
+			if v < 0 {
+				break
+			}
+			bits = bits<<6 | uint32(v)
+			nbits += 6
+			i++
+			if nbits >= 16 {
+				nbits -= 16
+				units = append(units, uint16(bits>>uint(nbits)))
+			}
+		}
+		out.WriteString(string(utf16.Decode(units)))
+		if i < len(s) && s[i] == '-' {
+			i++ // consume explicit terminator
+		}
+	}
+	return out.String()
 }
 
 func trunc(s string, n int) string {
