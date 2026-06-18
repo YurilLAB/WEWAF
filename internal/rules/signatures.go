@@ -71,6 +71,22 @@ var cmdInjectionPattern = "(?i)(?:[;|`\\n]|&&|\\|\\|)\\s*" +
 // phase) and SQLI-026 (header phase / query args).
 var symbolicLogicalSQLiPattern = `(?i)(?:\|\||&&)\s*['"]\s*\w+\s*['"]\s*=`
 
+// likeTautologyPattern detects the LIKE / RLIKE / REGEXP form of an OR/AND
+// tautology — "OR 1 LIKE 1", "OR 'a' LIKE 'a'", "AND 1 RLIKE 1",
+// "OR 'x' REGEXP 'x'". SQLI-005 only covered the "=" and ">" comparison forms,
+// so the pattern-match operators (a documented bypass when "=" is filtered)
+// slipped through. The operands are constrained to a bare number or a SHORT
+// quoted string so ordinary prose ("search shirts or pants like jeans" — the
+// operands there are unquoted words) cannot trip it. Used by SQLI-027 (body)
+// and SQLI-028 (header phase / query args).
+var likeTautologyPattern = `(?i)\b(?:or|and)\s+(?:\d+|'[^']{1,8}'|"[^"]{1,8}")\s+(?:like|rlike|regexp)\s+(?:\d+|'[^']{1,8}'|"[^"]{1,8}")`
+
+// procedureAnalysePattern detects MySQL's PROCEDURE ANALYSE() — used by sqlmap
+// for column-count discovery and information disclosure. The trailing "(" is
+// required so it matches the technique's call form but never the prose
+// "stored procedure analysis". Used by SQLI-029 (body) and SQLI-030 (args).
+var procedureAnalysePattern = `(?i)\bprocedure\s+analyse\s*\(`
+
 // DefaultRules returns the built-in high-value signatures.
 func DefaultRules() []core.Rule {
 	return []core.Rule{
@@ -496,6 +512,12 @@ func DefaultRules() []core.Rule {
 		// replaced by ||/&& with quoted operands, e.g. 1'||'1'='1.
 		{ID: "SQLI-025", Name: "Symbolic logical tautology (body)", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "SQL ||/&& string tautology (OR/AND keyword evasion)", Targets: []string{"args", "body"}, Pattern: symbolicLogicalSQLiPattern},
 		{ID: "SQLI-026", Name: "Symbolic logical tautology (args)", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "SQL ||/&& string tautology in query args", Targets: []string{"args"}, Pattern: symbolicLogicalSQLiPattern},
+		// LIKE / RLIKE / REGEXP tautology (sqlmap "=" → "LIKE" filter bypass).
+		{ID: "SQLI-027", Name: "LIKE tautology (body)", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Blind boolean tautology using LIKE/RLIKE/REGEXP", Targets: []string{"args", "body", "headers"}, Pattern: likeTautologyPattern},
+		{ID: "SQLI-028", Name: "LIKE tautology (args)", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Blind boolean LIKE/RLIKE/REGEXP tautology in query args", Targets: []string{"args", "uri"}, Pattern: likeTautologyPattern},
+		// MySQL PROCEDURE ANALYSE() column-count / info disclosure.
+		{ID: "SQLI-029", Name: "PROCEDURE ANALYSE (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "MySQL PROCEDURE ANALYSE() information disclosure", Targets: []string{"args", "body", "headers"}, Pattern: procedureAnalysePattern},
+		{ID: "SQLI-030", Name: "PROCEDURE ANALYSE (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "MySQL PROCEDURE ANALYSE() in query args", Targets: []string{"args", "uri"}, Pattern: procedureAnalysePattern},
 
 		// --- RCE / command injection extensions ---
 		{ID: "RCE-010", Name: "Powershell encoded command", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PowerShell -EncodedCommand / IEX DownloadString", Targets: []string{"args", "body"}, Pattern: `(?i)(?:-EncodedCommand|iex\s*\(\s*new-object\s+net\.webclient|DownloadString\s*\()`},
