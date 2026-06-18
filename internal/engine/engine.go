@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -229,6 +230,19 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 	// "body.norm" so it is matched by the "body" target prefix.
 	if norm := NormalizeForMatch(body); norm != body {
 		targets["body.norm"] = norm
+	}
+
+	// JSON-unescaped body view. A JSON payload that hides "<script>" /
+	// "UNION SELECT" behind backslash-u escapes is literal text to the regex
+	// rules but the app's JSON parser decodes it — a real bypass (confirmed by
+	// fuzzing). Inspect the decoded form too, plus its normalized variant so a
+	// decoded payload that also uses \v / unicode separators is caught. Added
+	// only when decoding changed something, so non-escaped bodies cost nothing.
+	if dec := decodeJSONEscapes(body); dec != body {
+		targets["body.jsondecoded"] = dec
+		if dn := NormalizeForMatch(dec); dn != dec {
+			targets["body.jsonnorm"] = dn
+		}
 	}
 
 	// Cookie inspection with the full body-phase rule set. Header-phase rules
@@ -932,6 +946,69 @@ func detectJWTAttacks(s string) []core.Match {
 		}
 	}
 	return matches
+}
+
+// decodeJSONEscapes reveals JSON string escape sequences so signature rules
+// see the content the backend's JSON parser will produce. A JSON value that
+// uses backslash-u escapes for "<", ">", or a letter inside a keyword reads as
+// literal text to a regex but decodes to "<script>" / "UNION SELECT" once the
+// app parses the JSON — a real WAF-bypass class. The decoder correctly handles
+// an escaped backslash so a doubly-escaped sequence is not mis-decoded. Non-JSON
+// input is returned essentially unchanged (the result is only ever used as an
+// ADDITIONAL match target; the verbatim body is preserved).
+func decodeJSONEscapes(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '\\' || i+1 >= len(s) {
+			b.WriteByte(c)
+			continue
+		}
+		switch s[i+1] {
+		case 'u':
+			if i+6 <= len(s) {
+				if r, err := strconv.ParseUint(s[i+2:i+6], 16, 32); err == nil {
+					b.WriteRune(rune(r))
+					i += 5
+					continue
+				}
+			}
+			b.WriteByte(c)
+		case '/':
+			b.WriteByte('/')
+			i++
+		case 'n':
+			b.WriteByte('\n')
+			i++
+		case 't':
+			b.WriteByte('\t')
+			i++
+		case 'r':
+			b.WriteByte('\r')
+			i++
+		case 'b':
+			b.WriteByte('\b')
+			i++
+		case 'f':
+			b.WriteByte('\f')
+			i++
+		case '"':
+			b.WriteByte('"')
+			i++
+		case '\\':
+			// Escaped backslash: emit one '\' and consume BOTH, so a literal
+			// "\\u003c" is left as "<" (not decoded to "<").
+			b.WriteByte('\\')
+			i++
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // isFormURLEncoded reports whether the request body is
