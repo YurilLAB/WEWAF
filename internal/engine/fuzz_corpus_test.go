@@ -16,7 +16,7 @@ import (
 // newFuzzEngine builds an engine with the full default + CRS rule set in
 // active mode, mirroring a realistic deployment. Rule matching is exercised
 // directly (no proxy), so rate-limiting / DDoS gates can't pollute results.
-func newFuzzEngine(t *testing.T) *Engine {
+func newFuzzEngine(t testing.TB) *Engine {
 	t.Helper()
 	cfg := config.Default()
 	cfg.Mode = "active"
