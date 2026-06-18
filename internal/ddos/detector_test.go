@@ -250,3 +250,23 @@ func TestBotnetPerPathMapBounded(t *testing.T) {
 		t.Fatalf("per-path IP map grew past the cap: len=%d (want <= 512)", got)
 	}
 }
+
+// TestRecordSlowReadFlagsSlowloris validates the Slowloris detection logic:
+// a request alive long enough but transferring bytes below the floor is
+// flagged; a fast read or a too-young request is not.
+func TestRecordSlowReadFlagsSlowloris(t *testing.T) {
+	d := New(Config{SlowMinAge: 10 * time.Second, SlowMinBPS: 128})
+	// Slow drip: 100 bytes over 20s = 5 B/s, well below 128.
+	if !d.RecordSlowRead(100, 20*time.Second) {
+		t.Fatalf("slow drip (5 B/s over 20s) should be flagged")
+	}
+	// Fast read: 1MB over 11s = ~95k B/s, above the floor.
+	if d.RecordSlowRead(1<<20, 11*time.Second) {
+		t.Fatalf("fast read should not be flagged")
+	}
+	// Too young: even a slow rate under SlowMinAge must not flag (avoids
+	// penalising small quick POSTs).
+	if d.RecordSlowRead(1, 2*time.Second) {
+		t.Fatalf("request younger than SlowMinAge must not be flagged")
+	}
+}

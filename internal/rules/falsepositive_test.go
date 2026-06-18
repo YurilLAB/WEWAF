@@ -299,6 +299,16 @@ var maliciousCases = []caseInput{
 	{name: "sqli_in_cookie", phase: core.PhaseRequestBody, targets: map[string]string{
 		"headers.cookie": "sid=1 UNION SELECT password FROM users",
 	}},
+	// Obfuscated command injection reading a sensitive file in the body.
+	{name: "rce_quote_split_passwd", phase: core.PhaseRequestBody, targets: map[string]string{
+		"body": `cmd=c'a't /etc/passwd`,
+	}},
+	{name: "rce_brace_expansion", phase: core.PhaseRequestBody, targets: map[string]string{
+		"body": "cmd={cat,/etc/shadow}",
+	}},
+	{name: "rce_windows_cmd", phase: core.PhaseRequestBody, targets: map[string]string{
+		"body": "cmd=cmd /c whoami",
+	}},
 	// Unix command injection — recon one-liners that RCE-003 missed.
 	{name: "cmd_injection_pipe_id", phase: core.PhaseRequestHeaders, targets: map[string]string{
 		"uri":       "/run?host=x%7C+id",

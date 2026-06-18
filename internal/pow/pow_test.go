@@ -3,6 +3,7 @@ package pow
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -104,10 +105,10 @@ func TestVerifyMalformedTokens(t *testing.T) {
 	it := newTestIssuer(t)
 	for _, bad := range []string{
 		"",
-		strings.Repeat("a", 5000),       // too long
-		"only.three.parts.though",       // wrong field count
-		"a.b.c.d.e",                     // right shape, junk content
-		"id.notbase64@@@.8.0.sig",       // base64 fails
+		strings.Repeat("a", 5000), // too long
+		"only.three.parts.though", // wrong field count
+		"a.b.c.d.e",               // right shape, junk content
+		"id.notbase64@@@.8.0.sig", // base64 fails
 	} {
 		if _, err := it.Verify(bad, []byte{0, 0, 0, 0, 0, 0, 0, 1}); err != ErrTokenMalformed && err != ErrTokenSignature {
 			t.Errorf("malformed input %q: got %v", bad, err)
@@ -248,5 +249,112 @@ func TestSignBodyRoundTrip(t *testing.T) {
 	}
 	if _, err := base64.RawURLEncoding.DecodeString(parts[4]); err != nil {
 		t.Fatalf("sig not base64url: %v", err)
+	}
+}
+
+// TestVerifyRejectsDifficultyDowngrade is the explicit forgery test for the
+// "client lowers the work factor" technique. The difficulty is inside the
+// HMAC-signed body, so rewriting it to an easier value must break the
+// signature — the attacker cannot get a cheaper challenge accepted.
+func TestVerifyRejectsDifficultyDowngrade(t *testing.T) {
+	it := newTestIssuer(t)
+	_, ser, err := it.Issue(16)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	parts := strings.Split(ser, ".")
+	// parts: id.salt.diff.exp.mac — rewrite diff to 1 (trivial to solve).
+	parts[2] = "1"
+	forged := strings.Join(parts, ".")
+	// Solve at the downgraded difficulty so PoW would pass IF the token were
+	// accepted; the signature check must reject it before that matters.
+	saltBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+	nonce, ok := SolveForTest(saltBytes, 1, 1<<20)
+	if !ok {
+		t.Fatal("solver gave up")
+	}
+	if _, err := it.Verify(forged, nonce); err != ErrTokenSignature {
+		t.Fatalf("difficulty-downgrade forgery must fail with ErrTokenSignature, got %v", err)
+	}
+}
+
+// TestVerifyRejectsCrossTokenNonceReuse covers the "solve once, reuse the
+// nonce on a different challenge" technique. Each token's salt is unique and
+// part of the PoW input, so a nonce that solves token A must not satisfy
+// token B (different salt) — preventing precomputation / nonce recycling.
+func TestVerifyRejectsCrossTokenNonceReuse(t *testing.T) {
+	it := newTestIssuer(t)
+	tokA, _, _ := it.Issue(8)
+	_, serB, _ := it.Issue(8)
+	parts := strings.Split(serB, ".")
+	saltB, _ := base64.RawURLEncoding.DecodeString(parts[1])
+
+	nonceA, ok := SolveForTest(tokA.Salt, 8, 1<<20)
+	if !ok {
+		t.Fatal("solver gave up on A")
+	}
+	// nonceA solves A's salt; the chance it also solves B's distinct salt at
+	// 8 bits is 1/256, so retry until we have a nonce that does NOT solve B
+	// to make the assertion deterministic.
+	h := sha256.New()
+	h.Write(saltB)
+	h.Write(nonceA)
+	if hasLeadingZeros(h.Sum(nil), 8) {
+		t.Skip("rare: nonceA coincidentally solved salt B; non-deterministic, skip")
+	}
+	if _, err := it.Verify(serB, nonceA); err != ErrSolutionInvalid {
+		t.Fatalf("cross-token nonce reuse must fail with ErrSolutionInvalid, got %v", err)
+	}
+}
+
+// TestVerifyRejectsForeignSecret confirms a token minted by an issuer with a
+// different secret is rejected — i.e. forging requires the server key.
+func TestVerifyRejectsForeignSecret(t *testing.T) {
+	victim := newTestIssuer(t)
+	attacker, err := NewIssuer([]byte("attacker-secret-attacker-secret-xx"), 8, 16, time.Minute)
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	tok, ser, _ := attacker.Issue(8)
+	nonce, ok := SolveForTest(tok.Salt, 8, 1<<20)
+	if !ok {
+		t.Fatal("solver gave up")
+	}
+	if _, err := victim.Verify(ser, nonce); err != ErrTokenSignature {
+		t.Fatalf("foreign-secret token must fail with ErrTokenSignature, got %v", err)
+	}
+}
+
+// TestSeenEvictionPreservesReplayProtection is the regression test for the
+// seen-set eviction fix: even when the seen-set is flooded past its ceiling,
+// an UNEXPIRED redeemed token must still be rejected as a replay (the
+// emergency eviction drops expired entries first, never a still-valid ID).
+func TestSeenEvictionPreservesReplayProtection(t *testing.T) {
+	it := newTestIssuer(t)
+	tok, ser, _ := it.Issue(8)
+	nonce, ok := SolveForTest(tok.Salt, 8, 1<<20)
+	if !ok {
+		t.Fatal("solver gave up")
+	}
+	if _, err := it.Verify(ser, nonce); err != nil {
+		t.Fatalf("first redemption should succeed: %v", err)
+	}
+	// Flood the seen-set past the ceiling with EXPIRED entries (redeemed
+	// older than the TTL). The emergency eviction must drop these, not the
+	// fresh real redemption above.
+	it.seenMu.Lock()
+	old := time.Now().Add(-2 * it.ttl)
+	for i := 0; i < 100001; i++ {
+		it.seen["expired-"+strconv.Itoa(i)] = old
+	}
+	it.seenMu.Unlock()
+	// Trigger claimSeen's ceiling path via a fresh (different) token.
+	tok2, ser2, _ := it.Issue(8)
+	nonce2, _ := SolveForTest(tok2.Salt, 8, 1<<20)
+	_, _ = it.Verify(ser2, nonce2) // drives eviction of expired entries
+
+	// The original token must STILL be seen → replay rejected.
+	if _, err := it.Verify(ser, nonce); err != ErrTokenReplay {
+		t.Fatalf("unexpired redeemed token must remain replay-protected after eviction, got %v", err)
 	}
 }

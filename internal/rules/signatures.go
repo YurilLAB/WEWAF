@@ -181,7 +181,12 @@ func DefaultRules() []core.Rule {
 		{ID: "RCE-001", Name: "RCE Command Substitution", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Command substitution $() or backticks", Targets: []string{"args", "body", "headers"}, Pattern: "(?i)(\\$\\([\\s\\S]{0,300}\\)|`[\\s\\S]{0,300}`)"},
 		{ID: "RCE-002", Name: "RCE Reverse Shell", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Reverse shell indicator", Targets: []string{"args", "body"}, Pattern: `(?i)(bash\s+-i|nc\s+-[ev]|python\s+-c\s*['"]import socket)`},
 		{ID: "RCE-003", Name: "RCE Dangerous Chain", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Shell meta-char followed by binary", Targets: []string{"args", "body"}, Pattern: `(?i)[;&|]\s*(curl|wget|python|perl|ruby|bash|sh|cmd|powershell|php|node|nodejs|lua|luajit|awk|gawk|nawk|expect|telnet|ssh|scp|ftp|tftp|nc|netcat|socat)\s+`},
-		{ID: "RCE-004", Name: "RCE IFS Evasion", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionLog, Description: "IFS evasion pattern", Targets: []string{"args", "body"}, Pattern: `(?i)\$\{IFS\}`},
+		// $IFS whitespace-evasion. Bash splits on $IFS, so attackers write
+		// "cat$IFS/etc/passwd" or "cat$IFS$9/etc/passwd" to avoid literal
+		// spaces. The old pattern only matched the braced "${IFS}" form, so
+		// the bare "$IFS" / "$IFS$9" variants slipped past. \b after IFS keeps
+		// a variable literally named "$IFSomething" from matching.
+		{ID: "RCE-004", Name: "RCE IFS Evasion", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionLog, Description: "IFS whitespace-evasion pattern", Targets: []string{"args", "body"}, Pattern: `(?i)\$\{?IFS\b`},
 		{ID: "RCE-005", Name: "RCE Scripting One-Liners", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Scripting language one-liner execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(base64\s+-d|python\s+-c|perl\s+-e|ruby\s+-e|php\s+-r)`},
 		{ID: "RCE-006", Name: "RCE Dangerous Functions", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dangerous PHP/function execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(eval\s*\(|assert\s*\(|exec\s*\(|system\s*\(|passthru\s*\(|popen\s*\(|proc_open\s*\(|shell_exec\s*\()`},
 
@@ -476,6 +481,24 @@ func DefaultRules() []core.Rule {
 		// buffered body, RCE-015 inspects query args / the URI.
 		{ID: "RCE-014", Name: "Unix command injection (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Shell metacharacter followed by a common Unix command", Targets: []string{"args", "body"}, Pattern: cmdInjectionPattern},
 		{ID: "RCE-015", Name: "Unix command injection (args/uri)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Shell metacharacter followed by a common Unix command in query args", Targets: []string{"args", "uri"}, Pattern: cmdInjectionPattern},
+		// Sensitive-file access in the BODY. TRAV-004 covers args/uri (header
+		// phase) but a quote/backslash/wildcard-obfuscated command
+		// ("c'a't /etc/passwd", "/bin/c?t /etc/passwd", "{cat,/etc/passwd}")
+		// hides the COMMAND, not its target — so matching the target file path
+		// catches the whole obfuscation class robustly, in the body where
+		// command-injection params usually live. FP-safe: these absolute paths
+		// to credential/secret files have no place in a legitimate request body.
+		{ID: "LFI-020", Name: "Sensitive file access (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Absolute path to a credential/secret system file in the body", Targets: []string{"args", "body"}, Pattern: `(?i)/etc/(?:passwd|shadow|gshadow|sudoers|mysql/my\.cnf|ssh/sshd_config)\b|/proc/self/(?:environ|cmdline|maps|status)\b|/root/\.(?:ssh|bash_history|aws)\b|/\.aws/credentials\b|/\.ssh/(?:id_(?:rsa|dsa|ecdsa|ed25519)|authorized_keys)\b`},
+		// Bash brace expansion: "{cat,/etc/passwd}" expands to "cat /etc/passwd"
+		// with no spaces, a documented WAF bypass. Anchored to a known command
+		// then a comma then a non-space arg, which a legitimate JS object
+		// literal ("{cat, dog}", space after comma) or JSON ("{"k":...}") does
+		// not produce.
+		{ID: "RCE-016", Name: "Shell brace expansion", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Bash brace-expansion command obfuscation", Targets: []string{"args", "body"}, Pattern: `(?i)\{(?:cat|curl|wget|nc|ncat|netcat|bash|sh|zsh|python|perl|ruby|php|id|whoami|uname|ls|rm|cp|mv|chmod|chown|ping|nslookup|dig|head|tail|base64)\b,[^\s},]`},
+		// Windows command execution: cmd /c and PowerShell encoded-command
+		// (-e / -enc / -encodedcommand abbreviations). RCE-010 only matched the
+		// full "-EncodedCommand"; real payloads use the abbreviated flags.
+		{ID: "RCE-017", Name: "Windows command execution", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Windows cmd.exe / PowerShell encoded-command execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\bcmd(?:\.exe)?\s+/c\s|\bpowershell(?:\.exe)?\b[^\n]{0,80}?\s-e(?:nc(?:odedcommand)?)?\s+[A-Za-z0-9+/]{8,}`},
 		// Ruby / JSP "#{...}" string interpolation probe. The dangerous
 		// variants (with java/runtime/exec) are blocked by EL-001; this
 		// log-only rule flags the bare interpolation canary ("#{7*7}") that

@@ -389,16 +389,33 @@ func (it *Issuer) claimSeen(id string) bool {
 		return false
 	}
 	if len(it.seen) > 100000 {
-		// Hard ceiling — if we're here something is wrong (e.g., sweep
-		// failed). Drop in chunks to stay below the cap rather than
-		// growing unbounded. Picking arbitrary keys is fine: we'd only
-		// allow a replay of a token that's about to expire anyway.
-		dropped := 0
-		for k := range it.seen {
-			delete(it.seen, k)
-			dropped++
-			if dropped >= 25000 {
-				break
+		// Evict EXPIRED entries first. A token whose validity window has
+		// passed can never be redeemed again — Verify rejects expiry (step 3)
+		// before it ever reaches claimSeen — so dropping its seen-record
+		// cannot open a replay window. The previous code dropped ARBITRARY
+		// entries, which could evict a still-valid redeemed ID and let that
+		// token be replayed before it expired, silently weakening the very
+		// guarantee the seen-set exists to provide. A redeemed-at older than
+		// the TTL means the token has certainly expired.
+		cutoff := time.Now().Add(-it.ttl)
+		for k, v := range it.seen {
+			if v.Before(cutoff) {
+				delete(it.seen, k)
+			}
+		}
+		// Last resort: still over the ceiling means >100k tokens were redeemed
+		// within a single TTL — orders of magnitude past the per-IP issue
+		// rate-limit, i.e. a pathological anomaly. Drop a bounded arbitrary
+		// chunk to preserve liveness; this is the only path that can evict an
+		// unexpired ID, and only under that extreme.
+		if len(it.seen) > 100000 {
+			dropped := 0
+			for k := range it.seen {
+				delete(it.seen, k)
+				dropped++
+				if dropped >= 25000 {
+					break
+				}
 			}
 		}
 	}
