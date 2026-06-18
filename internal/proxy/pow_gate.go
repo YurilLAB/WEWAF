@@ -24,7 +24,7 @@ const powCookieName = "__wewaf_pow"
 // cookie that validates against the configured secret AND was issued
 // within PoWCookieTTLSec. Constant-time on signature compare.
 func (wp *WAFProxy) hasValidPoWCookie(r *http.Request) bool {
-	if wp == nil || wp.cfg == nil || !wp.cfg.PoWEnabled || wp.cfg.PoWSecret == "" {
+	if wp == nil || wp.cfg == nil || !wp.conf().PoWEnabled || wp.conf().PoWSecret == "" {
 		return false
 	}
 	c, err := r.Cookie(powCookieName)
@@ -36,7 +36,7 @@ func (wp *WAFProxy) hasValidPoWCookie(r *http.Request) bool {
 		return false
 	}
 	body := parts[0] + "." + parts[1]
-	mac := hmac.New(sha256.New, []byte(wp.cfg.PoWSecret))
+	mac := hmac.New(sha256.New, []byte(wp.conf().PoWSecret))
 	mac.Write([]byte(body))
 	// Full SHA-256 digest — must match handlers_session.go:signPowCookie.
 	// The previous truncation to 12 bytes provided no security benefit
@@ -49,7 +49,7 @@ func (wp *WAFProxy) hasValidPoWCookie(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	ttl := time.Duration(wp.cfg.PoWCookieTTLSec) * time.Second
+	ttl := time.Duration(wp.conf().PoWCookieTTLSec) * time.Second
 	if ttl <= 0 {
 		ttl = time.Hour
 	}
@@ -63,10 +63,10 @@ func (wp *WAFProxy) hasValidPoWCookie(r *http.Request) bool {
 // for this request. Requires: PoW enabled, an issuer attached, the
 // session score above the configured trigger, and no valid pass cookie.
 func (wp *WAFProxy) shouldGateWithPoW(r *http.Request, score int) bool {
-	if wp == nil || wp.pow == nil || !wp.cfg.PoWEnabled {
+	if wp == nil || wp.pow == nil || !wp.conf().PoWEnabled {
 		return false
 	}
-	trigger := wp.cfg.PoWTriggerScore
+	trigger := wp.conf().PoWTriggerScore
 	if trigger <= 0 {
 		trigger = 60
 	}

@@ -499,13 +499,20 @@ func main() {
 				return
 			}
 			eng.Reload(compiled)
-			cfg.SetMode(fresh.Mode)
+			cfg.SetMode(fresh.Mode) // mode is atomic, no lock needed
+			// Mutate the shared live fields under cfg's lock — the engine
+			// reads them via cfg.Snapshot() (RLock) and the proxy via its
+			// published snapshot, so an unlocked write here was a data race.
+			cfg.Lock()
 			cfg.BlockThreshold = fresh.BlockThreshold
 			cfg.ParanoiaLevel = fresh.ParanoiaLevel
 			cfg.RateLimitRPS = fresh.RateLimitRPS
 			cfg.RateLimitBurst = fresh.RateLimitBurst
 			cfg.TrustXFF = fresh.TrustXFF
 			cfg.TrustedProxies = append([]string(nil), fresh.TrustedProxies...)
+			cfg.Unlock()
+			// Republish the proxy's hot-path config snapshot.
+			wp.RefreshConfig()
 			// Apply the fresh trust policy atomically. A bad CIDR keeps
 			// the previous policy in place and surfaces in the log.
 			if ipx := wp.IPExtractor(); ipx != nil {

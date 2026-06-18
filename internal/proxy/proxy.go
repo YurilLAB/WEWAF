@@ -41,6 +41,13 @@ import (
 // WAFProxy wraps a reverse proxy with WAF inspection.
 type WAFProxy struct {
 	cfg       *config.Config
+	// cfgSnap holds an immutable snapshot of cfg, published atomically by
+	// RefreshConfig after every config mutation (admin /api/config edit or
+	// hot-reload). Hot-path reads go through conf() so they never race the
+	// writers, which mutate the live cfg fields under cfg's lock. The live
+	// cfg pointer is retained only to build new snapshots and for the
+	// internally-synchronised mode accessor.
+	cfgSnap atomic.Pointer[config.Config]
 	eng       *engine.Engine
 	metrics   *telemetry.Metrics
 	bf        *bruteforce.Detector
@@ -206,7 +213,7 @@ func (wp *WAFProxy) inspectJA3(r *http.Request) (hash string, verdict ja3.Verdic
 // on a public API means we're testing the exact branches the real hot
 // path takes, not a parallel implementation.
 func (wp *WAFProxy) applyHeadersForTest(res *http.Response) {
-	if wp.cfg.SecurityHeadersEnabled {
+	if wp.conf().SecurityHeadersEnabled {
 		res.Header.Set("X-Content-Type-Options", "nosniff")
 		res.Header.Set("X-Frame-Options", "DENY")
 		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -233,16 +240,16 @@ func (wp *WAFProxy) applyHeadersForTest(res *http.Response) {
 			res.Header.Set("Cross-Origin-Opener-Policy", "same-origin")
 		}
 	}
-	if wp.cfg.HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
-		maxAge := wp.cfg.HSTSMaxAgeSec
+	if wp.conf().HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
+		maxAge := wp.conf().HSTSMaxAgeSec
 		if maxAge <= 0 {
 			maxAge = 15552000
 		}
 		v := fmt.Sprintf("max-age=%d", maxAge)
-		if wp.cfg.HSTSIncludeSubdoms {
+		if wp.conf().HSTSIncludeSubdoms {
 			v += "; includeSubDomains"
 		}
-		if wp.cfg.HSTSPreload {
+		if wp.conf().HSTSPreload {
 			v += "; preload"
 		}
 		res.Header.Set("Strict-Transport-Security", v)
@@ -443,6 +450,9 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 		}),
 	}
 
+	// Publish the initial config snapshot for hot-path reads (conf()).
+	wp.RefreshConfig()
+
 	wp.proxy = httputil.NewSingleHostReverseProxy(backend)
 	// A reverse proxy left on DefaultTransport has no per-connection timeouts
 	// and no pool caps — a slow backend can park proxy goroutines for the full
@@ -455,6 +465,30 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	wp.proxy.ErrorHandler = wp.errorHandler
 
 	return wp, nil
+}
+
+// conf returns the current immutable config snapshot for hot-path reads. The
+// snapshot is published by RefreshConfig under cfg's lock, so reading its
+// fields never races the admin handler / hot-reload watcher mutating the live
+// cfg. Falls back to the live cfg when no snapshot has been published yet
+// (e.g. a WAFProxy constructed directly in a unit test) — safe there because
+// such tests don't mutate config concurrently.
+func (wp *WAFProxy) conf() *config.Config {
+	if c := wp.cfgSnap.Load(); c != nil {
+		return c
+	}
+	return wp.cfg
+}
+
+// RefreshConfig republishes the config snapshot from the live cfg. Callers must
+// invoke it after every config mutation (admin /api/config edit, hot-reload)
+// so hot-path readers observe the change. cfg.Snapshot() takes the read lock,
+// producing a consistent copy even if a writer is mid-update.
+func (wp *WAFProxy) RefreshConfig() {
+	if wp == nil || wp.cfg == nil {
+		return
+	}
+	wp.cfgSnap.Store(wp.cfg.Snapshot())
 }
 
 // newBackendTransport returns an http.Transport with explicit timeouts and
@@ -519,7 +553,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if w != nil {
 				// Failsafe: block on panic unless operator opted into
 				// fail-open. 503 + Retry-After lets clients back off.
-				if wp.cfg.FailsafeMode == "open" {
+				if wp.conf().FailsafeMode == "open" {
 					w.Header().Set("X-WAF-Failsafe", "open-pass")
 					wp.proxy.ServeHTTP(w, r)
 					return
@@ -581,12 +615,12 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rejecting a bad handshake is cheaper than admitting it. When the
 	// feature is off we skip the detection entirely so a plain HTTP
 	// request costs nothing here.
-	if wp.cfg.WebSocketInspect && dpi.WSUpgradeRequest(r) {
+	if wp.conf().WebSocketInspect && dpi.WSUpgradeRequest(r) {
 		wp.wsUpgrades.Add(1)
 		verdict := dpi.CheckWSUpgrade(r, dpi.WSUpgradeConfig{
-			OriginAllowlist:      wp.cfg.WebSocketOriginAllowlist,
-			SubprotocolAllowlist: wp.cfg.WebSocketSubprotoAllowlist,
-			RequireSubprotocol:   wp.cfg.WebSocketRequireSubproto,
+			OriginAllowlist:      wp.conf().WebSocketOriginAllowlist,
+			SubprotocolAllowlist: wp.conf().WebSocketSubprotoAllowlist,
+			RequireSubprotocol:   wp.conf().WebSocketRequireSubproto,
 		})
 		if !verdict.Allow {
 			wp.wsRejected.Add(1)
@@ -792,7 +826,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Enforce body size limit before reading.
-	if r.ContentLength > wp.cfg.MaxBodyBytes && r.ContentLength > 0 {
+	if r.ContentLength > wp.conf().MaxBodyBytes && r.ContentLength > 0 {
 		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
 		wp.eng.ProcessLogging(tx)
 		return
@@ -807,7 +841,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// would pass through inspection with the trailing N bytes
 		// dropped — the engine would happily allow a request whose
 		// real payload is bigger than it ever saw.
-		limit := wp.cfg.MaxBodyBytes
+		limit := wp.conf().MaxBodyBytes
 		limited := io.LimitReader(r.Body, limit+1)
 		var err error
 		body, err = io.ReadAll(limited)
@@ -854,9 +888,9 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// handing it to the engine so a 10 KB bomb expanding to 1 GB cannot
 		// starve inspection memory. On failure we reject the request rather
 		// than silently forwarding an uninspected compressed payload.
-		if wp.cfg.DecompressInspect {
+		if wp.conf().DecompressInspect {
 			if decoded, reason := maybeDecompressBody(r.Header, body,
-				wp.cfg.DecompressRatioCap, wp.cfg.MaxDecompressBytes); reason != "" {
+				wp.conf().DecompressRatioCap, wp.conf().MaxDecompressBytes); reason != "" {
 				wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "COMPRESS-BOMB", reason, 100)
 				http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
 				wp.eng.ProcessLogging(tx)
@@ -902,14 +936,14 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// clean block reason, and string-like fields are surfaced for rule
 	// matching. Runs only when both the feature is on and the content
 	// type identifies the request as gRPC.
-	if wp.cfg.GRPCInspect && dpi.IsGRPCRequest(r) {
+	if wp.conf().GRPCInspect && dpi.IsGRPCRequest(r) {
 		wp.grpcRequests.Add(1)
 		res := dpi.InspectGRPCBody(body, dpi.GRPCLimits{
-			MaxFrames:       wp.cfg.GRPCMaxFrames,
-			MaxFrameBytes:   wp.cfg.GRPCMaxFrameBytes,
-			BlockCompressed: wp.cfg.GRPCBlockCompressed,
+			MaxFrames:       wp.conf().GRPCMaxFrames,
+			MaxFrameBytes:   wp.conf().GRPCMaxFrameBytes,
+			BlockCompressed: wp.conf().GRPCBlockCompressed,
 		})
-		if res.Blocked && wp.cfg.GRPCBlockOnError {
+		if res.Blocked && wp.conf().GRPCBlockOnError {
 			wp.grpcBlocked.Add(1)
 			intr := &core.Interruption{
 				Action:  core.ActionBlock,
@@ -980,7 +1014,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// changing any rule.
 	if sessID != "" && wp.sessions != nil && wp.sessions.Enabled() {
 		risk := wp.sessions.Score(sessID)
-		if threshold := wp.cfg.SessionBlockThreshold; threshold > 0 && risk >= threshold {
+		if threshold := wp.conf().SessionBlockThreshold; threshold > 0 && risk >= threshold {
 			intr := &core.Interruption{
 				Action:  core.ActionBlock,
 				Status:  http.StatusForbidden,
@@ -1016,7 +1050,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Brute-force enforcement.
 	if wp.bf != nil && isLogin {
 		key := bruteforce.Key(tx.ClientIP, "")
-		if wp.bf.IsBruteForce(key, wp.cfg.BruteForceThreshold) {
+		if wp.bf.IsBruteForce(key, wp.conf().BruteForceThreshold) {
 			mode := wp.cfg.ModeSnapshot()
 			if mode != "detection" && mode != "learning" {
 				wp.metrics.RecordBlock(tx.ClientIP, r.Method, r.URL.Path, "BRUTE-FORCE", "Brute-force threshold exceeded", 100)
@@ -1090,7 +1124,7 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	if res.Body == nil {
 		return nil
 	}
-	maxInspect := wp.cfg.MaxBodyBytes
+	maxInspect := wp.conf().MaxBodyBytes
 	if maxInspect <= 0 {
 		maxInspect = 1 << 20
 	}
@@ -1119,7 +1153,7 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	}
 
 	// Inject security headers and strip identifying ones.
-	if wp.cfg.SecurityHeadersEnabled {
+	if wp.conf().SecurityHeadersEnabled {
 		res.Header.Set("X-Content-Type-Options", "nosniff")
 		res.Header.Set("X-Frame-Options", "DENY")
 		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -1149,16 +1183,16 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	// HSTS — only emit on HTTPS backends. Setting Strict-Transport-Security
 	// on http:// is spec-non-compliant and most browsers ignore it anyway,
 	// so we silently skip rather than mis-advertise transport guarantees.
-	if wp.cfg.HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
-		maxAge := wp.cfg.HSTSMaxAgeSec
+	if wp.conf().HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
+		maxAge := wp.conf().HSTSMaxAgeSec
 		if maxAge <= 0 {
 			maxAge = 15552000
 		}
 		v := fmt.Sprintf("max-age=%d", maxAge)
-		if wp.cfg.HSTSIncludeSubdoms {
+		if wp.conf().HSTSIncludeSubdoms {
 			v += "; includeSubDomains"
 		}
-		if wp.cfg.HSTSPreload {
+		if wp.conf().HSTSPreload {
 			v += "; preload"
 		}
 		res.Header.Set("Strict-Transport-Security", v)

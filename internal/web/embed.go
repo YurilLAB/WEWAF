@@ -956,6 +956,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		// leaves the previous policy in place and surfaces in the log
 		// — refusing to apply is safer than silently dropping the gate.
 		if s.proxy != nil {
+			// Republish the proxy's hot-path config snapshot so the edits
+			// above are observed without racing the live cfg fields.
+			s.proxy.RefreshConfig()
 			if ipx := s.proxy.IPExtractor(); ipx != nil {
 				if err := ipx.Update(updateTrustXFF, updateTrustedProxies); err != nil {
 					log.Printf("config: trusted_proxies update rejected: %v", err)
