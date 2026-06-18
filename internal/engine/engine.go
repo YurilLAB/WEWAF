@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -81,6 +82,24 @@ var (
 	// legitimate multi-line GET parameters (plain "%0a"-separated text) from
 	// matching, while catching "%0d%0aSet-Cookie:", "%0d%0aLocation:", etc.
 	crlfInjectionRe = regexp.MustCompile(`(?i)(?:%(?:25)*0[ad]|[\r\n])(?:%(?:25)*0[ad]|[\r\n])?(?:%(?:25)*20|\+|\s)*[a-z][a-z0-9-]{1,40}\s*(?:%(?:25)*3a|:)`)
+
+	// jwtRe matches a JWT-shaped token. A JWT header is base64url of {"alg"...,
+	// which always begins "eyJ", so the prefix is a reliable, low-FP marker.
+	jwtRe = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*`)
+	// jwtAlgNoneRe matches an unsigned-token "alg":"none" (any case) in a
+	// DECODED JWT header — the classic signature-bypass.
+	jwtAlgNoneRe = regexp.MustCompile(`(?i)"alg"\s*:\s*"?\s*none\b`)
+	// jwtKidRe extracts the "kid" (key id) header parameter value.
+	jwtKidRe = regexp.MustCompile(`(?i)"kid"\s*:\s*"([^"]*)"`)
+	// jwtDangerousKidRe flags a kid value carrying injection metacharacters or
+	// traversal — the kid is used to look up a key and is a documented SQLi /
+	// LFI / command-injection sink. Legitimate kids are plain identifiers
+	// (alphanumerics, '-', '_', ':') and never contain these.
+	jwtDangerousKidRe = regexp.MustCompile("[\"'<>;|$`\\\\]|\\.\\.|\\x00|(?i)\\b(?:union|select|sleep|or\\s+1=1|etc/passwd)\\b")
+	// jwtJkuRe flags a client-presented jku/x5u (external key-set URL) header —
+	// attacker-supplied key sources (CVE-2018-0114 class). Log-level: some
+	// issuers legitimately use jku, so it is recorded rather than blocked.
+	jwtJkuRe = regexp.MustCompile(`(?i)"(?:jku|x5u)"\s*:`)
 
 	// nullByteRe detects a NUL byte in the RAW request target — encoded
 	// (%00, %2500, …) or literal. The canonicalizer strips NUL before rules
@@ -490,6 +509,24 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 			})
 		}
 
+		// JWT header attacks. JWTs are base64url-encoded, so alg:none / kid
+		// injection / jku abuse are invisible to the regular regex rules
+		// (JWT-001 only sees a literal "alg":"none"). Decode the header and
+		// inspect it. Scan the Authorization and Cookie headers plus query
+		// args — the placements where a token is presented.
+		for key, val := range targets {
+			if !strings.Contains(val, "eyJ") {
+				continue
+			}
+			lk := strings.ToLower(key)
+			if lk == "headers.authorization" || lk == "headers.cookie" ||
+				strings.HasPrefix(lk, "args.") || lk == "uri" {
+				for _, m := range detectJWTAttacks(val) {
+					addMatch(m)
+				}
+			}
+		}
+
 		// NUL-byte injection in the raw request target (canonicalisation strips
 		// it before the rule engine sees it).
 		if nullByteRe.MatchString(rawURI) {
@@ -785,6 +822,62 @@ func (e *Engine) readBodyString(r *http.Request) (string, error) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 	return string(body), nil
+}
+
+// detectJWTAttacks finds JWT-shaped tokens in s, base64url-decodes each
+// header segment, and returns matches for attacks the encoded form hides from
+// regular regex rules: alg:none signature bypass, kid header injection
+// (SQLi/LFI/command), and a client-presented jku/x5u external key source. It
+// is bounded (maxJWTs) so a body packed with eyJ-prefixed strings can't blow
+// up cost, and never panics on malformed base64.
+func detectJWTAttacks(s string) []core.Match {
+	const maxJWTs = 8
+	if !strings.Contains(s, "eyJ") {
+		return nil
+	}
+	var matches []core.Match
+	found := jwtRe.FindAllString(s, maxJWTs)
+	for _, tok := range found {
+		seg := tok
+		if i := strings.IndexByte(seg, '.'); i >= 0 {
+			seg = seg[:i]
+		}
+		hdrBytes, err := base64.RawURLEncoding.DecodeString(seg)
+		if err != nil {
+			// Tolerate accidental padding.
+			if hb, err2 := base64.StdEncoding.DecodeString(seg); err2 == nil {
+				hdrBytes = hb
+			} else {
+				continue
+			}
+		}
+		hdr := string(hdrBytes)
+		if !strings.Contains(hdr, "alg") && !strings.Contains(hdr, "kid") && !strings.Contains(hdr, "jku") && !strings.Contains(hdr, "x5u") {
+			continue // decoded to something that isn't a JWT header
+		}
+		if jwtAlgNoneRe.MatchString(hdr) {
+			matches = append(matches, core.Match{
+				RuleID: "JWT-002", RuleName: "JWT alg:none signature bypass", Phase: core.PhaseRequestHeaders,
+				Target: "jwt.header", Value: trunc(hdr, 64), Score: 90, Action: core.ActionBlock,
+				Message: "JWT header declares alg:none (unsigned token)", Timestamp: time.Now().UTC(),
+			})
+		}
+		if m := jwtKidRe.FindStringSubmatch(hdr); m != nil && jwtDangerousKidRe.MatchString(m[1]) {
+			matches = append(matches, core.Match{
+				RuleID: "JWT-003", RuleName: "JWT kid header injection", Phase: core.PhaseRequestHeaders,
+				Target: "jwt.header", Value: trunc(m[1], 64), Score: 90, Action: core.ActionBlock,
+				Message: "JWT kid parameter contains injection metacharacters", Timestamp: time.Now().UTC(),
+			})
+		}
+		if jwtJkuRe.MatchString(hdr) {
+			matches = append(matches, core.Match{
+				RuleID: "JWT-004", RuleName: "JWT external key source", Phase: core.PhaseRequestHeaders,
+				Target: "jwt.header", Value: trunc(hdr, 64), Score: 50, Action: core.ActionLog,
+				Message: "JWT header references an external key set (jku/x5u)", Timestamp: time.Now().UTC(),
+			})
+		}
+	}
+	return matches
 }
 
 // isFormURLEncoded reports whether the request body is
