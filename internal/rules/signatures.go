@@ -58,7 +58,11 @@ var cmdInjectionPattern = "(?i)(?:[;|`\\n]|&&|\\|\\|)\\s*" +
 	"dmesg|lsof|mount|umount|iptables|systemctl|nslookup|traceroute|tracert|ping|" +
 	"ls|dir|cat|head|tail|grep|egrep|fgrep|find|locate|chmod|chown|rm|mkdir|rmdir|" +
 	"touch|ps|kill|killall|pkill|base64|xxd|od|strings|md5sum|sha1sum|sha256sum|" +
-	"arp|route|ifup|ifdown|service|nmap|dig)\\b"
+	// The command must end at a non-word boundary, but NOT a comma: this keeps
+	// real injection (";base64 -d", ";base64|sh", ";id", ";cat /etc/passwd")
+	// while excluding the base64 DATA URI "data:<mime>;base64,..." whose
+	// ";base64," would otherwise false-positive on legitimate inline images.
+	"arp|route|ifup|ifdown|service|nmap|dig)(?:[^\\w,]|$)"
 
 // symbolicLogicalSQLiPattern detects the sqlmap "symboliclogical" tamper: an
 // OR/AND tautology where the keyword is replaced with the symbolic operator
@@ -512,6 +516,15 @@ func DefaultRules() []core.Rule {
 		{ID: "LFI-010", Name: "Unicode traversal", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Unicode / alt-encoded ../ sequences", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:%c0%ae|%c1%9c|%uff0e|%u002e|\.\\\.\\|\.\./\\)`},
 		{ID: "LFI-011", Name: "PHP wrapper", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PHP stream wrappers (data, expect, phar, zip)", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)\b(?:data|expect|phar|zip|compress\.zlib|compress\.bzip2|glob|ogg|ssh2|rar):/{0,2}[^\s]`},
 		{ID: "LFI-012", Name: "Windows sensitive file", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Windows system path in request", Targets: []string{"uri", "args"}, Pattern: `(?i)\b(?:c:\\windows\\system32\\|boot\.ini|win\.ini|\\sam|\\security|\\ntds\.dit)\b`},
+		// PHP / stream wrappers in the QUERY STRING. LFI-011, TRAV-003 and
+		// CRS-933140 all cover the wrappers but run in the body phase, so they
+		// only see form-parsed POST args — a GET ?file=php://filter/... or
+		// ?file=expect://id slipped straight through (only file:// was caught,
+		// incidentally, by the header-phase SSRF-011). Mirror the body coverage
+		// in the header phase for uri/path/args. The "://" (two slashes) is
+		// required so this never collides with a legitimate "data:" image URI
+		// (single colon) — every dangerous wrapper form uses scheme://.
+		{ID: "LFI-013", Name: "PHP wrapper (args/uri)", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "PHP/stream wrapper in query string (php://, expect://, phar://, zip://, data://)", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:php|expect|phar|zip|glob|ssh2|ogg|rar|data|zlib|compress\.(?:zlib|bzip2))://`},
 
 		// --- SQLi extensions ---
 		{ID: "SQLI-020", Name: "PostgreSQL pg_sleep", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Time-based pg_sleep injection", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)pg_sleep\s*\(`},
