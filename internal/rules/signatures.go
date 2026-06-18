@@ -122,6 +122,17 @@ func DefaultRules() []core.Rule {
 		{ID: "XXE-001", Name: "XXE DOCTYPE", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "XML DOCTYPE declaration", Targets: []string{"body"}, Pattern: `(?i)<!DOCTYPE\s`},
 		{ID: "XXE-002", Name: "XXE ENTITY", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "XML ENTITY declaration", Targets: []string{"body"}, Pattern: `(?i)<!ENTITY\s`},
 		{ID: "XXE-003", Name: "XXE External Entity", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "External entity SYSTEM/PUBLIC reference", Targets: []string{"body"}, Pattern: `(?i)\b(SYSTEM|PUBLIC)\s+["']`},
+		// XInclude is the DOCTYPE-less XXE alternative: when an attacker controls
+		// only a sub-element of the XML (e.g. a SOAP body) they cannot declare a
+		// DOCTYPE/ENTITY, so XXE-001/002 never fire — but an <xi:include
+		// href="..."/> still pulls in a local file or fires an SSRF. The
+		// scheme/path-qualified forms get caught coincidentally by the SSRF /
+		// traversal rules, but a bare relative href ("config.xml") slips through.
+		// The XInclude namespace URI and the <xi:include element never appear in
+		// benign request data (and do NOT collide with legitimate XSLT
+		// <xsl:include>, which lives in a different namespace), so matching them
+		// is false-positive-free.
+		{ID: "XXE-004", Name: "XXE XInclude", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "XInclude local-file / SSRF (DOCTYPE-less XXE)", Targets: []string{"body"}, Pattern: `(?i)<xi:include\b|www\.w3\.org/2001/xinclude`},
 
 		// === LDAP Injection ===
 		// LDAP filter syntax requires parenthesised expressions with

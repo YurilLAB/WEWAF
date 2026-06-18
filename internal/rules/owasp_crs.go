@@ -131,7 +131,14 @@ func CRSRules() []core.Rule {
 		// ============================================================
 		// REQUEST-933: PHP Injection (PL1-PL3)
 		// ============================================================
-		{ID: "CRS-933100", Name: "CRS PHP Open Tag", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 70, Action: core.ActionBlock, Description: "CRS: PHP open tag in request body", Targets: []string{"args", "body"}, Pattern: `<\?(?:php|=)?`},
+		// The bare "<?" short-tag form must still match (a real PHP injection
+		// vector), but the XML declaration "<?xml ...?>" must NOT — otherwise
+		// every legitimate XML / SOAP / RSS / SVG / SAML request body is blocked
+		// as a "PHP open tag". Upstream OWASP CRS 933100 carves out the XML
+		// prolog the same way: match "<?" unless it is exactly "<?xml" followed
+		// by whitespace, "/", ">", or "?". "<?php", "<?=", and "<? <code>" still hit
+		// via the [^x] branch.
+		{ID: "CRS-933100", Name: "CRS PHP Open Tag", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 70, Action: core.ActionBlock, Description: "CRS: PHP open tag in request body", Targets: []string{"args", "body"}, Pattern: `<\?(?:[^x]|x[^m]|xm[^l]|xml[^\s/>?])`},
 		{ID: "CRS-933110", Name: "CRS PHP Script File Upload", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 80, Action: core.ActionBlock, Description: "CRS: PHP file upload by extension", Targets: []string{"body"}, Pattern: `(?i)filename\s*=\s*"[^"]*\.(?:php[3457s]?|phtml|phar|inc|ph[pt]|pl|py|jsp|asp[xh]?|cgi|sh|exe|bat|cmd)"`},
 		{ID: "CRS-933120", Name: "CRS PHP Config Directive", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 70, Action: core.ActionBlock, Description: "CRS: PHP ini directive injection", Targets: []string{"args", "body"}, Pattern: `(?i)(?:allow_url_(?:include|fopen)|auto_prepend_file|auto_append_file|disable_functions|open_basedir|safe_mode)\s*=`},
 		{ID: "CRS-933130", Name: "CRS PHP Magic Variables", Phase: core.PhaseRequestBody, Paranoia: 2, Category: "crs.php", Score: 60, Action: core.ActionBlock, Description: "CRS: PHP superglobals in user input", Targets: []string{"args", "body"}, Pattern: `(?i)\$(?:GLOBALS|_(?:GET|POST|COOKIE|SESSION|REQUEST|SERVER|ENV|FILES))\b`},
