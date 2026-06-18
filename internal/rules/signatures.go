@@ -60,6 +60,17 @@ var cmdInjectionPattern = "(?i)(?:[;|`\\n]|&&|\\|\\|)\\s*" +
 	"touch|ps|kill|killall|pkill|base64|xxd|od|strings|md5sum|sha1sum|sha256sum|" +
 	"arp|route|ifup|ifdown|service|nmap|dig)\\b"
 
+// symbolicLogicalSQLiPattern detects the sqlmap "symboliclogical" tamper: an
+// OR/AND tautology where the keyword is replaced with the symbolic operator
+// "||" / "&&" and the operands are quoted strings, e.g. 1'||'1'='1 or
+// 1'&&'1'='1. SQLI-003 only matches the "or"/"and" keyword form or a bare
+// digit=digit, so these slipped through. The discriminator that keeps it off
+// legitimate JS/shell "||"/"&&" (true||false, x=1||y=2, a && b) is a QUOTED
+// operand immediately after the operator followed by "=" — the string-equality
+// tautology shape that only SQL injection produces. Used by SQLI-025 (body
+// phase) and SQLI-026 (header phase / query args).
+var symbolicLogicalSQLiPattern = `(?i)(?:\|\||&&)\s*['"]\s*\w+\s*['"]\s*=`
+
 // DefaultRules returns the built-in high-value signatures.
 func DefaultRules() []core.Rule {
 	return []core.Rule{
@@ -453,6 +464,10 @@ func DefaultRules() []core.Rule {
 		{ID: "SQLI-022", Name: "Hex-encoded SQLi payload", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "0x68657870... hex-encoded strings", Targets: []string{"args", "body"}, Pattern: `(?i)0x[0-9a-f]{20,}`},
 		{ID: "SQLI-023", Name: "Stacked queries", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "Semicolon-separated query followed by keyword", Targets: []string{"args", "body"}, Pattern: `(?i);\s*(?:select|insert|update|delete|drop|create|alter|exec|xp_cmdshell)\b`},
 		{ID: "SQLI-024", Name: "Comment-based evasion", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "MySQL /*!...*/ or -- evasion", Targets: []string{"args", "body"}, Pattern: `(?i)/\*!\d{5}.*\*/|\bunion\b\s*(?:/\*.*?\*/\s*)?select`},
+		// Symbolic-logical tautology (sqlmap symboliclogical tamper): OR/AND
+		// replaced by ||/&& with quoted operands, e.g. 1'||'1'='1.
+		{ID: "SQLI-025", Name: "Symbolic logical tautology (body)", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "SQL ||/&& string tautology (OR/AND keyword evasion)", Targets: []string{"args", "body"}, Pattern: symbolicLogicalSQLiPattern},
+		{ID: "SQLI-026", Name: "Symbolic logical tautology (args)", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "SQL ||/&& string tautology in query args", Targets: []string{"args"}, Pattern: symbolicLogicalSQLiPattern},
 
 		// --- RCE / command injection extensions ---
 		{ID: "RCE-010", Name: "Powershell encoded command", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PowerShell -EncodedCommand / IEX DownloadString", Targets: []string{"args", "body"}, Pattern: `(?i)(?:-EncodedCommand|iex\s*\(\s*new-object\s+net\.webclient|DownloadString\s*\()`},

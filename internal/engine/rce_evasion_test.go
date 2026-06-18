@@ -75,3 +75,39 @@ func TestRCEObfuscationNoFalsePositive(t *testing.T) {
 		})
 	}
 }
+
+// TestSymbolicLogicalSQLiBlocked is the regression for the sqlmap
+// symboliclogical tamper: OR/AND replaced with ||/&& and quoted operands.
+// SQLI-003 only matched the keyword/digit forms, so these tautologies slipped
+// past until SQLI-025/026 were added.
+func TestSymbolicLogicalSQLiBlocked(t *testing.T) {
+	eng := newFuzzEngine(t)
+	attacks := []string{
+		`1'||'1'='1`,
+		`1'&&'1'='1`,
+		`1' || '1' = '1`,
+		`x'||'a'='a`,
+	}
+	for _, p := range attacks {
+		p := p
+		t.Run(p, func(t *testing.T) {
+			if !rceBodyBlocked(eng, p) {
+				t.Errorf("symbolic-logical SQLi tautology not blocked: %q", p)
+			}
+		})
+	}
+	// JS/shell logical operators without the string-equality tautology shape
+	// must NOT trip the rule.
+	legit := []string{
+		"true||false", "a && b", "x=1||y=2", "cfg = host||'localhost'",
+		"https://example.com/?a=1||2",
+	}
+	for _, p := range legit {
+		p := p
+		t.Run("legit_"+p, func(t *testing.T) {
+			if rceBodyBlocked(eng, p) {
+				t.Errorf("legit ||/&& wrongly blocked as SQLi: %q", p)
+			}
+		})
+	}
+}
