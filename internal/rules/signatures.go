@@ -367,6 +367,15 @@ func DefaultRules() []core.Rule {
 		{ID: "EL-001", Name: "Expression Language Injection", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "EL injection with dangerous class or runtime access", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\$\{[^}]*(?:java|runtime|exec|process|environment|classloader)[^}]*\}|\#\{[^}]*(?:java|runtime|exec|process|environment)[^}]*\})`},
 		{ID: "XPATH-002", Name: "XPath Injection Variant", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "XPath injection with axis or boolean bypass", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\/(?:child|parent|descendant|ancestor|attribute|self)::|count\s*\(\s*\/\/|(?:'|")\s*(?:or|and)\s+(?:'|")?\d+(?:'|")?\s*=\s*(?:'|")?\d+|\/\/\*\[|\]\s*\|\s*\/\/|\*\[local-name\s*\()`},
 		{ID: "XSS-013", Name: "CSS Style Attribute Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "CSS injection or style attribute XSS payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:style\s*=\s*["']?[^"'>]{0,200}(?:javascript\s*:|@import\s+|(?:-moz-binding|behavior)\s*:|data\s*:\s*text\/css|url\s*\(\s*["']?\s*javascript\s*:))`},
+		// CSS script-execution constructs anywhere (e.g. inside a <style> TAG,
+		// not just a style= attribute, which XSS-013 covers). These are
+		// script-executing CSS features that legitimate stylesheets never use,
+		// so blocking them is FP-safe — UNLIKE @import / url() of an external
+		// resource, which is deliberately NOT matched here because Google Fonts
+		// and CDNs use exactly that ("@import url('//fonts.googleapis.com')").
+		// Covers -moz-binding (XBL), IE behavior:url() (HTC), javascript:/
+		// vbscript: in url(), and @import of a javascript:/data:text/html sink.
+		{ID: "XSS-014", Name: "CSS script-execution construct", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Script-executing CSS construct (-moz-binding / behavior:url / url(javascript:) / @import javascript:)", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)-moz-binding\s*:|behavior\s*:\s*url\s*\(|(?:url|src)\s*\(\s*['"]?\s*(?:javascript|vbscript)\s*:|@import\s+(?:url\s*\(\s*)?['"]?\s*(?:javascript:|data\s*:\s*text/html)`},
 		// === Information Disclosure ===
 		{ID: "INFO-001", Name: "Stack Trace Disclosure", Phase: core.PhaseResponseBody, Score: 50, Action: core.ActionLog, Description: "Stack trace or exception details leaked in response", Targets: []string{"body"}, Pattern: `(?i)(stack\s*trace|traceback\s*\(most\s*recent\s*call\s*last\)|exception\s*in\s*thread|error\s*at\s*line\s*\d+|caused\s*by\s*:\s*\S{3,})`},
 		{ID: "INFO-002", Name: "Git Directory Exposure", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Git repository directory exposed in URL", Targets: []string{"uri"}, Pattern: `(?i)/\.git(/|$|\s|\?|&)`},

