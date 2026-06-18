@@ -340,6 +340,51 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 		}
 	}
 
+	// Query-string args + request target into the BODY phase. The header phase
+	// builds args.* / uri from the query string, but only the SUBSET of rules
+	// marked PhaseRequestHeaders runs there — the bulk of the signature set
+	// (XSS, XPath, SSI, deserialization, prototype pollution, Spring4Shell,
+	// LDAP, JSON NoSQL, …) is PhaseRequestBody and so never saw the query
+	// string. The result was a gaping hole: a reflected ?q=<script>alert(1)
+	// </script> — the most common XSS vector — bypassed every XSS rule, and
+	// likewise for the other body-only classes. Mirror the query args and the
+	// URI into the body-phase target map so the FULL rule set inspects them,
+	// decoded and homoglyph-folded exactly like the header phase. Query args
+	// are merged into the existing "args.NAME" keys (so a name present in both
+	// the query and a form body keeps both payloads); the URI is added only if
+	// a form body did not already populate it. Bounded so a query packed with
+	// params can't blow up the target map.
+	if tx.Request != nil && tx.Request.URL != nil {
+		const maxQueryFields = 256
+		added := 0
+		for k, vs := range tx.Request.URL.Query() {
+			if added >= maxQueryFields {
+				e.logger.Warnf("engine: query-field limit (%d) reached", maxQueryFields)
+				break
+			}
+			raw := strings.Join(vs, ", ")
+			decoded := raw
+			if d, err := url.QueryUnescape(raw); err == nil {
+				decoded = d
+			}
+			val := FoldHomoglyphs(Canonicalize(decoded))
+			key := "args." + k
+			if existing, ok := targets[key]; ok && existing != val {
+				targets[key] = existing + ", " + val
+			} else {
+				targets[key] = val
+			}
+			added++
+		}
+		if _, ok := targets["uri"]; !ok {
+			if uri, err := url.PathUnescape(tx.Request.URL.RequestURI()); err == nil {
+				targets["uri"] = FoldHomoglyphs(Canonicalize(uri))
+			} else {
+				targets["uri"] = FoldHomoglyphs(Canonicalize(tx.Request.URL.RequestURI()))
+			}
+		}
+	}
+
 	// UTF-7 decoded body view. A payload like "+ADw-script+AD4-" is inert ASCII
 	// to every signature rule, but a backend that honors charset=utf-7 decodes
 	// it to "<script>" — the classic UTF-7 XSS smuggle (confirmed by fuzzing:

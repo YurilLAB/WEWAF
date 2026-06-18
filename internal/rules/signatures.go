@@ -126,7 +126,11 @@ func DefaultRules() []core.Rule {
 		// === SQL Injection — immediate / high score ===
 		{ID: "SQLI-001", Name: "SQLi Union Select", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "UNION SELECT pattern", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)union(\s+|/\*[\s\S]{0,100}\*/)+(all(\s+|/\*[\s\S]{0,100}\*/)+)?select`},
 		{ID: "SQLI-002", Name: "SQLi Stacked Destructive", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Stacked destructive query", Targets: []string{"args", "body"}, Pattern: `(?i);\s*(drop|delete|truncate|insert|update)\s`},
-		{ID: "SQLI-003", Name: "SQLi Tautology + Comment", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Tautology with comment sequence", Targets: []string{"args", "body"}, Pattern: `(?i)(['"]?\s*\b(?:or|and)\b\s*['"]?[^'"\s=]+['"]?\s*=\s*['"]?[^'"\s=]+|\d+\s*=\s*\d+)`},
+		// Operands exclude "<" / ">" so natural-language "and >= for" / "use <=
+		// and ..." is not read as the tautology "and X=Y": a real SQL tautology
+		// operand (1, 'x', col) never starts with an angle bracket, and the
+		// inequality forms are covered by SQLI-005.
+		{ID: "SQLI-003", Name: "SQLi Tautology + Comment", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Tautology with comment sequence", Targets: []string{"args", "body"}, Pattern: `(?i)(['"]?\s*\b(?:or|and)\b\s*['"]?[^'"\s=<>]+['"]?\s*=\s*['"]?[^'"\s=<>]+|\d+\s*=\s*\d+)`},
 		{ID: "SQLI-004", Name: "SQLi Time-based Function", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Time-based SQLi function", Targets: []string{"args", "body"}, Pattern: `(?i)(sleep\s*\(|benchmark\s*\(|pg_sleep\s*\(|waitfor\s+delay)`},
 		{ID: "SQLI-005", Name: "SQLi Blind Boolean", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Blind boolean tautology", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(\band\b\s*\(?\s*1\s*=\s*1|\bor\b\s*\(?\s*1\s*=\s*1|\band\b\s*\(?\s*2\s*>\s*1|\bor\b\s*\(?\s*2\s*>\s*1)`},
 		{ID: "SQLI-006", Name: "SQLi Error Based", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Error-based SQLi information extraction", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(convert\s*\(\s*int\s*,\s*@@version|@@datadir|@@version|@@hostname|db_name\s*\()`},
@@ -309,7 +313,14 @@ func DefaultRules() []core.Rule {
 		{ID: "RCE-008", Name: "RCE Perl Open", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Perl open command execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)perl\s+-e\s*['"][^'"]*\bopen\s*[\s\(]`},
 
 		// === XSS Template Injection / Polyglots ===
-		{ID: "XSS-012", Name: "XSS Template Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Template expression or polyglot payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\$\{[^}]{0,200}\}`},
+		// Require a CODE indicator inside "${...}" — digit arithmetic (the 7*7
+		// SSTI probe), a call, a scope operator, a string/backtick literal, or a
+		// dangerous keyword — not a bare "${identifier}". The old catch-all
+		// "\$\{[^}]{0,200}\}" blocked every "${price}" / "${user.name}" / JS
+		// template literal, a heavy false positive (now that query args reach
+		// the body phase, "?q=cost is ${price}" hit it too). The dangerous EL
+		// forms remain covered here and by EL-001 / SSTI-002 / SSTI-006.
+		{ID: "XSS-012", Name: "XSS Template Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Template expression or polyglot payload", Targets: []string{"args", "body", "headers"}, Pattern: "(?i)\\$\\{[^}]*(?:\\d\\s*[-+*/%]\\s*\\d|\\(|::|`|['\"]|java\\b|runtime|exec|process|class\\b|system\\b|getRuntime|new\\s)[^}]*\\}"},
 
 		// === JSON Injection ===
 		{ID: "JSON-001", Name: "JSON Injection", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Suspicious JSON privilege escalation", Targets: []string{"args", "body"}, Pattern: `(?i)\{\s*["']?(?:admin|role|isAdmin|permissions|access)\s*["']?\s*:\s*(?:true|1|null)\s*\}`},
@@ -538,7 +549,12 @@ func DefaultRules() []core.Rule {
 
 		// --- Path traversal / file inclusion variants ---
 		{ID: "LFI-010", Name: "Unicode traversal", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Unicode / alt-encoded ../ sequences", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:%c0%ae|%c1%9c|%uff0e|%u002e|\.\\\.\\|\.\./\\)`},
-		{ID: "LFI-011", Name: "PHP wrapper", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PHP stream wrappers (data, expect, phar, zip)", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)\b(?:data|expect|phar|zip|compress\.zlib|compress\.bzip2|glob|ogg|ssh2|rar):/{0,2}[^\s]`},
+		// Require "://" (two slashes): every real stream-wrapper use is
+		// "scheme://...". The old ":/{0,2}" also matched the single-colon
+		// "data:" form, false-positiving on legitimate "data:image/png;base64,"
+		// URIs (now that query args reach the body phase, a ?img=data:... query
+		// hit it too). XSS data: URIs are still covered by XSS-008.
+		{ID: "LFI-011", Name: "PHP wrapper", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PHP stream wrappers (data, expect, phar, zip)", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)\b(?:data|expect|phar|zip|compress\.zlib|compress\.bzip2|glob|ogg|ssh2|rar)://[^\s]`},
 		{ID: "LFI-012", Name: "Windows sensitive file", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Windows system path in request", Targets: []string{"uri", "args"}, Pattern: `(?i)\b(?:c:\\windows\\system32\\|boot\.ini|win\.ini|\\sam|\\security|\\ntds\.dit)\b`},
 		// PHP / stream wrappers in the QUERY STRING. LFI-011, TRAV-003 and
 		// CRS-933140 all cover the wrappers but run in the body phase, so they
