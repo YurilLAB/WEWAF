@@ -1474,6 +1474,12 @@ func NewEgressProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.M
 		dnsCache: newEgressDNSCache(60*time.Second, 4096),
 		rl:       newEgressRateLimiter(50, 100),
 	}
+	// Pin the dial to a validated IP (see safeDial) so a host that resolves
+	// "safe" for the dangerReason pre-check can't rebind to an internal /
+	// metadata IP at connection time.
+	if tr, ok := ep.client.Transport.(*http.Transport); ok {
+		tr.DialContext = ep.safeDial
+	}
 	// Pre-resolve allowlisted hosts into the DNS cache so the first
 	// real outbound request doesn't spend 5s waiting on LookupIP.
 	// Background goroutine — never blocks startup.
@@ -1719,7 +1725,16 @@ func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+	// Dial through safeDial so the CONNECT tunnel validates the exact IP it
+	// connects to — net.DialTimeout would re-resolve r.Host and could be
+	// rebound to an internal / metadata IP after the dangerReason pre-check.
+	dialHost := r.Host
+	if _, _, err := net.SplitHostPort(dialHost); err != nil {
+		dialHost = net.JoinHostPort(dialHost, "443")
+	}
+	dialCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	destConn, err := ep.safeDial(dialCtx, "tcp", dialHost)
 	if err != nil {
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		return
@@ -1773,6 +1788,50 @@ func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	_ = destConn.Close()
 	_ = clientConn.Close()
 	<-done
+}
+
+// safeDial resolves addr's host, validates the resolved IPs, and dials a
+// validated IP directly — so the address that is security-checked is exactly
+// the one connected to. This closes the DNS-rebinding TOCTOU: the pre-flight
+// dangerReason check resolves the hostname, but the dial previously re-resolved
+// it independently (net.DialTimeout for CONNECT, the default DialContext for
+// HTTP) and could land on 169.254.169.254 / an internal IP that the check never
+// saw. By re-classifying the exact IP at dial time, the guard holds even if the
+// attacker's DNS flips between the two lookups. When EgressBlockPrivateIPs is
+// off the operator has opted out of IP classification, so we resolve+pin
+// without rejecting. TLS ServerName / Host stay the hostname (net/http sets
+// them from the URL), so certificate verification is unaffected.
+func (ep *EgressProxy) safeDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := ep.dnsCache.Lookup(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("egress: resolve %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("egress: no addresses for %q", host)
+	}
+	d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	var lastErr error
+	for _, ip := range ips {
+		if ep.cfg != nil && ep.cfg.EgressBlockPrivateIPs {
+			if reason := classifyIP(ip); reason != "" {
+				lastErr = fmt.Errorf("egress: blocked dial to %s (%s): %s", host, ip, reason)
+				continue
+			}
+		}
+		conn, derr := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if derr == nil {
+			return conn, nil
+		}
+		lastErr = derr
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("egress: no dialable address for %q", host)
+	}
+	return nil, lastErr
 }
 
 func (ep *EgressProxy) recordEgressBlock(targetURL, reason string) {
