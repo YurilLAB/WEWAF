@@ -85,6 +85,22 @@ var symbolicLogicalSQLiPattern = `(?i)(?:\|\||&&)\s*['"]\s*\w+\s*['"]\s*=`
 // and SQLI-028 (header phase / query args).
 var likeTautologyPattern = `(?i)\b(?:or|and)\s+(?:\d+|'[^']{1,8}'|"[^"]{1,8}")\s+(?:like|rlike|regexp)\s+(?:\d+|'[^']{1,8}'|"[^"]{1,8}")`
 
+// queryNoSQLBracketPattern detects the bracket-notation MongoDB operator that
+// PHP and Express/qs parse out of a query string or form into a nested object:
+// "?username[$ne]=1" becomes {username:{$ne:1}} — the classic NoSQL auth
+// bypass. The JSON-body form is caught by NOSQL-001/003 (body phase), but the
+// query-string form lives in the request-target / param KEY, which only the
+// header-phase "uri" target sees. The "[$" + operator + "]" shape never
+// appears in a legitimate parameter name, so it is false-positive-free.
+var queryNoSQLBracketPattern = `(?i)\[\$(?:ne|gt|gte|lt|lte|in|nin|eq|regex|where|exists|nor|not|or|and|all|elemmatch|size|type|mod|text|search|expr)\]`
+
+// querySSTIPattern mirrors the body-phase SSTI signatures (SSTI-001/003) for
+// the query string. It requires a DANGEROUS token inside the template
+// delimiters — the 7*7 probe, a known Jinja/Twig global (config/self/request/
+// lipsum/…), or a Python sandbox-escape dunder (__class__/__mro__/…) — never a
+// bare "{{ }}", so legitimate client-side template fragments are not flagged.
+var querySSTIPattern = `(?i)\{\{\s*(?:7\*7|config|self|_self|lipsum|joiner|namespace|cycler|request)\b|\{\{[^}]*__(?:class|mro|subclasses|globals|builtins|bases|init)__`
+
 // procedureAnalysePattern detects MySQL's PROCEDURE ANALYSE() — used by sqlmap
 // for column-count discovery and information disclosure. The trailing "(" is
 // required so it matches the technique's call form but never the prose
@@ -404,6 +420,14 @@ func DefaultRules() []core.Rule {
 		{ID: "LDAP-002", Name: "LDAP Search Injection", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "LDAP injection in search filter parameters", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\*\)|\(\||\(&|\)\()[\s\S]{0,200}(?:objectclass|objectCategory|uid|cn|dc|ou|\*)(?:\s*=\s*\*|\))`},
 		{ID: "SSTI-003", Name: "SSTI Jinja2 Flask Django", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Jinja2, Flask or Django template injection pattern", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\{\{\s*request\s*\|(?:\s*attr)?|\{\{\s*config\s*\.\s*items\s*\(|\{\{\s*self\s*\.__class__\s*\}\}|\{%\s*(?:for|if)\s+.*?request|\{\{\s*.*?\.__class__\s*\.__bases__\s*\}\})`},
 		{ID: "EL-001", Name: "Expression Language Injection", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "EL injection with dangerous class or runtime access", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\$\{[^}]*(?:java|runtime|exec|process|environment|classloader)[^}]*\}|\#\{[^}]*(?:java|runtime|exec|process|environment)[^}]*\})`},
+		// Header-phase (query-string) variants of the template / EL injection
+		// rules above. SSTI-001/003 and EL-001 run in the body phase, so a
+		// GET ?name={{7*7}} or ?x=${T(java.lang.Runtime)...} slipped through.
+		// Same dangerous-token tightness, so no new false positives.
+		{ID: "SSTI-005", Name: "SSTI template injection (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Server-side template injection in query args", Targets: []string{"args", "uri"}, Pattern: querySSTIPattern},
+		{ID: "SSTI-006", Name: "EL injection (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Expression-language injection with dangerous class/runtime access in query args", Targets: []string{"args", "uri"}, Pattern: `(?i)(?:\$\{[^}]*(?:java|runtime|exec|process|environment|classloader)[^}]*\}|\#\{[^}]*(?:java|runtime|exec|process|environment)[^}]*\})`},
+		// Bracket-notation NoSQL operator in the query string / form param key.
+		{ID: "NOSQL-005", Name: "NoSQL bracket operator (args)", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "MongoDB operator via bracket-notation param (username[$ne]=...)", Targets: []string{"uri", "args"}, Pattern: queryNoSQLBracketPattern},
 		{ID: "XPATH-002", Name: "XPath Injection Variant", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "XPath injection with axis or boolean bypass", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\/(?:child|parent|descendant|ancestor|attribute|self)::|count\s*\(\s*\/\/|(?:'|")\s*(?:or|and)\s+(?:'|")?\d+(?:'|")?\s*=\s*(?:'|")?\d+|\/\/\*\[|\]\s*\|\s*\/\/|\*\[local-name\s*\()`},
 		{ID: "XSS-013", Name: "CSS Style Attribute Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "CSS injection or style attribute XSS payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:style\s*=\s*["']?[^"'>]{0,200}(?:javascript\s*:|@import\s+|(?:-moz-binding|behavior)\s*:|data\s*:\s*text\/css|url\s*\(\s*["']?\s*javascript\s*:))`},
 		// CSS script-execution constructs anywhere (e.g. inside a <style> TAG,
