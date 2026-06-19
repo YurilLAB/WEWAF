@@ -492,6 +492,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			BrowserChallengeEnabled   *bool `json:"browser_challenge_enabled"`
 			BrowserChallengeBlock     *bool `json:"browser_challenge_block"`
 			SessionBlockThreshold     *int  `json:"session_block_threshold"`
+			SessionThrottleThreshold  *int  `json:"session_throttle_threshold"`
+			SessionThrottleDelayMs    *int  `json:"session_throttle_delay_ms"`
 			SessionRequestRateCeiling int       `json:"session_request_rate_ceiling"`
 			SessionPathCountCeiling   int       `json:"session_path_count_ceiling"`
 			ChallengeTTLSec           int       `json:"challenge_ttl_sec"`
@@ -699,6 +701,16 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if payload.SessionBlockThreshold != nil {
 			if v := *payload.SessionBlockThreshold; v >= 0 && v <= 100 {
 				s.cfg.SessionBlockThreshold = v
+			}
+		}
+		if payload.SessionThrottleThreshold != nil {
+			if v := *payload.SessionThrottleThreshold; v >= 0 && v <= 100 {
+				s.cfg.SessionThrottleThreshold = v
+			}
+		}
+		if payload.SessionThrottleDelayMs != nil {
+			if v := *payload.SessionThrottleDelayMs; v >= 0 && v <= 2000 {
+				s.cfg.SessionThrottleDelayMs = v
 			}
 		}
 		if payload.SessionRequestRateCeiling > 0 {

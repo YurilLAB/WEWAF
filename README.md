@@ -282,6 +282,8 @@ Leave it unset only for development.
 | `session_tracking_enabled`     | `false`        | Issue a signed session cookie and accumulate per-session signals.|
 | `session_idle_ttl_sec`         | `1800`         | Evict sessions idle longer than this.                            |
 | `session_block_threshold`      | `0` (off)      | Score at which a session's requests are blocked. `0` = observe.  |
+| `session_throttle_threshold`   | `0` (off)      | Score at which a session enters the throttle band — delayed, not blocked. Sits below the challenge and block thresholds. `0` = off. |
+| `session_throttle_delay_ms`    | `500` when on  | Delay applied to throttle-band requests, clamped to `2000`ms. Aborts immediately if the client disconnects. |
 | `browser_challenge_enabled`    | `false`        | Serve the JS integrity probe and accept verify POSTs.            |
 | `browser_challenge_block`      | `false`        | If on, a failed challenge blocks the request outright.           |
 | `graphql_enabled`              | `false`        | Parse GraphQL requests and enforce structural limits.            |

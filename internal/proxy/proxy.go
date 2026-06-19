@@ -677,9 +677,23 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Skipped for the PoW assets themselves, the verify endpoint, and
 	// anything served by the WAF's own admin/challenge surface — those
 	// MUST always pass through.
-	if wp.shouldGateWithPoW(r, scoreFor(wp, sessID)) && !isPoWBypassPath(r.URL.Path) {
-		wp.servePoWChallenge(w, r, scoreFor(wp, sessID))
+	hdrScore := scoreFor(wp, sessID)
+	if wp.shouldGateWithPoW(r, hdrScore) && !isPoWBypassPath(r.URL.Path) {
+		wp.servePoWChallenge(w, r, hdrScore)
 		return
+	}
+
+	// Graduated throttle band (Island-style step-down from a hard block).
+	// A session whose risk is elevated but below the challenge trigger pays
+	// a bounded latency tax instead of being blocked outright. Opt-in: the
+	// band is off unless SessionThrottleThreshold is set, so existing
+	// deployments are unchanged. Never terminal — the request continues to
+	// full inspection after the delay. A challenge would already have
+	// returned above, and a block-band score is left for the body-phase
+	// SessionBlockThreshold check, so only a true throttle-band score lands
+	// here.
+	if !isPoWBypassPath(r.URL.Path) && wp.riskActionFor(hdrScore) == RiskThrottle {
+		wp.applyThrottle(r.Context(), r, hdrScore)
 	}
 
 	// Pre-WAF admission control: if the shaper is enabled and the global

@@ -189,6 +189,16 @@ type Config struct {
 	// decay (legacy monotonic behaviour).
 	SessionScoreDecayPerMin int `json:"session_score_decay_per_min"`
 	SessionBlockThreshold     int    `json:"session_block_threshold"` // risk score at/above which to block; 0 = never
+	// SessionThrottleThreshold is the risk score at/above which a session
+	// enters the graduated throttle band: the request proceeds but pays a
+	// bounded latency tax (SessionThrottleDelayMs). It sits below the
+	// challenge trigger and the block threshold to form an ascending ladder
+	// throttle < challenge < block. 0 = disabled (legacy behaviour).
+	SessionThrottleThreshold int `json:"session_throttle_threshold"`
+	// SessionThrottleDelayMs is the delay applied to throttle-band requests,
+	// clamped to [0,2000]. When the band is enabled but this is 0, Validate
+	// applies a 500ms default so enabling the band actually does something.
+	SessionThrottleDelayMs int `json:"session_throttle_delay_ms"`
 
 	// Deep packet inspection — gRPC + WebSocket. When enabled, the
 	// proxy pre-parses protocol framing before handing payloads to the
@@ -395,6 +405,8 @@ func Default() *Config {
 		ChallengeTTLSec:           86400, // 24h — matches cookie MaxAge
 		SessionScoreDecayPerMin:   2,     // 50 points fade in ~25 quiet min
 		SessionBlockThreshold:     0,     // disabled by default — observe first
+		SessionThrottleThreshold:  0,     // disabled by default — observe first
+		SessionThrottleDelayMs:    0,     // Validate sets 500 when the band is enabled
 
 		GRPCInspect:            false,
 		GRPCBlockOnError:       false,
@@ -710,6 +722,27 @@ func (c *Config) Validate() error {
 		c.PoWAdaptiveTier2PenaltyBits = 10
 	}
 
+	// Graduated throttle band. Threshold is a risk score in [0,100]; the
+	// delay is bounded to keep the tarpit from holding goroutines too long
+	// (the proxy clamps to the same ceiling as a defence in depth). When the
+	// band is enabled but no delay was set, apply a sane default so flipping
+	// the threshold on actually produces an effect.
+	if c.SessionThrottleThreshold < 0 {
+		c.SessionThrottleThreshold = 0
+	}
+	if c.SessionThrottleThreshold > 100 {
+		c.SessionThrottleThreshold = 100
+	}
+	if c.SessionThrottleDelayMs < 0 {
+		c.SessionThrottleDelayMs = 0
+	}
+	if c.SessionThrottleDelayMs > 2000 {
+		c.SessionThrottleDelayMs = 2000
+	}
+	if c.SessionThrottleThreshold > 0 && c.SessionThrottleDelayMs == 0 {
+		c.SessionThrottleDelayMs = 500
+	}
+
 	if c.MultiLimitWindowSec <= 0 {
 		c.MultiLimitWindowSec = 60
 	}
@@ -893,6 +926,8 @@ func (c *Config) Snapshot() *Config {
 		ChallengeTTLSec:           c.ChallengeTTLSec,
 		SessionScoreDecayPerMin:   c.SessionScoreDecayPerMin,
 		SessionBlockThreshold:     c.SessionBlockThreshold,
+		SessionThrottleThreshold:  c.SessionThrottleThreshold,
+		SessionThrottleDelayMs:    c.SessionThrottleDelayMs,
 
 		GRPCInspect:              c.GRPCInspect,
 		GRPCBlockOnError:         c.GRPCBlockOnError,
