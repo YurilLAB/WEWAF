@@ -137,6 +137,40 @@ func TestShadowSuppressesBotFingerprint(t *testing.T) {
 	}
 }
 
+// TestShadowSuppressesResponseBlock covers the response phase: a rule that
+// blocks on the RESPONSE body (CRS-950140, a leaked PEM private key — a real
+// hard-block) must be suppressible by shadow mode exactly like a request-phase
+// rule, since every phase shares evaluatePhase. Guards against a regression
+// where shadow only worked for request phases.
+func TestShadowSuppressesResponseBlock(t *testing.T) {
+	pem := []byte("oops leaked:\n-----BEGIN RSA PRIVATE KEY-----\nMIIabc123\n-----END RSA PRIVATE KEY-----\n")
+
+	// Baseline: a PEM private key in the response body is blocked.
+	base := newShadowEngine(t, nil)
+	if base.ProcessResponseBody(newReq("/"), pem) == nil {
+		t.Fatal("baseline: PEM private key in response should be blocked (CRS-950140)")
+	}
+
+	// Shadow CRS-950140: the response must no longer block, and the recorder fires.
+	var recorded []string
+	sh := newShadowEngine(t, []string{"CRS-950140"})
+	sh.SetShadowRecorder(func(_ *core.Transaction, m core.Match) {
+		recorded = append(recorded, m.RuleID)
+	})
+	if intr := sh.ProcessResponseBody(newReq("/"), pem); intr != nil {
+		t.Fatalf("shadowed response-phase rule must not block; got matches %v", ruleIDsOf(intr.Matches))
+	}
+	found := false
+	for _, id := range recorded {
+		if id == "CRS-950140" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("shadow recorder did not observe the suppressed response-phase match; got %v", recorded)
+	}
+}
+
 func newReq(target string) *core.Transaction {
 	req := httptest.NewRequest(http.MethodGet, target, nil)
 	return core.NewTransaction(nil, req, nil)

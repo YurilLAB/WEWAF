@@ -23,6 +23,36 @@ func testEngine(t *testing.T, cfg Config) *Engine {
 	return e
 }
 
+// TestPurgeReclaimsQuietButKeepsActive validates the long-run housekeeping that
+// keeps the ledger from growing forever: a quiet offender whose last offense is
+// older than PurgeAge and whose ban has lapsed is dropped, while an offender
+// with a still-active ban is retained regardless of age, and a recently-active
+// offender is retained.
+func TestPurgeReclaimsQuietButKeepsActive(t *testing.T) {
+	e := testEngine(t, Config{Enabled: true, PurgeAge: time.Hour, HalfLife: time.Hour})
+	now := time.Now().UTC()
+
+	quiet := clientip.NormalizeIPKey("203.0.113.81")  // old offense, lapsed ban -> purge
+	active := clientip.NormalizeIPKey("203.0.113.82") // old offense, ACTIVE ban -> keep
+	recent := clientip.NormalizeIPKey("203.0.113.83") // recent offense -> keep
+
+	e.RecordBan(quiet, "x", 1, now.Add(-3*time.Hour), now.Add(-2*time.Hour)) // lastOffense 3h ago, ban lapsed 2h ago
+	e.RecordBan(active, "x", 1, now.Add(-3*time.Hour), now.Add(time.Hour))   // old, but ban active for another hour
+	e.RecordBan(recent, "x", 1, now.Add(-1*time.Minute), now.Add(-30*time.Second))
+
+	e.Purge()
+
+	if e.Consult("203.0.113.81").Known {
+		t.Error("quiet, long-lapsed offender should have been purged")
+	}
+	if !e.Consult("203.0.113.82").Known {
+		t.Error("offender with an ACTIVE ban must be retained regardless of age")
+	}
+	if !e.Consult("203.0.113.83").Known {
+		t.Error("recently-active offender must be retained")
+	}
+}
+
 // TestEscalation_Doubling proves the duration doubles per offense tier at
 // factor=2 (mirrors core/banlist_test.go's 1x/2x/4x proof) and clamps at max.
 func TestEscalation_Doubling(t *testing.T) {

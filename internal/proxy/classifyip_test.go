@@ -41,3 +41,19 @@ func TestClassifyIPBlocksInternalAndReserved(t *testing.T) {
 		}
 	}
 }
+
+// TestClassifyIPBlocksNAT64Public documents the intentional fail-closed posture:
+// a NAT64 (RFC 6052) address embedding a PUBLIC IPv4 is STILL blocked. An egress
+// proxy never legitimately dials NAT64-literal destinations, so any 64:ff9b::/96
+// address is treated as anomalous regardless of the embedded IPv4 — closing the
+// door on NAT64 being used to smuggle a destination past the SSRF gate.
+func TestClassifyIPBlocksNAT64Public(t *testing.T) {
+	// 64:ff9b::808:808 embeds 8.8.8.8 (a public address).
+	ip := net.ParseIP("64:ff9b::808:808")
+	if ip == nil {
+		t.Fatal("test bug: unparseable NAT64 address")
+	}
+	if reason := classifyIP(ip); reason == "" {
+		t.Error("NAT64-embedded PUBLIC address must still be blocked (fail-closed egress posture)")
+	}
+}

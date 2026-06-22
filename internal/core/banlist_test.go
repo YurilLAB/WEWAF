@@ -218,6 +218,35 @@ func TestBanListEscalatesFromLedger(t *testing.T) {
 	}
 }
 
+// TestBanListLedgerResetsAfterWindow proves the durable-ledger escalation path
+// honours the backoff window: a repeat ban WITHIN the window escalates from the
+// ledger's prior count, but one OUTSIDE the window resets to tier 1 even though
+// the ledger still holds a high prior count (so a reformed offender isn't
+// permanently penalised across restarts).
+func TestBanListLedgerResetsAfterWindow(t *testing.T) {
+	// Within the window -> escalate from the ledger's prior count (5 -> 6).
+	bl := NewBanList()
+	bl.ConfigureBackoff(true, 2, 100*time.Millisecond, 1000*time.Hour)
+	bl.SetOffenseLedger(&fakeLedger{offenses: 5, last: time.Now().UTC().Add(-50 * time.Millisecond), have: true})
+	if !bl.Ban("9.9.9.9", "x", time.Hour) {
+		t.Fatal("ban should be accepted")
+	}
+	if got := bl.entries["9.9.9.9"].Offenses; got != 6 {
+		t.Fatalf("within window: expected escalation to tier 6, got %d", got)
+	}
+
+	// Outside the window -> reset to tier 1 despite the ledger's prior count.
+	bl2 := NewBanList()
+	bl2.ConfigureBackoff(true, 2, 100*time.Millisecond, 1000*time.Hour)
+	bl2.SetOffenseLedger(&fakeLedger{offenses: 5, last: time.Now().UTC().Add(-200 * time.Millisecond), have: true})
+	if !bl2.Ban("9.9.9.9", "x", time.Hour) {
+		t.Fatal("ban should be accepted")
+	}
+	if got := bl2.entries["9.9.9.9"].Offenses; got != 1 {
+		t.Fatalf("outside window: offense tier should reset to 1, got %d", got)
+	}
+}
+
 func TestBanListRestoreBan(t *testing.T) {
 	bl := NewBanList()
 	exp := time.Now().Add(time.Hour)
