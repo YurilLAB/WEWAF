@@ -312,7 +312,12 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 		// false-positive free — and uses the no-URL-decode NormalizeForMatch
 		// treatment (NFKC + homoglyph + whitespace fold) so base64 tokens aren't
 		// mangled into rule hits.
-		const maxHeaderSinkLen = 8192
+		// Inspect up to the proxy's 64 KB total-header gate (proxy.go header
+		// check). The cap MUST be >= what the proxy forwards to the backend,
+		// or a payload parked past the cap is invisible to these signatures
+		// yet reaches the origin verbatim. RE2 is linear so a full-size header
+		// is cheap; the 64 KB total gate bounds the absolute cost.
+		const maxHeaderSinkLen = 64 * 1024
 		for _, name := range injectionSinkHeaders {
 			if vs := tx.Request.Header.Values(name); len(vs) > 0 {
 				joined := strings.Join(vs, ", ")
@@ -903,9 +908,11 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 }
 
 // buildRequestHeaderTargets extracts inspectable strings from an HTTP request.
-// Individual values are capped at 8 KB and total entries at 100 to prevent DoS.
+// The per-value cap matches the proxy's 64 KB total-header gate so the WAF never
+// inspects LESS of a header than it forwards to the backend (a smaller cap let a
+// payload hide in the un-inspected tail); total entries are capped at 100.
 func (e *Engine) buildRequestHeaderTargets(r *http.Request) map[string]string {
-	const maxValueLen = 8192
+	const maxValueLen = 64 * 1024
 	const maxEntries = 100
 
 	targets := make(map[string]string, 8)
