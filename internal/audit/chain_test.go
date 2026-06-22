@@ -219,6 +219,45 @@ func TestChainSurvivesTruncatedTailLine(t *testing.T) {
 	}
 }
 
+// TestChainDetectsTrailingTruncation closes the gap where deleting the last K
+// records (K>=2) leaves a self-consistent chain prefix that the MAC walk alone
+// reports as clean. The high-water-mark sidecar proves more records once
+// existed, so Verify (and resume) flag the truncation — even though no HMAC
+// secret was needed to perform the deletion.
+func TestChainDetectsTrailingTruncation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.log")
+
+	c, _ := New(Config{Secret: "stable-secret", FilePath: path})
+	for i := 0; i < 10; i++ {
+		if _, err := c.Append("config_write", "admin", "m", ""); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	_ = c.Close()
+
+	// Attacker (daemon stopped, file write access) deletes the last 5 records.
+	raw, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) != 10 {
+		t.Fatalf("expected 10 records, got %d", len(lines))
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines[:5], "\n")+"\n"), 0600); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+
+	// Restart — resume + Verify must both detect the truncation.
+	c2, _ := New(Config{Secret: "stable-secret", FilePath: path})
+	defer c2.Close()
+	ok, badSeq, total := c2.Verify()
+	if ok {
+		t.Fatalf("Verify MUST detect trailing truncation (got ok=true, total=%d)", total)
+	}
+	if badSeq != 6 {
+		t.Fatalf("badSeq should be the first deleted record (6); got %d", badSeq)
+	}
+}
+
 // TestChainFilePersistence — entries written in one session are visible
 // to Verify() run in a fresh Chain on the same file.
 func TestChainFilePersistence(t *testing.T) {

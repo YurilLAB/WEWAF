@@ -182,6 +182,13 @@ type Chain struct {
 	file *os.File
 	bw   *bufio.Writer
 
+	// hwmPath is the high-water-mark sidecar (<FilePath>.hwm). It records the
+	// highest committed seq, MAC'd with the secret, so a "stop the daemon,
+	// delete the last K lines, restart" attack — which leaves a perfectly
+	// self-consistent chain PREFIX that Verify() alone cannot detect — is
+	// caught: the file ends below the recorded HWM. Empty when in-memory only.
+	hwmPath string
+
 	// In-memory ring for quick /api/audit/tail access. Older entries
 	// still live on disk if the file path is configured.
 	ring      []Entry
@@ -249,8 +256,10 @@ func New(cfg Config) (*Chain, error) {
 		if err != nil {
 			return nil, fmt.Errorf("audit: open %q: %w", cfg.FilePath, err)
 		}
+		c.hwmPath = cfg.FilePath + ".hwm"
 		// Scan forward to the end of the file, capturing the last
-		// valid entry's seq + MAC so we can continue the chain.
+		// valid entry's seq + MAC so we can continue the chain. resume()
+		// also cross-checks the high-water-mark to detect trailing truncation.
 		if err := c.resume(f); err != nil {
 			_ = f.Close()
 			return nil, err
@@ -326,6 +335,18 @@ func (c *Chain) resume(f *os.File) error {
 	}
 	c.seq = lastSeq
 	c.prevMAC = lastMAC
+	// Trailing-truncation check: if the high-water-mark sidecar records a seq
+	// well above where the file now ends, entries were deleted from the tail —
+	// a perfectly self-consistent prefix the MAC walk above cannot catch.
+	if hwmSeq, ok := c.readHWMLocked(); ok && hwmSeq > lastSeq+truncationGapTolerance {
+		if c.firstBadSeq.Load() == 0 || c.firstBadSeq.Load() > lastSeq+1 {
+			c.firstBadSeq.Store(lastSeq + 1)
+		}
+		c.statsVerifyFails.Add(1)
+		fmt.Fprintf(os.Stderr,
+			"audit: TRAILING TRUNCATION DETECTED — file ends at seq %d but the high-water-mark is %d (%d records deleted)\n",
+			lastSeq, hwmSeq, hwmSeq-lastSeq)
+	}
 	return nil
 }
 
@@ -402,9 +423,77 @@ func (c *Chain) Append(kind, actor, message, metaJSON string) (Entry, error) {
 	// Commit chain state only after a successful write (or when memory-only).
 	c.seq = e.Seq
 	c.prevMAC = e.MAC
+	// Persist the high-water-mark AFTER the entry is durable. Because the HWM
+	// is always written after the entry, a crash can never leave it ahead of
+	// the file — only a deliberate truncation can — so a stale HWM is an
+	// unambiguous tamper signal, not a false positive.
+	c.writeHWMLocked(e.Seq)
 	c.pushRingLocked(e)
 	c.statsAppends.Add(1)
 	return e, nil
+}
+
+// truncationGapTolerance is how many trailing entries the file may sit below the
+// high-water-mark without being flagged as truncation. 1 absorbs the artificial
+// "chop the last complete entry" case (and any single in-flight loss); a real
+// "delete the last K records" attack deletes K>=2 and is flagged.
+const truncationGapTolerance = 1
+
+type hwmRecord struct {
+	Seq uint64 `json:"seq"`
+	MAC string `json:"mac"`
+}
+
+// hwmMAC authenticates a high-water-mark seq with the chain secret, so an
+// attacker who truncates the log cannot forge a matching lower HWM (the secret
+// lives only in process memory).
+func (c *Chain) hwmMAC(seq uint64) string {
+	h := hmac.New(sha256.New, c.secret)
+	h.Write([]byte(fmt.Sprintf("wewaf-audit-hwm:%d", seq)))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// writeHWMLocked persists the highest committed seq + its MAC via temp-file +
+// atomic rename. Best-effort: a failure is logged but never fails the Append
+// (the chain entry is already durable). Caller holds c.mu.
+func (c *Chain) writeHWMLocked(seq uint64) {
+	if c.hwmPath == "" {
+		return
+	}
+	buf, err := json.Marshal(&hwmRecord{Seq: seq, MAC: c.hwmMAC(seq)})
+	if err != nil {
+		return
+	}
+	tmp := c.hwmPath + ".tmp"
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "audit: write HWM: %v\n", err)
+		return
+	}
+	if err := os.Rename(tmp, c.hwmPath); err != nil {
+		fmt.Fprintf(os.Stderr, "audit: commit HWM: %v\n", err)
+	}
+}
+
+// readHWMLocked returns the persisted high-water-mark seq when the sidecar
+// exists and its MAC validates. ok=false on absent (fresh chain / pre-HWM log)
+// or invalid (forged) — neither can be distinguished into a false positive
+// because a tamperer cannot produce a valid HWM for a lower seq.
+func (c *Chain) readHWMLocked() (uint64, bool) {
+	if c.hwmPath == "" {
+		return 0, false
+	}
+	buf, err := os.ReadFile(c.hwmPath)
+	if err != nil {
+		return 0, false
+	}
+	var rec hwmRecord
+	if err := json.Unmarshal(buf, &rec); err != nil {
+		return 0, false
+	}
+	if !hmac.Equal([]byte(c.hwmMAC(rec.Seq)), []byte(rec.MAC)) {
+		return 0, false
+	}
+	return rec.Seq, true
 }
 
 // Verify re-walks either the file (if configured) or the in-memory ring
@@ -459,6 +548,12 @@ func (c *Chain) verifyFromFileLocked() (ok bool, badSeq uint64, total uint64) {
 	// Restore write position so subsequent Appends still go to the end.
 	if _, err := c.file.Seek(0, io.SeekEnd); err != nil {
 		return false, 0, total
+	}
+	// Trailing-truncation: a valid prefix walked clean above, but the
+	// high-water-mark proves more records once existed and were deleted.
+	if hwmSeq, ok := c.readHWMLocked(); ok && hwmSeq > total+truncationGapTolerance {
+		c.statsVerifyFails.Add(1)
+		return false, total + 1, total
 	}
 	return true, 0, total
 }
