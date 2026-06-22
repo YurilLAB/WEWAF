@@ -53,10 +53,19 @@ type Config struct {
 	BruteForceWindowSec int `json:"brute_force_window_sec"`
 	BruteForceThreshold int `json:"brute_force_threshold"`
 
-	// Reputation-based auto-ban
-	ReputationWindowSec      int `json:"reputation_window_sec"`       // default 600 (10 min)
-	ReputationThreshold      int `json:"reputation_threshold"`        // default 5 blocks before auto-ban
-	ReputationBanDurationSec int `json:"reputation_ban_duration_sec"` // default 3600 (1 hour)
+	// Reputation-based auto-ban. ReputationEnabled turns on the durable
+	// repeat-offender engine (internal/reputation): it persists each offender's
+	// offense tier + active ban so escalation and bans survive restarts, and it
+	// auto-bans an IP that accrues ReputationThreshold blocks within
+	// ReputationWindowSec for ReputationBanDurationSec (escalated by the ban
+	// backoff). Distinct from IPReputationEnabled, which pulls EXTERNAL feeds.
+	ReputationEnabled        bool `json:"reputation_enabled"`          // default false (observe-first)
+	ReputationWindowSec      int  `json:"reputation_window_sec"`       // default 600 (10 min)
+	ReputationThreshold      int  `json:"reputation_threshold"`        // default 5 blocks before auto-ban
+	ReputationBanDurationSec int  `json:"reputation_ban_duration_sec"` // default 3600 (1 hour)
+	RepHalfLifeSec           int  `json:"rep_half_life_sec"`           // default 86400 — reputation-score decay half-life
+	RepJitterSec             int  `json:"rep_jitter_sec"`              // default 60 — random ban padding (unpredictable unban)
+	RepPurgeAgeSec           int  `json:"rep_purge_age_sec"`           // default 2592000 (30d) — quiet offenders purged
 
 	// Engine behaviour
 	Mode         string   `json:"mode"`           // "active", "detection", "learning"
@@ -366,9 +375,13 @@ func Default() *Config {
 		RateLimitBurst:           150,
 		BruteForceWindowSec:      300,
 		BruteForceThreshold:      10,
+		ReputationEnabled:        false,
 		ReputationWindowSec:      600,
 		ReputationThreshold:      5,
 		ReputationBanDurationSec: 3600,
+		RepHalfLifeSec:           86400,
+		RepJitterSec:             60,
+		RepPurgeAgeSec:           2592000,
 		Mode:                     "active",
 		LogLevel:                 "info",
 		AuditLogPath:             "",
@@ -588,6 +601,25 @@ func (c *Config) Validate() error {
 	}
 	if c.ReputationBanDurationSec < 60 {
 		c.ReputationBanDurationSec = 60
+	}
+	if c.RepHalfLifeSec < 60 {
+		// A sub-minute half-life is a typo: it would decay reputation to noise
+		// before the auto-ban window even closes.
+		c.RepHalfLifeSec = 86400
+	}
+	if c.RepJitterSec < 0 {
+		c.RepJitterSec = 0
+	}
+	if c.RepJitterSec > 3600 {
+		c.RepJitterSec = 3600
+	}
+	if c.RepPurgeAgeSec <= 0 {
+		c.RepPurgeAgeSec = 2592000
+	}
+	// PurgeAge must outlast the decay half-life, else an offender is purged
+	// before its reputation has meaningfully decayed.
+	if c.RepPurgeAgeSec < c.RepHalfLifeSec {
+		c.RepPurgeAgeSec = c.RepHalfLifeSec
 	}
 	if c.HistoryDir == "" {
 		c.HistoryDir = "history"
@@ -984,9 +1016,13 @@ func (c *Config) Snapshot() *Config {
 		RateLimitBurst:           c.RateLimitBurst,
 		BruteForceWindowSec:      c.BruteForceWindowSec,
 		BruteForceThreshold:      c.BruteForceThreshold,
+		ReputationEnabled:        c.ReputationEnabled,
 		ReputationWindowSec:      c.ReputationWindowSec,
 		ReputationThreshold:      c.ReputationThreshold,
 		ReputationBanDurationSec: c.ReputationBanDurationSec,
+		RepHalfLifeSec:           c.RepHalfLifeSec,
+		RepJitterSec:             c.RepJitterSec,
+		RepPurgeAgeSec:           c.RepPurgeAgeSec,
 		Mode:                     c.ModeSnapshot(),
 		LogLevel:                 c.LogLevel,
 		AuditLogPath:             c.AuditLogPath,

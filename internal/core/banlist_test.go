@@ -163,6 +163,83 @@ func TestBanListAcceptsSingleHostCIDR(t *testing.T) {
 	}
 }
 
+// fakeLedger is a minimal OffenseLedger for testing the BanList delegation.
+type fakeLedger struct {
+	offenses int
+	last     time.Time
+	have     bool
+	recorded []ledgerCall
+}
+
+type ledgerCall struct {
+	key      string
+	reason   string
+	offenses int
+	expires  time.Time
+}
+
+func (f *fakeLedger) Offenses(key string) (int, time.Time, bool) {
+	return f.offenses, f.last, f.have
+}
+
+func (f *fakeLedger) RecordBan(key, reason string, offenses int, now, expires time.Time) {
+	f.recorded = append(f.recorded, ledgerCall{key, reason, offenses, expires})
+}
+
+// TestBanListEscalatesFromLedger proves that when a durable ledger is installed,
+// escalation derives the prior offense count from IT — not the (empty)
+// in-memory history — so escalation survives a restart, and that each accepted
+// ban is recorded back to the ledger.
+func TestBanListEscalatesFromLedger(t *testing.T) {
+	bl := NewBanList()
+	bl.ConfigureBackoff(true, 2, time.Hour, 1000*time.Hour)
+	led := &fakeLedger{offenses: 2, last: time.Now().UTC(), have: true}
+	bl.SetOffenseLedger(led)
+
+	// In-memory history is empty; without the ledger this would be tier 1
+	// (base). The ledger's prior count of 2 must escalate this to tier 3.
+	if !bl.Ban("9.9.9.9", "x", 100*time.Millisecond) {
+		t.Fatal("ban should be accepted")
+	}
+	entry := bl.entries["9.9.9.9"]
+	if entry.Offenses != 3 {
+		t.Fatalf("expected ledger-derived offense tier 3, got %d", entry.Offenses)
+	}
+	// tier 3 at factor 2 => base * 2^2 = 400ms.
+	dur := entry.ExpiresAt.Sub(entry.Timestamp)
+	if dur < 350*time.Millisecond || dur > 450*time.Millisecond {
+		t.Fatalf("expected ~400ms escalated duration, got %s", dur)
+	}
+	if len(led.recorded) != 1 {
+		t.Fatalf("expected exactly one RecordBan, got %d", len(led.recorded))
+	}
+	if led.recorded[0].offenses != 3 {
+		t.Fatalf("RecordBan offense count got %d want 3", led.recorded[0].offenses)
+	}
+}
+
+func TestBanListRestoreBan(t *testing.T) {
+	bl := NewBanList()
+	exp := time.Now().Add(time.Hour)
+	if !bl.RestoreBan("203.0.113.50", "restored", exp, 4) {
+		t.Fatal("an active ban should be restorable")
+	}
+	if !bl.IsBanned("203.0.113.50") {
+		t.Fatal("restored ban must make IsBanned true")
+	}
+	if got := bl.entries["203.0.113.50"].Offenses; got != 4 {
+		t.Fatalf("restored offense tier got %d want 4", got)
+	}
+	// An already-lapsed ban must not be re-seeded.
+	if bl.RestoreBan("203.0.113.51", "stale", time.Now().Add(-time.Hour), 1) {
+		t.Fatal("a lapsed ban must not be restored")
+	}
+	// Allowlisted/loopback targets are still refused on the restore path.
+	if bl.RestoreBan("127.0.0.1", "x", exp, 1) {
+		t.Fatal("loopback must never be restorable (self-DoS guard)")
+	}
+}
+
 func TestBanListAllowlistProtectsIPv6SameSlash64(t *testing.T) {
 	// Allowlisting a single /128 admin host must prevent banning ANY address in
 	// its /64, because the ban list keys (and matches) IPv6 at /64 — otherwise a

@@ -146,6 +146,11 @@ type Metrics struct {
 	egressCap       int
 	botCap          int
 	persister       Persister
+	// blockHook, when set, is invoked (outside the lock, panic-guarded) on
+	// every recorded block. It feeds the reputation auto-ban observer without
+	// telemetry having to import core/reputation — main wires the closure. May
+	// be nil.
+	blockHook func(ip, method, path, ruleID, category, message string, score int)
 
 	// Per-rule match counters so the UI can highlight the noisiest rules.
 	// Lazily initialised in RecordBlockWithCategory to keep the zero value
@@ -308,6 +313,20 @@ func (m *Metrics) SetPersister(p Persister) {
 	m.mu.Unlock()
 }
 
+// SetBlockHook attaches a callback fired on every recorded block. It is the
+// single funnel the reputation auto-ban observer hangs off (every RecordBlock*
+// path delegates to RecordBlockWithCategory). The hook runs OFF the metrics
+// lock and is panic-guarded, so a slow or panicking hook can neither deadlock
+// nor crash telemetry. May be nil to detach.
+func (m *Metrics) SetBlockHook(fn func(ip, method, path, ruleID, category, message string, score int)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.blockHook = fn
+	m.mu.Unlock()
+}
+
 // OnRotation clears in-memory aggregates that are bounded per rotation window.
 // The ring buffers are left alone so the UI still has recent data to render.
 func (m *Metrics) OnRotation() {
@@ -388,6 +407,7 @@ func (m *Metrics) RecordBlockWithCategory(ip, method, path, ruleID, category, me
 		}
 	}
 	p := m.persister
+	hook := m.blockHook
 	m.mu.Unlock()
 	if p != nil {
 		p.EnqueueBlock(BlockEvent{
@@ -400,6 +420,15 @@ func (m *Metrics) RecordBlockWithCategory(ip, method, path, ruleID, category, me
 			Score:        score,
 			Message:      message,
 		})
+	}
+	if hook != nil {
+		// Panic-guarded: the auto-ban observer must never take down the
+		// telemetry hot path. Runs synchronously but does only in-memory work
+		// plus a non-blocking enqueue, so it adds negligible latency.
+		func() {
+			defer recoverPanic("blockHook")
+			hook(ip, method, path, ruleID, category, message, score)
+		}()
 	}
 }
 

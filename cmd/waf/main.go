@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"wewaf/internal/limits"
 	"wewaf/internal/pow"
 	"wewaf/internal/proxy"
+	"wewaf/internal/reputation"
 	"wewaf/internal/rules"
 	"wewaf/internal/session"
 	"wewaf/internal/ssl"
@@ -66,6 +68,49 @@ func (l banListLister) ActiveBans() []firewall.Ban {
 		out = append(out, firewall.Ban{IP: e.IP, ExpiresAt: e.ExpiresAt})
 	}
 	return out
+}
+
+// reputationConfigFrom maps the operator config onto the reputation engine's
+// policy. Escalation Factor / MaxDuration / OffenseWindow are deliberately
+// shared with the ban-backoff knobs so the reputation-driven and BanList-driven
+// escalation ladders agree.
+func reputationConfigFrom(cfg *config.Config) reputation.Config {
+	return reputation.Config{
+		Enabled:       cfg.ReputationEnabled,
+		Window:        time.Duration(cfg.ReputationWindowSec) * time.Second,
+		Threshold:     cfg.ReputationThreshold,
+		BaseDuration:  time.Duration(cfg.ReputationBanDurationSec) * time.Second,
+		Factor:        float64(cfg.BanBackoffMultiplier),
+		MaxDuration:   time.Duration(cfg.MaxBanDurationSec) * time.Second,
+		OffenseWindow: time.Duration(cfg.BanBackoffWindowSec) * time.Second,
+		HalfLife:      time.Duration(cfg.RepHalfLifeSec) * time.Second,
+		Jitter:        time.Duration(cfg.RepJitterSec) * time.Second,
+		PurgeAge:      time.Duration(cfg.RepPurgeAgeSec) * time.Second,
+	}
+}
+
+// reputationSubsystem classifies a block's rule ID / category into the
+// detection subsystem that raised it, so the reputation ledger can record WHICH
+// independent subsystems have flagged an IP (the bitmask that seeds future
+// cross-subsystem "recidive" consensus). Unknown sources fold into "engine".
+func reputationSubsystem(ruleID, category string) string {
+	id := strings.ToUpper(ruleID)
+	switch {
+	case strings.HasPrefix(id, "DDOS"):
+		return "ddos"
+	case strings.HasPrefix(id, "BRUTE"):
+		return "bruteforce"
+	case strings.HasPrefix(id, "JA3") || strings.HasPrefix(id, "JA4"):
+		return "ja3"
+	case strings.HasPrefix(id, "RATE"):
+		return "rate"
+	case strings.HasPrefix(id, "INTEL"):
+		return "intel"
+	case strings.HasPrefix(id, "SESSION"):
+		return "session"
+	default:
+		return "engine"
+	}
 }
 
 func main() {
@@ -159,10 +204,36 @@ func main() {
 	}()
 	log.Printf("history store opened: %s", historyStore.StatsSnapshot().CurrentPath)
 
+	// Durable reputation ledger. When enabled it persists each repeat
+	// offender's escalation tier and active ban so neither is forgotten across
+	// a restart (closing WEWAF's restart-amnesia gap), and it auto-bans an IP
+	// that accrues too many blocks in the configured window. Off by default —
+	// an open failure is non-fatal (the in-memory backoff still applies).
+	var repEngine *reputation.Engine
+	if cfg.ReputationEnabled {
+		repPath := filepath.Join(cfg.HistoryDir, "reputation.sqlite")
+		re, rerr := reputation.Open(reputation.Options{Path: repPath, Config: reputationConfigFrom(cfg)})
+		if rerr != nil {
+			log.Printf("reputation: open failed (%v) — durable reputation OFF, in-memory backoff still applies", rerr)
+		} else {
+			repEngine = re
+			repEngine.Start(context.Background())
+			log.Printf("reputation ledger opened: %s", repPath)
+			defer func() {
+				if err := repEngine.Close(); err != nil {
+					log.Printf("reputation ledger close error: %v", err)
+				}
+			}()
+		}
+	}
+
 	// Attach persistence to the telemetry hot path.
 	metrics.SetPersister(newHistoryPersister(historyStore))
 	historyStore.OnRotate(func(_ time.Time) {
 		metrics.OnRotation()
+		// Reuse the 24h rotation tick to purge quiet, unbanned offenders from
+		// the reputation ledger — no extra timer needed. No-op when disabled.
+		repEngine.Purge()
 		log.Printf("history rotated: new db=%s", historyStore.StatsSnapshot().CurrentPath)
 	})
 
@@ -431,6 +502,43 @@ func main() {
 	}
 	banList.SetAllowlist(banAllowSet)
 
+	// Wire the durable reputation ledger into the ban path. This (a) makes the
+	// existing exponential backoff durable — escalation is derived from the
+	// persisted offense count, so a repeat offender keeps climbing the ladder
+	// across restarts; (b) re-seeds bans that were still active at last
+	// shutdown so an attacker mid-ban stays banned; and (c) installs the
+	// auto-ban observer that turns the previously configured-but-unwired
+	// "N blocks in a window" reputation feature into a live, self-improving
+	// defence. The allowlist installed above still vetoes every ban source.
+	if repEngine != nil {
+		banList.SetOffenseLedger(repEngine)
+		restored := 0
+		for _, b := range repEngine.RestoreActive() {
+			if banList.RestoreBan(b.Key, b.Reason, b.ExpiresAt, b.Offenses) {
+				restored++
+			}
+		}
+		if restored > 0 {
+			log.Printf("reputation: restored %d active ban(s) across restart", restored)
+		}
+		// The single block funnel (every RecordBlock* path lands in
+		// RecordBlockWithCategory) feeds the ledger. Crossing the windowed
+		// threshold issues an escalating ban through core.BanList — the one
+		// escalator — so manual, intel, and auto bans all share one ladder.
+		metrics.SetBlockHook(func(ip, method, path, ruleID, category, message string, score int) {
+			d := repEngine.RecordBlock(ip, reputationSubsystem(ruleID, category), message)
+			if d.Ban {
+				reason := d.Reason
+				if reason == "" {
+					reason = "reputation: block threshold exceeded"
+				}
+				banList.Ban(ip, reason, d.Duration)
+			}
+		})
+		log.Printf("reputation auto-ban active: %d blocks within %ds escalate to a ban",
+			cfg.ReputationThreshold, cfg.ReputationWindowSec)
+	}
+
 	// Host-firewall ban sink. When enabled, a background reconcile loop syncs
 	// the active ban list into the OS packet filter (nftables on Linux, Windows
 	// Firewall on Windows) so a banned source is dropped at L3/L4 across EVERY
@@ -664,6 +772,12 @@ func main() {
 			cfg.TrustXFF = fresh.TrustXFF
 			cfg.TrustedProxies = append([]string(nil), fresh.TrustedProxies...)
 			cfg.Unlock()
+			// Hot-swap the reputation policy (window/threshold/decay/jitter)
+			// atomically. The Enabled flag and the persistence/restore wiring
+			// are fixed at startup, so a reload only re-tunes live behaviour.
+			if repEngine != nil {
+				repEngine.SetConfig(reputationConfigFrom(fresh))
+			}
 			// Republish the proxy's hot-path config snapshot.
 			wp.RefreshConfig()
 			// Apply the fresh trust policy atomically. A bad CIDR keeps

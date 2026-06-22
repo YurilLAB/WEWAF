@@ -141,6 +141,7 @@ type Restored struct {
 	Key       string
 	Reason    string
 	ExpiresAt time.Time
+	Offenses  int
 }
 
 // Options configures Open.
@@ -326,12 +327,12 @@ func (e *Engine) RecordBlock(ip, subsystem, reason string) Decision {
 	// stream of blocks doesn't re-fire every request — the gate's own IsBanned
 	// short-circuit also covers this once the ban lands).
 	if cfg.Threshold > 0 && en.blockCount >= cfg.Threshold && !now.Before(en.banUntil) {
-		n := en.offenses
-		if !en.lastBanned.IsZero() && now.Sub(en.lastBanned) > cfg.OffenseWindow {
-			n = 0 // escalation window lapsed: start back at tier 1
-		}
 		dec.Ban = true
-		dec.Duration = escalatedDuration(n+1, cfg.BaseDuration, cfg.MaxDuration, cfg.Factor, cfg.Jitter)
+		// Return the BASE duration, not an escalated one: the caller bans via
+		// core.BanList, which is the single escalator (it reads this engine's
+		// durable offense count through the OffenseLedger hook and applies the
+		// backoff multiplier). Escalating here too would double-count.
+		dec.Duration = cfg.BaseDuration
 		dec.Reason = reason
 		if dec.Reason == "" {
 			dec.Reason = "reputation: block threshold exceeded"
@@ -523,6 +524,7 @@ func (e *Engine) RestoreActive() []Restored {
 			Key:       en.key,
 			Reason:    "reputation: restored active ban",
 			ExpiresAt: en.banUntil,
+			Offenses:  en.offenses,
 		})
 	}
 	e.restoredN.Store(uint64(len(out)))

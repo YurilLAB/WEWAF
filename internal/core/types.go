@@ -272,6 +272,28 @@ type BanList struct {
 	// config hot-reload can swap it in atomically. Nil = only the always-on
 	// loopback/unspecified guard applies.
 	allowlist atomic.Pointer[clientip.CIDRSet]
+
+	// ledger is an optional durable backing for repeat-offender memory. When
+	// set, Ban reads the prior offense count from it (so escalation survives a
+	// restart and the in-memory backoffWindow) and records each accepted ban
+	// back to it. Nil = in-memory-only behaviour, unchanged. Guarded by mu;
+	// Ban already holds mu, so the read there is free.
+	ledger OffenseLedger
+}
+
+// OffenseLedger is a durable repeat-offender store BanList can delegate its
+// escalation memory to. Implemented by internal/reputation.Engine. The contract
+// is deliberately tiny: Offenses answers the prior ban count + last-ban time for
+// a canonical key (the SAME key BanList uses), and RecordBan persists an
+// accepted ban. Both MUST be non-blocking and MUST NOT call back into BanList.
+type OffenseLedger interface {
+	// Offenses returns the durable prior offense count and last-ban time for
+	// key. ok=false means "no record" (treated as zero offenses). BanList
+	// applies its own backoff-window reset to the returned values.
+	Offenses(key string) (count int, last time.Time, ok bool)
+	// RecordBan persists that key was banned at now, resulting in `offenses`
+	// total bans and expiring at `expires`.
+	RecordBan(key, reason string, offenses int, now, expires time.Time)
 }
 
 // maxBanEntries caps the active-ban map. With BanList.Cleanup running on
@@ -365,6 +387,51 @@ func (bl *BanList) SetAllowlist(set *clientip.CIDRSet) {
 	bl.allowlist.Store(set)
 }
 
+// SetOffenseLedger installs (or clears, with nil) the durable offense backing.
+// Once set, Ban derives its escalation offense count from the ledger instead of
+// the volatile in-memory history map, so a repeat offender keeps climbing the
+// escalation ladder across daemon restarts. Safe to call at startup before the
+// ban path is hot.
+func (bl *BanList) SetOffenseLedger(l OffenseLedger) {
+	bl.mu.Lock()
+	bl.ledger = l
+	bl.mu.Unlock()
+}
+
+// RestoreBan re-seeds a single ban directly, WITHOUT escalation or a ledger
+// write — used at startup to re-apply bans that were still active when the
+// daemon last stopped (the ledger already holds their durable record). The
+// in-memory entry makes IsBanned return true again and lets the firewall sink
+// re-push the drop to the kernel. An expired or allowlisted/invalid target is
+// silently skipped. Returns true iff the ban was re-seeded.
+func (bl *BanList) RestoreBan(ip, reason string, expiresAt time.Time, offenses int) bool {
+	key, ok := bl.validatedBanKey(ip)
+	if !ok {
+		return false
+	}
+	now := time.Now().UTC()
+	if !expiresAt.After(now) {
+		return false
+	}
+	if offenses < 1 {
+		offenses = 1
+	}
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+	bl.entries[key] = BanEntry{
+		IP:         key,
+		Reason:     reason,
+		ExpiresAt:  expiresAt,
+		Timestamp:  now,
+		Offenses:   offenses,
+		LastBanned: now,
+	}
+	if bl.history != nil {
+		bl.history[key] = banHistory{offenses: offenses, lastBanned: now}
+	}
+	return true
+}
+
 // banKey returns the canonical ban-list key for an input that may be a bare IP
 // OR a single-host CIDR (/32 or /128). Threat-intel feeds emit individual
 // addresses in CIDR form ("1.2.3.4/32"), so rejecting every "/"-bearing string
@@ -441,13 +508,22 @@ func (bl *BanList) Ban(ip, reason string, duration time.Duration) bool {
 		if bl.history == nil {
 			bl.history = make(map[string]banHistory)
 		}
-		h, ok := bl.history[ip]
-		if ok && (bl.backoffWindow <= 0 || now.Sub(h.lastBanned) <= bl.backoffWindow) {
+		// Prior offense count comes from the durable ledger when one is
+		// installed (so escalation survives restarts), otherwise from the
+		// volatile in-memory history map. Both honour the same backoffWindow
+		// reset, so behaviour is identical bar the persistence.
+		prevOffenses, prevLast, have := 0, time.Time{}, false
+		if bl.ledger != nil {
+			prevOffenses, prevLast, have = bl.ledger.Offenses(ip)
+		} else if h, ok := bl.history[ip]; ok {
+			prevOffenses, prevLast, have = h.offenses, h.lastBanned, true
+		}
+		if have && (bl.backoffWindow <= 0 || now.Sub(prevLast) <= bl.backoffWindow) {
 			// Cap offenses at 10 — at multiplier=2 that's already 512× base,
 			// well past any realistic maxDuration, so further loop iterations
 			// only add work under the write lock. 10 keeps the exponent loop
 			// at most 9 multiplications, unnoticeable.
-			offenses = h.offenses + 1
+			offenses = prevOffenses + 1
 			if offenses > 10 {
 				offenses = 10
 			}
@@ -528,13 +604,20 @@ func (bl *BanList) Ban(ip, reason string, duration time.Duration) bool {
 		}
 	}
 
+	expiresAt := now.Add(duration)
 	bl.entries[ip] = BanEntry{
 		IP:         ip,
 		Reason:     reason,
-		ExpiresAt:  now.Add(duration),
+		ExpiresAt:  expiresAt,
 		Timestamp:  now,
 		Offenses:   offenses,
 		LastBanned: now,
+	}
+	// Persist the ban durably so its escalation tier and active expiry survive
+	// a restart. Best-effort and non-blocking by contract; a ledger that drops
+	// the write only forgets across a restart, never affects this live ban.
+	if bl.ledger != nil {
+		bl.ledger.RecordBan(ip, reason, offenses, now, expiresAt)
 	}
 	return true
 }
