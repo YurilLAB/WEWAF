@@ -21,6 +21,7 @@ import (
 	"wewaf/internal/config"
 	"wewaf/internal/connection"
 	"wewaf/internal/core"
+	"wewaf/internal/corpus"
 	"wewaf/internal/graphql"
 	"wewaf/internal/history"
 	"wewaf/internal/host"
@@ -211,6 +212,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// Historical telemetry (queries the on-disk SQLite rotation set).
 	api.HandleFunc("/api/history/databases", s.handleHistoryDatabases)
 	api.HandleFunc("/api/history/events", s.handleHistoryEvents)
+	api.HandleFunc("/api/corpus", s.handleCorpus)
 	api.HandleFunc("/api/history/ips", s.handleHistoryIPs)
 	api.HandleFunc("/api/history/traffic", s.handleHistoryTraffic)
 	api.HandleFunc("/api/history/stats", s.handleHistoryStats)
@@ -1318,6 +1320,38 @@ func (s *Server) handleSSLConfig(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- History ----
+
+// handleCorpus mines the persisted block history for FP-prone rules and
+// repeat-offender IPs (the "get better by running" feedback loop). Read-only;
+// optional ?hours=N (1..720, default 24) and ?top=N (1..200) tune the window
+// and list size.
+func (s *Server) handleCorpus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.history == nil {
+		writeJSON(w, &corpus.Report{TopRules: []corpus.RuleStat{}, RepeatOffenders: []corpus.OffenderStat{}})
+		return
+	}
+	var opts corpus.Options
+	if h := r.URL.Query().Get("hours"); h != "" {
+		if n, err := strconv.Atoi(h); err == nil && n > 0 && n <= 720 {
+			opts.Window = time.Duration(n) * time.Hour
+		}
+	}
+	if topStr := r.URL.Query().Get("top"); topStr != "" {
+		if n, err := strconv.Atoi(topStr); err == nil && n > 0 && n <= 200 {
+			opts.TopN = n
+		}
+	}
+	rep, err := corpus.Mine(s.history, time.Now().UTC(), opts)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, rep)
+}
 
 func (s *Server) handleHistoryDatabases(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
