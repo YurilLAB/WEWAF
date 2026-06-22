@@ -217,17 +217,14 @@ func (t *Tracker) Score(id string) int {
 		}
 	}
 
-	// PoW cap — if this session has cleared the proof-of-work gate within
-	// the last hour, bound the visible score at 49. This prevents a
-	// Sisyphean loop where a high-risk session solves PoW, immediately
-	// trips the threshold again on the next request, and gets challenged
-	// repeatedly. The full underlying signal is still available to
-	// admin-UI introspection (see SessionView).
-	if !s.PowPassedAt.IsZero() && now.Sub(s.PowPassedAt) < time.Hour {
-		if score > 49 {
-			score = 49
-		}
-	}
+	// NOTE: we intentionally do NOT cap the score after a PoW pass. Re-challenge
+	// looping is already prevented at the gate — shouldGateWithPoW short-circuits
+	// on a valid __wewaf_pow pass cookie regardless of score (see
+	// proxy/pow_gate.go), so a solver is never re-challenged. A previous cap to
+	// 49-for-an-hour ALSO suppressed the SessionBlockThreshold enforcement,
+	// letting one cheap solve buy an hour of immunity from session-risk blocking
+	// while the attacker drove the true score arbitrarily high. The block band
+	// must see the real score, so the cap is removed.
 	// Capture whether the stored score actually changed WHILE we still hold
 	// the read lock. The previous code released the lock first and then read
 	// s.RiskScore unlocked to decide whether to write — a data race with the

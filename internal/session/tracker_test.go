@@ -327,10 +327,13 @@ func TestJA3BadVerdictBumpsScore(t *testing.T) {
 	}
 }
 
-// TestPowPassCapsVisibleScore — once a session has cleared PoW the score
-// MUST cap so the proxy doesn't immediately re-challenge on the next
-// request. Without this the user gets stuck in a solve-loop.
-func TestPowPassCapsVisibleScore(t *testing.T) {
+// TestPowPassDoesNotCapScore — after clearing PoW the score MUST remain the true
+// (high) value so SessionBlockThreshold can still block a session that keeps
+// misbehaving. Re-challenge looping is prevented at the gate by the __wewaf_pow
+// pass cookie, NOT by capping the score — a cap let one cheap solve buy an hour
+// of immunity from session-risk blocking while the attacker drove the score
+// arbitrarily high.
+func TestPowPassDoesNotCapScore(t *testing.T) {
 	tr := NewTracker(Config{Enabled: true})
 	defer tr.Stop()
 
@@ -340,8 +343,7 @@ func TestPowPassCapsVisibleScore(t *testing.T) {
 	if s == nil {
 		t.Fatal("session not created")
 	}
-	// Drive heavy blocks so the underlying score blows past 49 + the
-	// baseline trigger.
+	// Drive heavy blocks so the underlying score blows well past 49.
 	for i := 0; i < 50; i++ {
 		tr.RecordBlock(s.ID)
 		tr.touchSession(s.ID, r)
@@ -352,9 +354,9 @@ func TestPowPassCapsVisibleScore(t *testing.T) {
 	}
 
 	tr.RecordPowPass(s.ID)
-	capped := tr.Score(s.ID)
-	if capped > 49 {
-		t.Fatalf("post-PoW score should be ≤49; got %d (raw was %d)", capped, rawHigh)
+	after := tr.Score(s.ID)
+	if after <= 49 {
+		t.Fatalf("post-PoW score must NOT be capped to 49 (that neuters SessionBlockThreshold); got %d, true score was %d", after, rawHigh)
 	}
 }
 
