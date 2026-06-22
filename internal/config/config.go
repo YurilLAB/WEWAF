@@ -286,6 +286,41 @@ type Config struct {
 	IntelFeedsLearningHours int      `json:"intel_feeds_learning_hours"`  // observe-only window for new entries; default 0 (off)
 	IntelFeedsAllowSources  []string `json:"intel_feeds_allow_sources"`   // empty = all defaults; otherwise allowlist of source names
 
+	// Host-firewall ban sink — pushes the in-memory ban list down to the OS
+	// packet filter (nftables on Linux, Windows Firewall on Windows) so a
+	// banned source is dropped at L3/L4 across EVERY port, pre-handshake,
+	// instead of only when it speaks HTTP through the proxy. This is what
+	// makes a WEWAF ban protect the SERVER (SSH, databases, the origin port)
+	// and not just the website. Default off; the in-process HTTP ban check
+	// (proxy.go) always stays on, so the sink is a pure add-on that fails
+	// open to L7 enforcement if the kernel call errors.
+	FirewallSinkEnabled  bool     `json:"firewall_sink_enabled"`
+	FirewallBackend      string   `json:"firewall_backend"`       // "auto" | "nft" | "netsh" | "none"
+	FirewallDryRun       bool     `json:"firewall_dry_run"`       // log the exact argv instead of executing — safe trial mode
+	FirewallTable        string   `json:"firewall_table"`         // nftables table name (Linux), default "wewaf"
+	FirewallReconcileSec int      `json:"firewall_reconcile_sec"` // how often the reconcile loop syncs bans to the kernel; default 5
+	FirewallMaxRules     int      `json:"firewall_max_rules"`     // cap on kernel entries (0 = backend default); guards the per-rule netsh path
+	// BanAllowlist is the never-ban CIDR/IP set. Loopback and the unspecified
+	// address are always refused; these entries add your CDN egress range, the
+	// admin bind, or the default gateway so a threat feed or a confused
+	// auto-mitigation rule can't lock you out of your own box once the firewall
+	// sink is dropping at the kernel.
+	BanAllowlist []string `json:"ban_allowlist"`
+
+	// Origin proof-of-passage — inject a shared-secret header on every request
+	// forwarded to the backend so the origin can reject traffic that did NOT
+	// pass through the WAF. Closes the classic direct-to-origin bypass: an
+	// attacker who discovers the origin IP and connects to it directly skips
+	// every WAF check, making the whole WAF moot. The origin (or a 3-line
+	// nginx/Caddy rule) verifies the header. Secret is never auto-generated to
+	// a random value — it must be shared with the origin — and is redacted from
+	// every UI/log surface. Previous holds the prior secret during rotation so
+	// a key change never 403s live traffic.
+	OriginShieldEnabled        bool   `json:"origin_shield_enabled"`
+	OriginShieldHeader         string `json:"origin_shield_header"`          // default "X-WEWAF-Origin-Verify"
+	OriginShieldSecret         string `json:"origin_shield_secret"`          // shared secret; redacted
+	OriginShieldSecretPrevious string `json:"origin_shield_secret_previous"` // accepted during rotation; redacted
+
 	modeAtomic atomic.Value // stores string for hot-swapping Mode without copying mutexes
 	// mu protects runtime mutation of any non-atomic field (admin API POST
 	// /api/config edits, config watcher hot-reloads). Snapshot() takes an
@@ -463,6 +498,25 @@ func Default() *Config {
 		IntelFeedsCacheDir:      "",
 		IntelFeedsLearningHours: 0,
 		IntelFeedsAllowSources:  nil,
+
+		// Host-firewall sink off by default — it requires CAP_NET_ADMIN /
+		// Administrator and changes host-wide packet filtering, so it must be
+		// an explicit operator decision. "auto" picks nft on Linux / netsh on
+		// Windows when enabled.
+		FirewallSinkEnabled:  false,
+		FirewallBackend:      "auto",
+		FirewallDryRun:       false,
+		FirewallTable:        "wewaf",
+		FirewallReconcileSec: 5,
+		FirewallMaxRules:     0,
+		BanAllowlist:         nil,
+
+		// Origin shield off by default — needs a shared secret configured on
+		// the origin too, so it can't be a silent default.
+		OriginShieldEnabled:        false,
+		OriginShieldHeader:         "X-WEWAF-Origin-Verify",
+		OriginShieldSecret:         "",
+		OriginShieldSecretPrevious: "",
 	}
 	c.modeAtomic.Store(c.Mode)
 	return c
@@ -744,6 +798,48 @@ func (c *Config) Validate() error {
 	if c.IntelFeedsLearningHours > 24*30 {
 		c.IntelFeedsLearningHours = 24 * 30
 	}
+	// Host-firewall sink clamps. An unknown backend falls back to "auto"
+	// rather than failing startup — the sink degrades to L7-only enforcement
+	// if it can't find a usable tool, so a typo shouldn't brick the daemon.
+	switch c.FirewallBackend {
+	case "", "auto", "nft", "nftables", "netsh", "windows", "windows-firewall", "none":
+	default:
+		c.FirewallBackend = "auto"
+	}
+	if c.FirewallBackend == "" {
+		c.FirewallBackend = "auto"
+	}
+	if c.FirewallTable == "" {
+		c.FirewallTable = "wewaf"
+	}
+	if c.FirewallReconcileSec <= 0 {
+		c.FirewallReconcileSec = 5
+	}
+	// Reconciling more often than once a second is pointless (bans have
+	// second-granularity expiry) and just burns exec() calls.
+	if c.FirewallReconcileSec < 1 {
+		c.FirewallReconcileSec = 1
+	}
+	if c.FirewallMaxRules < 0 {
+		c.FirewallMaxRules = 0
+	}
+	// Validate the never-ban allowlist up front so a bad CIDR is caught at
+	// startup, not silently ignored when the first ban arrives.
+	if _, err := clientip.NewCIDRSet(c.BanAllowlist); err != nil {
+		return fmt.Errorf("config: ban_allowlist: %w", err)
+	}
+
+	// Origin shield. The header name must be a valid HTTP token, or
+	// Header.Del/Set would canonicalize a malformed name differently from a raw
+	// write and the strip/inject keys could diverge — so fall back to the
+	// default on anything empty or non-token. We do NOT error when enabled
+	// without a secret — that's handled at wiring time with a loud warning and
+	// the feature simply doesn't inject (auto-generating a per-restart random
+	// secret would be useless: the origin could never verify it).
+	if !isHTTPToken(c.OriginShieldHeader) {
+		c.OriginShieldHeader = "X-WEWAF-Origin-Verify"
+	}
+
 	// Reject malformed trusted_proxies entries up front so a typo in
 	// production config doesn't silently disable the trust-gate at
 	// runtime.
@@ -751,6 +847,27 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: %w", err)
 	}
 	return nil
+}
+
+// isHTTPToken reports whether s is a valid RFC 7230 header field name (one or
+// more tchars). Used to reject a malformed origin_shield_header before it can
+// desync the ingress strip key from the injected key.
+func isHTTPToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+			c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+			c == '`' || c == '|' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // BuildClientIPExtractor returns a *clientip.Extractor configured from
@@ -800,6 +917,12 @@ func (c *Config) RedactSecrets() *Config {
 	}
 	if cp.MeshAPIKey != "" {
 		cp.MeshAPIKey = secretRedactedPlaceholder
+	}
+	if cp.OriginShieldSecret != "" {
+		cp.OriginShieldSecret = secretRedactedPlaceholder
+	}
+	if cp.OriginShieldSecretPrevious != "" {
+		cp.OriginShieldSecretPrevious = secretRedactedPlaceholder
 	}
 	return cp
 }
@@ -966,6 +1089,19 @@ func (c *Config) Snapshot() *Config {
 		IntelFeedsCacheDir:      c.IntelFeedsCacheDir,
 		IntelFeedsLearningHours: c.IntelFeedsLearningHours,
 		IntelFeedsAllowSources:  append([]string(nil), c.IntelFeedsAllowSources...),
+
+		FirewallSinkEnabled:  c.FirewallSinkEnabled,
+		FirewallBackend:      c.FirewallBackend,
+		FirewallDryRun:       c.FirewallDryRun,
+		FirewallTable:        c.FirewallTable,
+		FirewallReconcileSec: c.FirewallReconcileSec,
+		FirewallMaxRules:     c.FirewallMaxRules,
+		BanAllowlist:         append([]string(nil), c.BanAllowlist...),
+
+		OriginShieldEnabled:        c.OriginShieldEnabled,
+		OriginShieldHeader:         c.OriginShieldHeader,
+		OriginShieldSecret:         c.OriginShieldSecret,
+		OriginShieldSecretPrevious: c.OriginShieldSecretPrevious,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
 	copy(cp.EgressAllowlist, c.EgressAllowlist)

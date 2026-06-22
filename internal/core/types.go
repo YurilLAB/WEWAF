@@ -3,8 +3,11 @@ package core
 import (
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"wewaf/internal/clientip"
@@ -230,7 +233,6 @@ func nextCounter() uint64 {
 	return counter
 }
 
-
 // BanEntry records a single IP ban.
 type BanEntry struct {
 	IP         string    `json:"ip"`
@@ -262,6 +264,14 @@ type BanList struct {
 	backoffMultiplier int
 	backoffWindow     time.Duration
 	maxDuration       time.Duration
+
+	// allowlist is the never-ban set: loopback/unspecified are always
+	// rejected, plus any CIDR the operator marks off-limits (their CDN
+	// egress range, the admin bind, the default gateway). Held behind an
+	// atomic pointer so the hot Ban() path reads it without a lock and a
+	// config hot-reload can swap it in atomically. Nil = only the always-on
+	// loopback/unspecified guard applies.
+	allowlist atomic.Pointer[clientip.CIDRSet]
 }
 
 // maxBanEntries caps the active-ban map. With BanList.Cleanup running on
@@ -347,14 +357,81 @@ func (bl *BanList) ConfigureBackoff(enabled bool, multiplier int, window, maxDur
 	bl.maxDuration = maxDuration
 }
 
-// Ban adds or updates a ban entry for the given IP. When backoff is enabled,
-// repeat bans on the same IP within the backoff window apply an exponential
-// multiplier to the duration, capped at maxDuration.
-func (bl *BanList) Ban(ip, reason string, duration time.Duration) {
+// SetAllowlist installs the never-ban CIDR set. Pass nil to clear it (the
+// always-on loopback/unspecified guard still applies). Hot-reload safe — the
+// pointer swap is atomic, so an in-flight Ban() either sees the old set or the
+// new one, never a torn value.
+func (bl *BanList) SetAllowlist(set *clientip.CIDRSet) {
+	bl.allowlist.Store(set)
+}
+
+// banKey returns the canonical ban-list key for an input that may be a bare IP
+// OR a single-host CIDR (/32 or /128). Threat-intel feeds emit individual
+// addresses in CIDR form ("1.2.3.4/32"), so rejecting every "/"-bearing string
+// would silently drop the entire feed pipeline. It also returns the parsed
+// address for the loopback/allowlist checks. Wider CIDR ranges and non-IP
+// garbage return ok=false: the ban map keys on a single host (IPv6 masked to
+// /64) and cannot represent an arbitrary range, and a non-IP string must never
+// reach the firewall sink (the command/argument-injection vector).
+func banKey(raw string) (key string, ip net.IP, ok bool) {
+	s := strings.TrimSpace(raw)
+	if p := net.ParseIP(s); p != nil {
+		return clientip.NormalizeIPKey(s), p, true
+	}
+	if hip, ipnet, err := net.ParseCIDR(s); err == nil {
+		if ones, bits := ipnet.Mask.Size(); ones == bits {
+			return clientip.NormalizeIPKey(hip.String()), hip, true
+		}
+	}
+	return "", nil, false
+}
+
+// effectiveBanNet is the network a ban actually covers: an IPv4 /32 host, or an
+// IPv6 /64 prefix (matching NormalizeIPKey, which masks v6 to /64 so a single
+// site can't rotate the low 64 bits). The allowlist is tested against THIS, not
+// the bare /128, so allowlisting any host inside a /64 (a /128 admin entry)
+// correctly prevents a /64 ban that would otherwise collateral-block it.
+func effectiveBanNet(ip net.IP) *net.IPNet {
+	if ip4 := ip.To4(); ip4 != nil {
+		return &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)}
+	}
+	return &net.IPNet{IP: ip.Mask(net.CIDRMask(64, 128)), Mask: net.CIDRMask(64, 128)}
+}
+
+// validatedBanKey returns the canonical key for a ban, or ok=false when the ban
+// must be refused: a non-IP / range string (injection + unrepresentable),
+// loopback / unspecified (self-DoS — on a single-binary box it can lock out the
+// admin plane), or anything overlapping the never-ban allowlist (the CDN egress
+// range, the admin bind, the default gateway). Centralising the gate here means
+// EVERY ban source — manual admin POST, intel feed, mesh-peer sync,
+// auto-mitigation — is covered by one rule, and nothing the firewall sink later
+// pushes to the kernel was ever attacker-chosen garbage or a self-DoS.
+func (bl *BanList) validatedBanKey(raw string) (string, bool) {
+	key, ip, ok := banKey(raw)
+	if !ok || ip.IsLoopback() || ip.IsUnspecified() {
+		return "", false
+	}
+	if al := bl.allowlist.Load(); al != nil && al.Overlaps(effectiveBanNet(ip)) {
+		return "", false
+	}
+	return key, true
+}
+
+// Ban adds or updates a ban entry for the given IP (or single-host CIDR). When
+// backoff is enabled, repeat bans on the same IP within the backoff window apply
+// an exponential multiplier to the duration, capped at maxDuration. Invalid,
+// loopback, and allowlisted IPs are dropped (see validatedBanKey). Returns true
+// iff the ban was accepted and stored, so callers (intel-feed counters, the
+// admin API) can report honestly instead of counting silently-dropped bans.
+func (bl *BanList) Ban(ip, reason string, duration time.Duration) bool {
+	key, ok := bl.validatedBanKey(ip)
+	if !ok {
+		return false
+	}
 	// Canonicalise to the same per-client key the ingress path uses (IPv6 ->
 	// /64) so a ban actually covers the prefix an attacker rotates through,
 	// and so an admin/threat-feed/mesh ban matches the key IsBanned checks.
-	ip = clientip.NormalizeIPKey(ip)
+	ip = key
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 	now := time.Now().UTC()
@@ -459,6 +536,7 @@ func (bl *BanList) Ban(ip, reason string, duration time.Duration) {
 		Offenses:   offenses,
 		LastBanned: now,
 	}
+	return true
 }
 
 // Unban removes a ban for the given IP.

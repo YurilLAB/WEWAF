@@ -334,6 +334,66 @@ func splitXFF(xff string) []string {
 	return out
 }
 
+// CIDRSet is an immutable, concurrency-safe set of CIDR networks with O(n)
+// membership testing. It reuses the same parser as the trusted_proxies
+// allowlist (bare IPs are promoted to /32 or /128), so operators write
+// allowlist entries in one consistent syntax across the whole config.
+//
+// It exists so the ban-input allowlist (core.BanList) and the host-firewall
+// sink (internal/firewall) can share one validated never-touch set without
+// re-implementing CIDR parsing — banning your own CDN egress range or the
+// loopback interface is a self-DoS, and a single shared primitive makes that
+// hard to get wrong in two places.
+type CIDRSet struct {
+	nets []*net.IPNet
+}
+
+// NewCIDRSet parses entries (CIDRs or bare IPs) into a set. A malformed entry
+// returns a non-nil error and a nil set; callers should treat that as a fatal
+// config error, exactly like trusted_proxies.
+func NewCIDRSet(entries []string) (*CIDRSet, error) {
+	nets, err := parseCIDRs(entries)
+	if err != nil {
+		return nil, err
+	}
+	return &CIDRSet{nets: nets}, nil
+}
+
+// Contains reports whether ipStr falls inside any network in the set. A nil
+// set, an empty set, or an unparseable IP all return false. Safe for
+// concurrent use — the set is never mutated after construction.
+func (s *CIDRSet) Contains(ipStr string) bool {
+	if s == nil {
+		return false
+	}
+	return ipInNets(strings.TrimSpace(ipStr), s.nets)
+}
+
+// Overlaps reports whether the network n intersects any network in the set —
+// i.e. one contains the other's base address. This is what the ban allowlist
+// needs: a ban keyed on an IPv6 /64 must be refused if the allowlist names ANY
+// host inside that /64 (a /128 admin entry), not only when the /64 base address
+// itself is listed. A nil set or nil n returns false.
+func (s *CIDRSet) Overlaps(n *net.IPNet) bool {
+	if s == nil || n == nil {
+		return false
+	}
+	for _, m := range s.nets {
+		if m.Contains(n.IP) || n.Contains(m.IP) {
+			return true
+		}
+	}
+	return false
+}
+
+// Len returns the number of networks in the set.
+func (s *CIDRSet) Len() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.nets)
+}
+
 func ipInNets(ipStr string, nets []*net.IPNet) bool {
 	if ipStr == "" || len(nets) == 0 {
 		return false
@@ -365,8 +425,11 @@ func parseCIDRs(in []string) ([]*net.IPNet, error) {
 		}
 		if !strings.Contains(s, "/") {
 			if ip := net.ParseIP(s); ip != nil {
-				if ip.To4() != nil {
-					s += "/32"
+				if ip4 := ip.To4(); ip4 != nil {
+					// Use the dotted-quad form so an IPv4-mapped IPv6 literal
+					// ("::ffff:1.2.3.4") promotes to 1.2.3.4/32, not the 128-bit
+					// "::ffff:1.2.3.4/32" which ParseCIDR would mask to ::/32.
+					s = ip4.String() + "/32"
 				} else {
 					s += "/128"
 				}

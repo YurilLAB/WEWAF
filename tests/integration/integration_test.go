@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -71,6 +72,15 @@ func newTestProxy(t *testing.T) (frontend, backend *httptest.Server, metrics *te
 	cfg.ListenAddr = ":0"
 	cfg.AdminAddr = ":0"
 	cfg.Mode = "active"
+	// Sit behind a trusted loopback "proxy" so tests can present a realistic
+	// non-loopback client IP via X-Forwarded-For. The WAF refuses to ban its
+	// own loopback (a self-DoS guard that also keeps the host-firewall sink
+	// from ever dropping 127.0.0.1 at the kernel), exactly as in production —
+	// so ban-enforcement tests must use a real client IP, not loopback.
+	// Requests without an XFF header still resolve to the loopback peer, so no
+	// existing test's client-IP behaviour changes.
+	cfg.TrustXFF = true
+	cfg.TrustedProxies = []string{"127.0.0.0/8", "::1/128"}
 	cfg.ShaperEnabled = false
 	cfg.DDoSWarmupSeconds = 1
 	cfg.PerRuleCounters = true
@@ -448,29 +458,42 @@ func TestPrometheusExposition(t *testing.T) {
 // actually rejected on the ingress path (403) before reaching the backend.
 // Before ban enforcement was wired into WAFProxy.ServeHTTP, bans were purely
 // decorative — listed in /api/bans and synced to peers but never blocking a
-// single request. The httptest client connects from loopback, so we ban
-// 127.0.0.1 and confirm the next request is forbidden, then unban and confirm
-// it is allowed again.
+// single request. The WAF now refuses to ban its own loopback (a self-DoS /
+// kernel-firewall guard), so we present a realistic public client IP via
+// X-Forwarded-For (the test proxy trusts the loopback peer), ban that, confirm
+// the next request is forbidden, then unban and confirm it is allowed again.
 func TestBannedIPIsBlocked(t *testing.T) {
 	frontend, _, metrics, bans, stop := newTestProxy(t)
 	defer stop()
 
-	// Sanity: an un-banned request reaches the backend.
-	resp, err := http.Get(frontend.URL + "/ok")
-	if err != nil {
-		t.Fatalf("pre-ban request: %v", err)
+	const clientIP = "203.0.113.50"
+	do := func() *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, frontend.URL+"/ok", nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set("X-Forwarded-For", clientIP)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		return resp
 	}
+
+	// Sanity: an un-banned request reaches the backend.
+	resp := do()
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 before ban, got %d", resp.StatusCode)
 	}
 
-	bans.Ban("127.0.0.1", "integration test ban", time.Hour)
-
-	resp, err = http.Get(frontend.URL + "/ok")
-	if err != nil {
-		t.Fatalf("post-ban request: %v", err)
+	bans.Ban(clientIP, "integration test ban", time.Hour)
+	if !bans.IsBanned(clientIP) {
+		t.Fatalf("ban of a public IP must take effect")
 	}
+
+	resp = do()
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("banned IP must be blocked with 403, got %d", resp.StatusCode)
@@ -482,11 +505,8 @@ func TestBannedIPIsBlocked(t *testing.T) {
 		t.Fatalf("ban block should increment BlockedRequests")
 	}
 
-	bans.Unban("127.0.0.1")
-	resp, err = http.Get(frontend.URL + "/ok")
-	if err != nil {
-		t.Fatalf("post-unban request: %v", err)
-	}
+	bans.Unban(clientIP)
+	resp = do()
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 after unban, got %d", resp.StatusCode)
@@ -682,13 +702,83 @@ func TestBanCoversIPv6Prefix(t *testing.T) {
 	}
 }
 
+// TestOriginShieldHeaderHandling proves the proof-of-passage header is injected
+// for the origin when enabled, and that a client-forged copy is always stripped
+// — even when the feature is disabled, so a partially-configured origin can't be
+// bypassed by smuggling the header through a WAF that isn't injecting it.
+func TestOriginShieldHeaderHandling(t *testing.T) {
+	const header = "X-WEWAF-Origin-Verify"
+	var mu sync.Mutex
+	var seen string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = r.Header.Get(header)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	front := func(enable bool, secret string) *httptest.Server {
+		cfg := config.Default()
+		cfg.BackendURL = backend.URL
+		cfg.Mode = "active"
+		cfg.OriginShieldEnabled = enable
+		cfg.OriginShieldSecret = secret
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+		rs, err := rules.NewRuleSet(rules.DefaultRules())
+		if err != nil {
+			t.Fatalf("rules: %v", err)
+		}
+		eng, err := engine.NewEngine(cfg, rs, &testLogger{t})
+		if err != nil {
+			t.Fatalf("engine: %v", err)
+		}
+		wp, err := proxy.NewWAFProxy(cfg, eng, telemetry.NewMetrics(), bruteforce.NewDetector(time.Minute))
+		if err != nil {
+			t.Fatalf("proxy: %v", err)
+		}
+		return httptest.NewServer(wp)
+	}
+
+	send := func(fe *httptest.Server, forged string) string {
+		req, _ := http.NewRequest(http.MethodGet, fe.URL+"/", nil)
+		if forged != "" {
+			req.Header.Set(header, forged)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		resp.Body.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		return seen
+	}
+
+	// Disabled: a forged client header must be stripped (backend sees nothing).
+	feOff := front(false, "")
+	defer feOff.Close()
+	if got := send(feOff, "attacker-forged"); got != "" {
+		t.Fatalf("disabled shield must strip the client header; backend saw %q", got)
+	}
+
+	// Enabled: backend must receive the REAL secret, never the forged value.
+	feOn := front(true, "the-real-origin-secret-value-32b!")
+	defer feOn.Close()
+	if got := send(feOn, "attacker-forged"); got != "the-real-origin-secret-value-32b!" {
+		t.Fatalf("enabled shield must inject the real secret; backend saw %q", got)
+	}
+}
+
 func TestExponentialBackoffBans(t *testing.T) {
 	bl := core.NewBanList()
 	bl.ConfigureBackoff(true, 2, time.Minute, time.Hour)
 
-	bl.Ban("offender", "scan", 100*time.Millisecond)
-	bl.Ban("offender", "scan", 100*time.Millisecond)
-	bl.Ban("offender", "scan", 100*time.Millisecond)
+	bl.Ban("198.51.100.20", "scan", 100*time.Millisecond)
+	bl.Ban("198.51.100.20", "scan", 100*time.Millisecond)
+	bl.Ban("198.51.100.20", "scan", 100*time.Millisecond)
 
 	list := bl.List()
 	if len(list) != 1 {

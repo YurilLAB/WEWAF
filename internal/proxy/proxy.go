@@ -108,6 +108,16 @@ type WAFProxy struct {
 	// are only invoked at the state-transition edge. Calling them on every
 	// request was an unnecessary mutex acquisition per hit.
 	shaperAttack atomic.Bool
+
+	// originShield injects the backend proof-of-passage header so the origin
+	// can reject direct-to-origin traffic that bypassed the WAF. Nil when the
+	// feature is off or no secret was configured.
+	originShield *originShield
+	// originHeader is the proof-of-passage header NAME, always set (defaulted).
+	// It is stripped from every inbound request regardless of whether injection
+	// is active, so a client can never smuggle a forged value to an origin that
+	// is configured to trust it.
+	originHeader string
 }
 
 // AttachSessionTracker wires in the session tracker so the proxy can
@@ -503,6 +513,21 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	wp.proxy.ModifyResponse = wp.modifyResponse
 	wp.proxy.ErrorHandler = wp.errorHandler
 
+	// Origin proof-of-passage. When enabled with a shared secret, compose the
+	// reverse-proxy director so every forwarded request carries the verify
+	// header. We only wire it when a secret is actually present — injecting a
+	// header the origin can't verify (or an empty one) would be worse than
+	// useless. main.go emits a loud warning for the enabled-but-no-secret case.
+	wp.originHeader = cfg.OriginShieldHeader
+	if wp.originHeader == "" {
+		wp.originHeader = "X-WEWAF-Origin-Verify"
+	}
+	if cfg.OriginShieldEnabled && cfg.OriginShieldSecret != "" {
+		shield := newOriginShield(cfg.OriginShieldHeader, cfg.OriginShieldSecret, cfg.OriginShieldSecretPrevious)
+		wp.originShield = shield
+		wp.proxy.Director = shield.wrapDirector(wp.proxy.Director)
+	}
+
 	return wp, nil
 }
 
@@ -609,6 +634,15 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// set this header AFTER stripping whatever the client sent.
 	if !wp.ipExtractor.IsTrustedPeer(r) {
 		r.Header.Del("X-WEWAF-Client-Cert-Verified")
+	}
+
+	// Strip any client-supplied origin proof-of-passage header on EVERY request,
+	// even when injection is off or unconfigured: if the origin is (partially)
+	// set up to trust this header, a client must never be able to smuggle it
+	// through. When the feature is active the director re-injects the genuine
+	// secret at forward time (with Set, which overwrites).
+	if wp.originHeader != "" {
+		r.Header.Del(wp.originHeader)
 	}
 
 	// Bypass-hardening: cheap protocol-level checks that catch request

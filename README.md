@@ -28,6 +28,9 @@ historical data survives restarts and stays searchable by time range.
 | Resilience        | Circuit breaker with half-open probe gating               | enabled  |
 | Resilience        | Adaptive DDoS detector (volumetric + botnet + Slowloris)  | enabled  |
 | Resilience        | Exponential-backoff bans (doubling duration, capped)      | enabled  |
+| Server protection | Host-firewall ban sink — kernel L3/L4 drop on **all** ports| opt-in   |
+| Server protection | Never-ban allowlist (loopback/CDN/gateway self-DoS guard) | enabled  |
+| Server protection | Origin proof-of-passage header (direct-to-origin defence) | opt-in   |
 | Observability     | Prometheus `/metrics` exposition                          | enabled  |
 | Observability     | Per-rule match counters (JSON + Prometheus)               | enabled  |
 | Observability     | Server-Sent Events stream of blocks / egress / bots       | enabled  |
@@ -134,6 +137,37 @@ hostname is attacker-controlled and aliased. Each destination host gets
 its own token-bucket rate limit so a single noisy dependency can't flood
 a third party. CONNECT tunnels half-close on either direction's copy
 ending so an idle peer cannot leak the other goroutine.
+
+**Protecting the server, not just the website.** Every other WAF feature
+here enforces at L7 — it returns an HTTP error. That protects the site, but
+a "banned" attacker has still finished the TCP handshake, TLS, and HTTP parse
+before being turned away, and can hammer SSH, a database port, or the origin
+directly all day. The **host-firewall ban sink** closes that: when enabled, a
+background reconcile loop syncs WEWAF's ban list into the OS packet filter —
+an nftables `inet` table with timeout-flagged v4/v6 sets on Linux, the
+`WEWAF` Windows Firewall group on Windows — so a banned source is dropped at
+**L3/L4 across every port, before the handshake**. This is the fail2ban /
+CrowdSec model: bans become a host defence, not just a web defence, and the
+WAF stops burning CPU refusing connections it already decided to drop. It is
+a pure add-on — the in-process HTTP ban check stays, so a failed kernel call
+never weakens enforcement — and every banned IP is canonicalised before it can
+reach `nft`/`netsh` (no command injection; fuzz-locked), with loopback, the
+CDN, and the gateway protected by a never-ban allowlist so a bad threat-feed
+entry can't self-DoS the box. A `firewall_dry_run` mode logs the exact kernel
+commands without touching the host. See
+[`docs/server-protection.md`](docs/server-protection.md).
+
+**Origin shielding against direct-to-origin bypass.** A WAF only protects an
+origin while traffic is forced through it; the moment an attacker finds the
+origin IP and connects directly, every check above is skipped. With
+`origin_shield_enabled`, WEWAF injects a shared-secret header on every request
+it forwards to the backend (the Cloudflare *Authenticated Origin Pull* / AWS
+CloudFront custom-header pattern). Configure the origin — or a three-line
+nginx/Caddy rule — to require it, and a direct hit fails at the door. The
+secret is shared out of band (never auto-generated to a value the origin can't
+verify), redacted from every log/UI surface, supports a `previous` value for
+zero-downtime rotation, and is stripped from inbound requests then re-set on
+egress so a client can never forge it.
 
 **Per-session anomaly scoring.** A dedicated tracker issues an
 HMAC-signed `__wewaf_sid` cookie on first contact and accumulates
@@ -549,6 +583,27 @@ the first real egress request doesn't block five seconds on LookupIP.
 Resolution happens on a background goroutine — startup never stalls on
 DNS even if the network is flaky.
 
+### Server protection (host firewall + origin shield)
+
+These features defend the **host and the origin**, not just the website. Full
+operational detail (privileges, backends, the origin-verification snippets, and
+how to inspect the live ruleset) lives in
+[`docs/server-protection.md`](docs/server-protection.md).
+
+| Field                      | Default     | Purpose                                                                                                                |
+|----------------------------|-------------|------------------------------------------------------------------------------------------------------------------------|
+| `firewall_sink_enabled`    | `false`     | Push the ban list into the OS packet filter so banned IPs drop at L3/L4 across **all** ports. Needs `CAP_NET_ADMIN` (Linux) / Administrator (Windows). |
+| `firewall_backend`         | `"auto"`    | `auto` (nft on Linux, Windows Firewall on Windows), `nft`, `netsh`, or `none`.                                          |
+| `firewall_dry_run`         | `false`     | Log the exact `nft`/`netsh` commands instead of executing them — a safe trial that never touches the host firewall.     |
+| `firewall_table`           | `"wewaf"`   | nftables table name (Linux). Sanitised to `[A-Za-z0-9_]`.                                                               |
+| `firewall_reconcile_sec`   | `5`         | How often the active ban set is synced to the kernel.                                                                   |
+| `firewall_max_rules`       | `0`         | Cap on kernel entries (0 = unlimited). Guards the per-rule Windows path under an IP-rotation flood.                     |
+| `ban_allowlist`            | `[]`        | CIDRs/IPs that must never be banned. Loopback/unspecified are always refused; `trusted_proxies` are merged in automatically (never ban your CDN). |
+| `origin_shield_enabled`    | `false`     | Inject a shared-secret header on every request forwarded to the backend so the origin can reject direct-to-origin traffic that bypassed the WAF. |
+| `origin_shield_header`     | `X-WEWAF-Origin-Verify` | Header carried to the origin.                                                                               |
+| `origin_shield_secret`     | `""`        | Shared secret (≥ 16 random bytes). Configure your origin to require it. Redacted from every UI/log surface.             |
+| `origin_shield_secret_previous` | `""`   | Accepted alongside the current secret during rotation so a key change never 403s live traffic. Redacted.               |
+
 ### Response headers
 
 | Field                       | Default     | Purpose                                                                                                                                           |
@@ -730,6 +785,9 @@ live under `tests/integration/`.
 | `internal/ddos`                 | Botnet threshold trips at configured unique-IP count; fresh-count optimisation actually prunes stale entries. |
 | `internal/dpi`                  | gRPC frame parser (bomb / count / truncation), WebSocket upgrade allowlist, RFC 6455 frame reader (masking, 64-bit length cap, reserved-opcode rejection). |
 | `internal/audit`                | HMAC chain roundtrip + detect edit / delete / reorder / wrong-secret / truncated-tail cases. |
+| `internal/firewall`             | Reconcile add/remove diff, allowlist + loopback skip, MaxRules cap, apply-error retry, dry-run, concurrent reconcile under `-race`; fuzz: no command injection through `nft`/`netsh`/PowerShell builders (`FuzzCanonicalIP`, `FuzzNftArgsNoInjection`, `FuzzPowerShellNoInjection`). |
+| `internal/proxy` (origin shield)| Director overwrites a forged verify header; `VerifyOriginSecret` constant-time match + rotation; fuzz: verify never misfires. |
+| `internal/core` (ban guard)     | Invalid/injection-shaped IPs dropped, loopback/unspecified never banned, allowlist + `trusted_proxies` honoured. |
 | `tests/integration`             | End-to-end: allow + block + per-rule counters + Prometheus exposition. |
 
 ## Hot-reload
@@ -762,6 +820,7 @@ internal/host/        — CPU/mem/disk/net sampler (gopsutil)
 internal/connection/  — backend probe + ping/event history
 internal/ssl/         — cert storage + TLS policy
 internal/bruteforce/  — sliding-window login attempt tracker
+internal/firewall/    — host packet-filter ban sink (nftables / Windows Firewall) with dry-run
 internal/web/         — admin JSON API + SSE stream + /metrics (no bundled UI)
 tests/integration/    — black-box end-to-end tests (boot real proxy + backend)
 history/              — created at runtime; rotating SQLite files live here

@@ -18,10 +18,12 @@ import (
 
 	"wewaf/internal/audit"
 	"wewaf/internal/bruteforce"
+	"wewaf/internal/clientip"
 	"wewaf/internal/config"
 	"wewaf/internal/connection"
 	"wewaf/internal/core"
 	"wewaf/internal/engine"
+	"wewaf/internal/firewall"
 	"wewaf/internal/graphql"
 	"wewaf/internal/history"
 	"wewaf/internal/host"
@@ -52,6 +54,19 @@ func (s *simpleLogger) Debugf(format string, args ...interface{}) { log.Printf("
 func (s *simpleLogger) Infof(format string, args ...interface{})  { log.Printf("[INFO] "+format, args...) }
 func (s *simpleLogger) Warnf(format string, args ...interface{})  { log.Printf("[WARN] "+format, args...) }
 func (s *simpleLogger) Errorf(format string, args ...interface{}) { log.Printf("[ERROR] "+format, args...) }
+
+// banListLister adapts *core.BanList to firewall.Lister so the host-firewall
+// reconcile loop can read the active ban set without firewall importing core.
+type banListLister struct{ bl *core.BanList }
+
+func (l banListLister) ActiveBans() []firewall.Ban {
+	entries := l.bl.List()
+	out := make([]firewall.Ban, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, firewall.Ban{IP: e.IP, ExpiresAt: e.ExpiresAt})
+	}
+	return out
+}
 
 func main() {
 	var configPath string
@@ -217,6 +232,27 @@ func main() {
 	wp.AttachSessionTracker(sessionTracker)
 	wp.AttachGraphQLValidator(gqlValidator)
 
+	// Origin proof-of-passage status. The proxy only injects the verify header
+	// when a shared secret is present (see NewWAFProxy); surface the
+	// misconfiguration here loudly so an operator who flipped the switch but
+	// forgot the secret isn't lulled into thinking the origin is shielded.
+	if cfg.OriginShieldEnabled {
+		switch {
+		case cfg.OriginShieldSecret == "":
+			log.Printf("WARN: origin_shield_enabled but origin_shield_secret is empty — NOT injecting %q. "+
+				"Set a strong shared secret and configure your origin to require it, or direct-to-origin "+
+				"traffic still bypasses the WAF.", cfg.OriginShieldHeader)
+		default:
+			if len(cfg.OriginShieldSecret) < 16 {
+				log.Printf("WARN: origin_shield_secret is short (%d chars) — use at least 16 random bytes "+
+					"(e.g. `openssl rand -hex 24`).", len(cfg.OriginShieldSecret))
+			}
+			log.Printf("origin shield: enabled (header=%s, rotation=%v) — configure your origin to reject "+
+				"requests missing this header to close the direct-to-origin bypass",
+				cfg.OriginShieldHeader, cfg.OriginShieldSecretPrevious != "")
+		}
+	}
+
 	// Tamper-evident audit log. Failure to open the chain is non-fatal —
 	// we degrade to in-memory-only and surface a log line so operators
 	// can see their disk setup is wrong without losing the WAF itself.
@@ -355,6 +391,64 @@ func main() {
 	// threat-feed, mesh, auto-mitigate) actually block the offender.
 	wp.AttachBanList(banList)
 
+	// Never-ban allowlist. Loopback and the unspecified address are always
+	// refused inside BanList; here we add the operator's explicit entries plus
+	// the trusted-proxy CIDRs — banning your own CDN egress range (which every
+	// real visitor's traffic appears to come from when trust_xff is on) would
+	// be an instant self-inflicted outage, doubly so once the host-firewall
+	// sink starts dropping those addresses at the kernel across every port.
+	banAllowEntries := append([]string(nil), cfg.BanAllowlist...)
+	banAllowEntries = append(banAllowEntries, cfg.TrustedProxies...)
+	banAllowSet, banAllowErr := clientip.NewCIDRSet(banAllowEntries)
+	if banAllowErr != nil {
+		log.Printf("ban allowlist: invalid entry (%v) — proceeding with the loopback/unspecified guard only", banAllowErr)
+		banAllowSet = nil
+	}
+	banList.SetAllowlist(banAllowSet)
+
+	// Host-firewall ban sink. When enabled, a background reconcile loop syncs
+	// the active ban list into the OS packet filter (nftables on Linux, Windows
+	// Firewall on Windows) so a banned source is dropped at L3/L4 across EVERY
+	// port, pre-handshake — protecting SSH, databases, and the origin port, not
+	// just the website. The in-process HTTP ban check above stays on, so if a
+	// kernel call fails the offender is still blocked at L7. Off by default
+	// (needs CAP_NET_ADMIN / Administrator); firewall_dry_run logs the exact
+	// commands without touching the host so operators can trial it safely.
+	if cfg.FirewallSinkEnabled {
+		// In legacy trust_xff mode (trust_xff on, no trusted_proxies) a client
+		// can spoof X-Forwarded-For to an arbitrary IP and, by tripping an
+		// auto-ban, have the sink kernel-DROP that address across every port.
+		// The sink already refuses private/loopback/CGNAT targets, but warn
+		// loudly so operators populate trusted_proxies before relying on it.
+		if cfg.TrustXFF && !wp.IPExtractor().HasTrustedProxies() {
+			log.Printf("WARN: firewall_sink_enabled with trust_xff and an empty trusted_proxies list — " +
+				"a spoofed X-Forwarded-For can get a public IP auto-banned and dropped at the kernel. " +
+				"Populate trusted_proxies before enabling the sink in production.")
+		}
+		fwBackend, fwErr := firewall.DefaultBackend(firewall.Config{
+			Backend:  cfg.FirewallBackend,
+			Table:    cfg.FirewallTable,
+			DryRun:   cfg.FirewallDryRun,
+			MaxRules: cfg.FirewallMaxRules,
+		})
+		switch {
+		case fwErr != nil:
+			log.Printf("firewall: backend init failed (%v) — host-firewall enforcement OFF, L7 ban check still applies", fwErr)
+		case fwBackend == nil:
+			log.Printf("firewall: no host-firewall backend for backend=%q on this platform — host-firewall enforcement OFF, L7 ban check still applies", cfg.FirewallBackend)
+		default:
+			fwSink := firewall.New(fwBackend, banListLister{banList}, firewall.Config{
+				Reconcile:   time.Duration(cfg.FirewallReconcileSec) * time.Second,
+				MaxRules:    cfg.FirewallMaxRules,
+				Allowlist:   banAllowSet,
+				DryRun:      cfg.FirewallDryRun,
+				ClearOnStop: true,
+			})
+			fwSink.Start(rootCtx)
+			defer fwSink.Stop()
+		}
+	}
+
 	// Auto-updating threat-intel feeds. The supervisor pulls FREE
 	// community lists (FireHOL, Spamhaus DROP, SSLBL JA3, blocklist.de,
 	// ET compromised, mitchellkrogza bad-UAs, CISA KEV) on a schedule
@@ -396,8 +490,12 @@ func main() {
 					}
 					// Long ban — these are typically permanent
 					// listings; the cleanup loop reaps stale entries.
-					banList.Ban(e.Value, reason, 7*24*time.Hour)
-					ipBatch++
+					// Count only bans that were actually stored (Ban now
+					// normalises CIDR feed entries and drops allowlisted /
+					// loopback / range values), so the log isn't a fiction.
+					if banList.Ban(e.Value, reason, 7*24*time.Hour) {
+						ipBatch++
+					}
 				case intel.KindJA3, intel.KindJA4:
 					if jaDetector == nil {
 						continue
