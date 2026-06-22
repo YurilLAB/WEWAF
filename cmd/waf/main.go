@@ -86,6 +86,10 @@ func reputationConfigFrom(cfg *config.Config) reputation.Config {
 		HalfLife:      time.Duration(cfg.RepHalfLifeSec) * time.Second,
 		Jitter:        time.Duration(cfg.RepJitterSec) * time.Second,
 		PurgeAge:      time.Duration(cfg.RepPurgeAgeSec) * time.Second,
+
+		Recidive:          cfg.RecidiveEnabled,
+		RecidiveThreshold: cfg.RecidiveThreshold,
+		RecidiveBan:       time.Duration(cfg.RecidiveBanDurationSec) * time.Second,
 	}
 }
 
@@ -537,6 +541,10 @@ func main() {
 		})
 		log.Printf("reputation auto-ban active: %d blocks within %ds escalate to a ban",
 			cfg.ReputationThreshold, cfg.ReputationWindowSec)
+		if cfg.RecidiveEnabled {
+			log.Printf("reputation recidive active: an IP flagged by %d distinct subsystems is banned for %ds",
+				cfg.RecidiveThreshold, cfg.RecidiveBanDurationSec)
+		}
 	}
 
 	// Host-firewall ban sink. When enabled, a background reconcile loop syncs

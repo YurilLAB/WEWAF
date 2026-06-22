@@ -2,7 +2,9 @@ package reputation
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"math/bits"
 	mrand "math/rand/v2"
 	"net"
 	"sync"
@@ -75,6 +77,15 @@ type Config struct {
 	HalfLife      time.Duration // score decay half-life
 	Jitter        time.Duration // rndtime: random padding added to a ban so the unban instant is unpredictable
 	PurgeAge      time.Duration // quiet offenders with no active ban are purged after this
+
+	// Recidive (cross-subsystem consensus, S3). When enabled, an IP that has
+	// been independently flagged by at least RecidiveThreshold DISTINCT
+	// detection subsystems is banned for RecidiveBan (escalated). This is a
+	// far stronger, lower-false-positive signal than a single noisy detector:
+	// one subsystem cannot manufacture consensus on its own.
+	Recidive          bool
+	RecidiveThreshold int           // distinct subsystems required (<=0 disables)
+	RecidiveBan       time.Duration // base duration for a recidive ban
 }
 
 func (c Config) sane() Config {
@@ -98,6 +109,12 @@ func (c Config) sane() Config {
 	}
 	if c.PurgeAge <= 0 {
 		c.PurgeAge = 30 * 24 * time.Hour
+	}
+	if c.RecidiveThreshold <= 0 {
+		c.RecidiveThreshold = 3
+	}
+	if c.RecidiveBan <= 0 {
+		c.RecidiveBan = 7 * 24 * time.Hour
 	}
 	return c
 }
@@ -127,11 +144,13 @@ type Reputation struct {
 	Subsystems uint16
 }
 
-// Decision is what RecordBlock returns: whether this block tripped the
-// auto-ban threshold and, if so, the escalated duration to ban for.
+// Decision is what RecordBlock returns: whether this block tripped an auto-ban
+// (either the windowed block threshold or cross-subsystem recidive consensus)
+// and, if so, the base duration to ban for (BanList applies escalation).
 type Decision struct {
 	BlockCount int
 	Ban        bool
+	Recidive   bool // true when the trigger was cross-subsystem consensus
 	Duration   time.Duration
 	Reason     string
 }
@@ -162,9 +181,10 @@ type Engine struct {
 	store *store
 	cfg   atomic.Pointer[Config]
 
-	autoBans   atomic.Uint64
-	restoredN  atomic.Uint64
-	maxEntries int
+	autoBans     atomic.Uint64
+	recidiveBans atomic.Uint64
+	restoredN    atomic.Uint64
+	maxEntries   int
 }
 
 const defaultMaxEntries = 200_000
@@ -322,25 +342,49 @@ func (e *Engine) RecordBlock(ip, subsystem, reason string) Decision {
 	en.blockCount++
 
 	dec := Decision{BlockCount: en.blockCount}
-	// Trigger an auto-ban when the windowed block count reaches the threshold
-	// and the IP is not already serving an active reputation ban (so a steady
-	// stream of blocks doesn't re-fire every request — the gate's own IsBanned
-	// short-circuit also covers this once the ban lands).
-	if cfg.Threshold > 0 && en.blockCount >= cfg.Threshold && !now.Before(en.banUntil) {
-		dec.Ban = true
-		// Return the BASE duration, not an escalated one: the caller bans via
-		// core.BanList, which is the single escalator (it reads this engine's
-		// durable offense count through the OffenseLedger hook and applies the
-		// backoff multiplier). Escalating here too would double-count.
-		dec.Duration = cfg.BaseDuration
-		dec.Reason = reason
-		if dec.Reason == "" {
-			dec.Reason = "reputation: block threshold exceeded"
+	// Two independent auto-ban triggers, evaluated only when the IP is not
+	// already serving an active reputation ban (so a steady stream of blocks
+	// doesn't re-fire every request — the gate's own IsBanned short-circuit
+	// also covers this once the ban lands):
+	//   - recidive: flagged by >= RecidiveThreshold DISTINCT subsystems. A
+	//     strong, low-false-positive consensus signal; preferred because it
+	//     warrants the longer ban.
+	//   - windowed: >= Threshold blocks within Window (the classic reputation
+	//     auto-ban).
+	// In both cases we return the BASE duration only — core.BanList is the
+	// single escalator (it reads this engine's durable offense count via the
+	// OffenseLedger hook and applies the backoff multiplier), so escalating
+	// here too would double-count.
+	if !now.Before(en.banUntil) {
+		recidive := cfg.Recidive && cfg.RecidiveThreshold > 0 &&
+			bits.OnesCount16(en.subsystems) >= cfg.RecidiveThreshold
+		windowed := cfg.Threshold > 0 && en.blockCount >= cfg.Threshold
+		switch {
+		case recidive:
+			dec.Ban = true
+			dec.Recidive = true
+			dec.Duration = cfg.RecidiveBan
+			if dec.Duration <= 0 {
+				dec.Duration = cfg.BaseDuration
+			}
+			dec.Reason = fmt.Sprintf("reputation: recidive — flagged by %d distinct subsystems",
+				bits.OnesCount16(en.subsystems))
+			en.windowStart = now
+			en.blockCount = 0
+			e.autoBans.Add(1)
+			e.recidiveBans.Add(1)
+		case windowed:
+			dec.Ban = true
+			dec.Duration = cfg.BaseDuration
+			dec.Reason = reason
+			if dec.Reason == "" {
+				dec.Reason = "reputation: block threshold exceeded"
+			}
+			// Reset the window so the next ban needs a fresh burst of blocks.
+			en.windowStart = now
+			en.blockCount = 0
+			e.autoBans.Add(1)
 		}
-		// Reset the window so the next ban needs a fresh burst of blocks.
-		en.windowStart = now
-		en.blockCount = 0
-		e.autoBans.Add(1)
 	}
 	p := snapshot(en)
 	e.mu.Unlock()
@@ -591,12 +635,13 @@ func (e *Engine) Stats() map[string]interface{} {
 	e.mu.RUnlock()
 	dropped, written := e.store.stats()
 	return map[string]interface{}{
-		"enabled":         e.config().Enabled,
-		"tracked":         tracked,
-		"auto_bans_total": e.autoBans.Load(),
-		"restored":        e.restoredN.Load(),
-		"dropped_writes":  dropped,
-		"written":         written,
+		"enabled":             e.config().Enabled,
+		"tracked":             tracked,
+		"auto_bans_total":     e.autoBans.Load(),
+		"recidive_bans_total": e.recidiveBans.Load(),
+		"restored":            e.restoredN.Load(),
+		"dropped_writes":      dropped,
+		"written":             written,
 	}
 }
 

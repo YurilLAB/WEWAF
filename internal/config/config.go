@@ -66,6 +66,14 @@ type Config struct {
 	RepHalfLifeSec           int  `json:"rep_half_life_sec"`           // default 86400 — reputation-score decay half-life
 	RepJitterSec             int  `json:"rep_jitter_sec"`              // default 60 — random ban padding (unpredictable unban)
 	RepPurgeAgeSec           int  `json:"rep_purge_age_sec"`           // default 2592000 (30d) — quiet offenders purged
+	// Recidive: an IP independently flagged by >= RecidiveThreshold DISTINCT
+	// detection subsystems (engine, ddos, bruteforce, ja3, intel, session,
+	// rate) is banned for RecidiveBanDurationSec. Cross-subsystem agreement is
+	// a far stronger, lower-FP signal than any single detector. Requires
+	// ReputationEnabled.
+	RecidiveEnabled        bool `json:"recidive_enabled"`          // default false
+	RecidiveThreshold      int  `json:"recidive_threshold"`        // default 3 distinct subsystems
+	RecidiveBanDurationSec int  `json:"recidive_ban_duration_sec"` // default 604800 (7d)
 
 	// Engine behaviour
 	Mode         string   `json:"mode"`           // "active", "detection", "learning"
@@ -382,6 +390,9 @@ func Default() *Config {
 		RepHalfLifeSec:           86400,
 		RepJitterSec:             60,
 		RepPurgeAgeSec:           2592000,
+		RecidiveEnabled:          false,
+		RecidiveThreshold:        3,
+		RecidiveBanDurationSec:   604800,
 		Mode:                     "active",
 		LogLevel:                 "info",
 		AuditLogPath:             "",
@@ -620,6 +631,12 @@ func (c *Config) Validate() error {
 	// before its reputation has meaningfully decayed.
 	if c.RepPurgeAgeSec < c.RepHalfLifeSec {
 		c.RepPurgeAgeSec = c.RepHalfLifeSec
+	}
+	if c.RecidiveThreshold <= 0 {
+		c.RecidiveThreshold = 3
+	}
+	if c.RecidiveBanDurationSec <= 0 {
+		c.RecidiveBanDurationSec = 604800
 	}
 	if c.HistoryDir == "" {
 		c.HistoryDir = "history"
@@ -1023,6 +1040,9 @@ func (c *Config) Snapshot() *Config {
 		RepHalfLifeSec:           c.RepHalfLifeSec,
 		RepJitterSec:             c.RepJitterSec,
 		RepPurgeAgeSec:           c.RepPurgeAgeSec,
+		RecidiveEnabled:          c.RecidiveEnabled,
+		RecidiveThreshold:        c.RecidiveThreshold,
+		RecidiveBanDurationSec:   c.RecidiveBanDurationSec,
 		Mode:                     c.ModeSnapshot(),
 		LogLevel:                 c.LogLevel,
 		AuditLogPath:             c.AuditLogPath,

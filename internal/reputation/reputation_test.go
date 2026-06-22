@@ -134,6 +134,54 @@ func TestAutoBanTrigger(t *testing.T) {
 	}
 }
 
+// TestRecidiveConsensusBan proves the cross-subsystem consensus trigger: an IP
+// flagged by >= RecidiveThreshold DISTINCT subsystems is banned (with the
+// longer recidive duration) even though it never crossed the windowed block
+// threshold — and a single subsystem hammering alone never trips it.
+func TestRecidiveConsensusBan(t *testing.T) {
+	e := testEngine(t, Config{
+		Enabled:           true,
+		Window:            time.Hour,
+		Threshold:         100, // high, so the windowed trigger can't fire here
+		BaseDuration:      600 * time.Second,
+		Factor:            2.0,
+		MaxDuration:       30 * 24 * time.Hour,
+		Recidive:          true,
+		RecidiveThreshold: 3,
+		RecidiveBan:       7 * 24 * time.Hour,
+	})
+	ip := "203.0.113.55"
+	// Two distinct subsystems — not yet consensus.
+	if d := e.RecordBlock(ip, "engine", "xss"); d.Ban {
+		t.Fatal("1 subsystem should not trigger recidive")
+	}
+	if d := e.RecordBlock(ip, "ddos", "flood"); d.Ban {
+		t.Fatal("2 subsystems should not trigger recidive")
+	}
+	// Third DISTINCT subsystem crosses the consensus threshold.
+	d := e.RecordBlock(ip, "bruteforce", "login")
+	if !d.Ban || !d.Recidive {
+		t.Fatalf("3 distinct subsystems should trigger a recidive ban, got %+v", d)
+	}
+	if d.Duration != 7*24*time.Hour {
+		t.Errorf("recidive base duration got %s want 7d", d.Duration)
+	}
+}
+
+func TestRecidive_SameSubsystemDoesNotConsensus(t *testing.T) {
+	e := testEngine(t, Config{
+		Enabled: true, Threshold: 100, BaseDuration: time.Minute,
+		Recidive: true, RecidiveThreshold: 3, RecidiveBan: time.Hour,
+	})
+	ip := "203.0.113.56"
+	// The SAME subsystem ten times sets a single bit — never reaches consensus.
+	for i := 0; i < 10; i++ {
+		if d := e.RecordBlock(ip, "engine", "x"); d.Ban {
+			t.Fatalf("one subsystem alone must never manufacture recidive consensus (block %d)", i)
+		}
+	}
+}
+
 func TestAutoBan_DisabledWhenNotEnabled(t *testing.T) {
 	e := testEngine(t, Config{Enabled: false, Threshold: 1})
 	if d := e.RecordBlock("203.0.113.9", "engine", "x"); d.Ban {
