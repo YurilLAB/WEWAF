@@ -772,6 +772,137 @@ func TestOriginShieldHeaderHandling(t *testing.T) {
 	}
 }
 
+// TestWebSocketUpgradeDoesNotBypassInspection proves that a forged / incomplete
+// WebSocket upgrade (just Upgrade+Connection headers, no Sec-WebSocket-Key/
+// Version, and carrying a request body) cannot tunnel an un-inspected body to
+// the backend. A genuine handshake is a bodyless GET with all mandatory
+// headers; anything else must fall through to the full rule engine.
+func TestWebSocketUpgradeDoesNotBypassInspection(t *testing.T) {
+	frontend, _, _, _, stop := newTestProxy(t)
+	defer stop()
+
+	form := url.Values{}
+	form.Set("q", "' UNION SELECT username,password FROM users-- -")
+	attack := form.Encode()
+
+	do := func(withUpgrade bool) int {
+		req, err := http.NewRequest(http.MethodPost, frontend.URL+"/search", strings.NewReader(attack))
+		if err != nil {
+			t.Fatalf("build: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if withUpgrade {
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Connection", "upgrade")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Sanity: the attack body is blocked without the upgrade headers.
+	if got := do(false); got != http.StatusForbidden {
+		t.Fatalf("sanity: SQLi body must be blocked (got %d)", got)
+	}
+	// The same attack with forged websocket markers must STILL be blocked —
+	// the passthrough is only for genuine bodyless GET handshakes.
+	if got := do(true); got != http.StatusForbidden {
+		t.Fatalf("WAF BYPASS: attack body with forged websocket upgrade headers was not inspected (got %d)", got)
+	}
+}
+
+// TestOversizeHeaderTailIsInspected proves a payload parked past the old 8 KB
+// per-header inspection cap (but under the 64 KB total-header gate, so it is
+// forwarded to the backend) is now inspected and blocked — closing the
+// "inspect-less-than-you-forward" header bypass.
+func TestOversizeHeaderTailIsInspected(t *testing.T) {
+	frontend, _, _, _, stop := newTestProxy(t)
+	defer stop()
+
+	req, err := http.NewRequest(http.MethodGet, frontend.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	// 16 KB of benign filler, then an XSS payload (matches XSS-001 on the
+	// "headers" target). Past the old 8 KB cap, under the 64 KB total gate.
+	req.Header.Set("Referer", strings.Repeat("A", 16*1024)+"<script>alert(1)</script>")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("payload past the old 8 KB header cap must be inspected and blocked, got %d", resp.StatusCode)
+	}
+}
+
+// TestForwardedHeadersSanitized proves a client-forged X-Forwarded-For /
+// X-Real-Ip / Forwarded never reaches the backend: WEWAF overwrites them with
+// the single client IP it authoritatively resolved, so an origin that trusts
+// the leftmost XFF can't be tricked into attributing the request to an
+// attacker-chosen address.
+func TestForwardedHeadersSanitized(t *testing.T) {
+	var mu sync.Mutex
+	var gotXFF, gotReal, gotFwd string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotXFF, gotReal, gotFwd = r.Header.Get("X-Forwarded-For"), r.Header.Get("X-Real-Ip"), r.Header.Get("Forwarded")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	cfg := config.Default()
+	cfg.BackendURL = backend.URL
+	cfg.Mode = "active"
+	cfg.TrustXFF = false // directly exposed: resolved client IP == TCP peer
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	rs, err := rules.NewRuleSet(rules.DefaultRules())
+	if err != nil {
+		t.Fatalf("rules: %v", err)
+	}
+	eng, err := engine.NewEngine(cfg, rs, &testLogger{t})
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	wp, err := proxy.NewWAFProxy(cfg, eng, telemetry.NewMetrics(), bruteforce.NewDetector(time.Minute))
+	if err != nil {
+		t.Fatalf("proxy: %v", err)
+	}
+	fe := httptest.NewServer(wp)
+	defer fe.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, fe.URL+"/", nil)
+	req.Header.Set("X-Forwarded-For", "203.0.113.50")
+	req.Header.Set("X-Real-Ip", "203.0.113.50")
+	req.Header.Set("Forwarded", "for=203.0.113.50")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Contains(gotXFF, "203.0.113.50") {
+		t.Fatalf("forged X-Forwarded-For leaked to backend: %q", gotXFF)
+	}
+	if !strings.HasPrefix(gotXFF, "127.0.0.1") {
+		t.Fatalf("backend XFF must lead with the resolved client IP, got %q", gotXFF)
+	}
+	if gotReal != "127.0.0.1" {
+		t.Fatalf("X-Real-Ip must be the resolved client IP, got %q", gotReal)
+	}
+	if gotFwd != "" {
+		t.Fatalf("Forwarded header must be stripped, got %q", gotFwd)
+	}
+}
+
 func TestExponentialBackoffBans(t *testing.T) {
 	bl := core.NewBanList()
 	bl.ConfigureBackoff(true, 2, time.Minute, time.Hour)

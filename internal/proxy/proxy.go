@@ -533,9 +533,42 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 		wp.originHeader = "X-WEWAF-Origin-Verify"
 	}
 	if cfg.OriginShieldEnabled && cfg.OriginShieldSecret != "" {
-		shield := newOriginShield(cfg.OriginShieldHeader, cfg.OriginShieldSecret, cfg.OriginShieldSecretPrevious)
-		wp.originShield = shield
-		wp.proxy.Director = shield.wrapDirector(wp.proxy.Director)
+		wp.originShield = newOriginShield(cfg.OriginShieldHeader, cfg.OriginShieldSecret, cfg.OriginShieldSecretPrevious)
+	}
+
+	// Compose the reverse-proxy director once: sanitise client-spoofable
+	// forwarding headers and (optionally) inject the origin proof-of-passage
+	// header. This runs on EVERY forward (main path + WebSocket passthrough).
+	base := wp.proxy.Director
+	wp.proxy.Director = func(r *http.Request) {
+		// Resolve the authoritative client IP from the PRISTINE inbound request
+		// (before the stdlib director appends our peer to X-Forwarded-For).
+		// Prefer the transaction's already-resolved value for consistency with
+		// what the ban list / rule engine saw.
+		clientIP := ""
+		if tx, ok := r.Context().Value(txKey).(*core.Transaction); ok && tx != nil {
+			clientIP = tx.ClientIP
+		} else if wp.ipExtractor != nil {
+			clientIP = wp.ipExtractor.ClientIP(r)
+		}
+		if base != nil {
+			base(r)
+		}
+		// Overwrite the spoofable forwarding headers with the single value
+		// WEWAF resolved. WEWAF is the trust boundary, so a client-forged
+		// X-Forwarded-For / X-Real-Ip / Forwarded must never reach the origin —
+		// otherwise a backend that trusts the leftmost XFF (the common default:
+		// Express trust-proxy, nginx realip, Rails, Spring) attributes the
+		// request to an attacker-chosen IP, defeating origin admin allowlists,
+		// per-IP rate limits, and audit attribution.
+		if clientIP != "" {
+			r.Header.Set("X-Forwarded-For", clientIP)
+			r.Header.Set("X-Real-Ip", clientIP)
+		}
+		r.Header.Del("Forwarded")
+		if wp.originShield != nil {
+			r.Header.Set(wp.originShield.header, wp.originShield.secret)
+		}
 	}
 
 	return wp, nil
@@ -1277,9 +1310,13 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	// Go's transport already inflated the body, so we leave it alone.
 	scanBody := inspectBody
 	compressed := false
-	if wp.cfg.DecompressInspect && !res.Uncompressed {
+	// Read decompression settings from the atomic snapshot, not the live cfg —
+	// the request path already does this (conf()), and reading wp.cfg directly
+	// here races the admin-config writer mutating these fields under lock.
+	rcfg := wp.conf()
+	if rcfg.DecompressInspect && !res.Uncompressed {
 		if decoded, reason := maybeDecompressBody(res.Header, inspectBody,
-			wp.cfg.DecompressRatioCap, wp.cfg.MaxDecompressBytes); reason == "" && len(decoded) > 0 {
+			rcfg.DecompressRatioCap, rcfg.MaxDecompressBytes); reason == "" && len(decoded) > 0 {
 			scanBody = decoded
 			compressed = true
 		}
@@ -1562,12 +1599,26 @@ func (rr *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, fmt.Errorf("responseRecorder: Hijacker not supported by underlying writer")
 }
 
+// isWebSocket reports whether r is a GENUINE WebSocket opening handshake that
+// must be passed through as a raw tunnel (a stream can't be buffered and
+// rule-inspected as an HTTP body). The check is deliberately strict: a real
+// RFC 6455 handshake is a bodyless GET carrying Upgrade, a Connection upgrade
+// token, Sec-WebSocket-Version, AND Sec-WebSocket-Key. The previous loose check
+// (just Upgrade + Connection) let an attacker bolt those two headers onto any
+// request — even a POST with a SQLi/XSS body — and tunnel the body to the
+// backend with ZERO rule-engine inspection. Anything that fails this strict
+// predicate falls through to full inspection instead of the passthrough.
 func isWebSocket(r *http.Request) bool {
-	if r == nil {
+	if r == nil || r.Method != http.MethodGet {
 		return false
 	}
-	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+	// A genuine handshake has no request body. ContentLength != 0 means a
+	// declared body (>0) or chunked framing (-1) — never a real handshake, and
+	// exactly the smuggling shape we must not passthrough.
+	if r.ContentLength != 0 {
+		return false
+	}
+	return dpi.WSUpgradeRequest(r) && r.Header.Get("Sec-WebSocket-Key") != ""
 }
 
 func isLoginRequest(r *http.Request) bool {
@@ -1623,6 +1674,25 @@ func NewEgressProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.M
 	}
 	ep.client = &http.Client{
 		Timeout: 30 * time.Second,
+		// Re-validate EVERY redirect hop against the same allowlist + hostname
+		// danger checks the original request passed. net/http otherwise auto-
+		// follows up to 10 redirects and only the dial-time classifyIP runs on
+		// the targets — so an allowlisted upstream returning `302 Location:
+		// http://internal-or-non-allowlisted/` would slip past the host
+		// allowlist and the localhost/.internal string blocks. Bounded to 3 hops.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 3 {
+				return fmt.Errorf("egress: too many redirects")
+			}
+			host := req.URL.Hostname()
+			if al := ep.cfg.EgressAllowlist; len(al) > 0 && !allowlistMatch(host, al) {
+				return fmt.Errorf("egress: redirect to non-allowlisted host %q blocked", host)
+			}
+			if reason := ep.dangerReason(req.Context(), host); reason != "" {
+				return fmt.Errorf("egress: redirect blocked: %s", reason)
+			}
+			return nil
+		},
 		Transport: &http.Transport{
 			// Pin every outbound dial to an address the SSRF classifier has
 			// just approved. The previous stock dialer re-resolved the
@@ -2175,9 +2245,71 @@ func resolvedDangerReason(host string) string {
 	return ""
 }
 
+// nat64Prefix is RFC 6052 64:ff9b::/96. A NAT64 gateway translates the embedded
+// low-32-bit IPv4 and dials THAT, so 64:ff9b::a9fe:a9fe actually reaches
+// 169.254.169.254 — the SSRF guard must classify the embedded IPv4, not the
+// IPv6 wrapper.
+var nat64Prefix = mustParseCIDR("64:ff9b::/96")
+
+// egressBlockedRanges are the CIDRs an outbound request must never dial,
+// covering the internal/reserved ranges Go's IsPrivate/IsLoopback/IsLinkLocal
+// do NOT catch: CGNAT (RFC 6598), IETF protocol assignments, benchmarking,
+// TEST-NETs, the reserved 240/4 space, the broadcast address, and the IPv6
+// transition/tunnel prefixes (6to4, Teredo) an attacker can use to wrap an
+// internal IPv4. classifyIP also keeps the stdlib checks as a fast path.
+var egressBlockedRanges = mustParseCIDRs([]string{
+	"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15",
+	"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
+	"255.255.255.255/32",
+	"2001::/32", // Teredo
+	"2002::/16", // 6to4
+	"100::/64",  // discard-only
+})
+
+func mustParseCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic("proxy: bad egress CIDR " + s + ": " + err.Error())
+	}
+	return n
+}
+
+func mustParseCIDRs(in []string) []*net.IPNet {
+	out := make([]*net.IPNet, 0, len(in))
+	for _, s := range in {
+		out = append(out, mustParseCIDR(s))
+	}
+	return out
+}
+
+// nat64Embedded returns the IPv4 a NAT64 (RFC 6052 /96) address embeds, or nil.
+func nat64Embedded(ip net.IP) net.IP {
+	v16 := ip.To16()
+	if v16 == nil || !nat64Prefix.Contains(ip) {
+		return nil
+	}
+	return net.IPv4(v16[12], v16[13], v16[14], v16[15])
+}
+
+// classifyIP returns a non-empty block reason for any destination an outbound
+// request must not reach. It is the load-bearing SSRF gate, used by both the
+// request-time dangerReason check and the dial-time re-check, so a gap here is
+// a DNS-rebinding-proof SSRF. Allow-by-default for genuinely public addresses.
 func classifyIP(ip net.IP) string {
 	if ip == nil {
 		return ""
+	}
+	// Normalise an IPv4-mapped IPv6 (::ffff:a.b.c.d) to its v4 form so the same
+	// checks apply and ip.String() yields the dotted-quad metadata key.
+	if v4 := ip.To4(); v4 != nil {
+		ip = v4
+	}
+	// Unwrap a NAT64-embedded IPv4 and classify THAT — the gateway dials it.
+	if embedded := nat64Embedded(ip); embedded != nil {
+		if reason := classifyIP(embedded); reason != "" {
+			return "NAT64-embedded " + reason
+		}
+		return "NAT64-embedded public address blocked"
 	}
 	if _, ok := metadataIPs[ip.String()]; ok {
 		return "cloud metadata endpoint blocked"
@@ -2196,6 +2328,11 @@ func classifyIP(ip net.IP) string {
 	}
 	if ip.IsMulticast() {
 		return "multicast IP destination blocked"
+	}
+	for _, n := range egressBlockedRanges {
+		if n.Contains(ip) {
+			return "reserved/internal IP destination blocked"
+		}
 	}
 	return ""
 }
