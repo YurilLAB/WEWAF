@@ -45,6 +45,68 @@ func NewRuleSet(raw []core.Rule) (*RuleSet, error) {
 	return rs, nil
 }
 
+// cmdInjectionPattern matches a shell metacharacter (";", "|", backtick,
+// newline, or the "&&" / "||" operators) followed by a common Unix command.
+// Single "&" is intentionally excluded — it is the URL/form parameter
+// separator and would false-positive on "&id=5"-style input. The command
+// ends on a word boundary so prose like "to id the file" (a space, not a
+// metacharacter, before the word) does not match. Used by RCE-014 (body
+// phase) and RCE-015 (header phase) to cover both body and query-arg
+// command injection.
+var cmdInjectionPattern = "(?i)(?:[;|`\\n]|&&|\\|\\|)\\s*" +
+	"(?:id|whoami|uname|hostname|ifconfig|ipconfig|netstat|pwd|printenv|crontab|" +
+	"dmesg|lsof|mount|umount|iptables|systemctl|nslookup|traceroute|tracert|ping|" +
+	"ls|dir|cat|head|tail|grep|egrep|fgrep|find|locate|chmod|chown|rm|mkdir|rmdir|" +
+	"touch|ps|kill|killall|pkill|base64|xxd|od|strings|md5sum|sha1sum|sha256sum|" +
+	// The command must end at a non-word boundary, but NOT a comma: this keeps
+	// real injection (";base64 -d", ";base64|sh", ";id", ";cat /etc/passwd")
+	// while excluding the base64 DATA URI "data:<mime>;base64,..." whose
+	// ";base64," would otherwise false-positive on legitimate inline images.
+	"arp|route|ifup|ifdown|service|nmap|dig)(?:[^\\w,]|$)"
+
+// symbolicLogicalSQLiPattern detects the sqlmap "symboliclogical" tamper: an
+// OR/AND tautology where the keyword is replaced with the symbolic operator
+// "||" / "&&" and the operands are quoted strings, e.g. 1'||'1'='1 or
+// 1'&&'1'='1. SQLI-003 only matches the "or"/"and" keyword form or a bare
+// digit=digit, so these slipped through. The discriminator that keeps it off
+// legitimate JS/shell "||"/"&&" (true||false, x=1||y=2, a && b) is a QUOTED
+// operand immediately after the operator followed by "=" — the string-equality
+// tautology shape that only SQL injection produces. Used by SQLI-025 (body
+// phase) and SQLI-026 (header phase / query args).
+var symbolicLogicalSQLiPattern = `(?i)(?:\|\||&&)\s*['"]\s*\w+\s*['"]\s*=`
+
+// likeTautologyPattern detects the LIKE / RLIKE / REGEXP form of an OR/AND
+// tautology — "OR 1 LIKE 1", "OR 'a' LIKE 'a'", "AND 1 RLIKE 1",
+// "OR 'x' REGEXP 'x'". SQLI-005 only covered the "=" and ">" comparison forms,
+// so the pattern-match operators (a documented bypass when "=" is filtered)
+// slipped through. The operands are constrained to a bare number or a SHORT
+// quoted string so ordinary prose ("search shirts or pants like jeans" — the
+// operands there are unquoted words) cannot trip it. Used by SQLI-027 (body)
+// and SQLI-028 (header phase / query args).
+var likeTautologyPattern = `(?i)\b(?:or|and)\s+(?:\d+|'[^']{1,8}'|"[^"]{1,8}")\s+(?:like|rlike|regexp)\s+(?:\d+|'[^']{1,8}'|"[^"]{1,8}")`
+
+// queryNoSQLBracketPattern detects the bracket-notation MongoDB operator that
+// PHP and Express/qs parse out of a query string or form into a nested object:
+// "?username[$ne]=1" becomes {username:{$ne:1}} — the classic NoSQL auth
+// bypass. The JSON-body form is caught by NOSQL-001/003 (body phase), but the
+// query-string form lives in the request-target / param KEY, which only the
+// header-phase "uri" target sees. The "[$" + operator + "]" shape never
+// appears in a legitimate parameter name, so it is false-positive-free.
+var queryNoSQLBracketPattern = `(?i)\[\$(?:ne|gt|gte|lt|lte|in|nin|eq|regex|where|exists|nor|not|or|and|all|elemmatch|size|type|mod|text|search|expr)\]`
+
+// querySSTIPattern mirrors the body-phase SSTI signatures (SSTI-001/003) for
+// the query string. It requires a DANGEROUS token inside the template
+// delimiters — the 7*7 probe, a known Jinja/Twig global (config/self/request/
+// lipsum/…), or a Python sandbox-escape dunder (__class__/__mro__/…) — never a
+// bare "{{ }}", so legitimate client-side template fragments are not flagged.
+var querySSTIPattern = `(?i)\{\{\s*(?:7\*7|config|self|_self|lipsum|joiner|namespace|cycler|request)\b|\{\{[^}]*__(?:class|mro|subclasses|globals|builtins|bases|init)__`
+
+// procedureAnalysePattern detects MySQL's PROCEDURE ANALYSE() — used by sqlmap
+// for column-count discovery and information disclosure. The trailing "(" is
+// required so it matches the technique's call form but never the prose
+// "stored procedure analysis". Used by SQLI-029 (body) and SQLI-030 (args).
+var procedureAnalysePattern = `(?i)\bprocedure\s+analyse\s*\(`
+
 // DefaultRules returns the built-in high-value signatures.
 func DefaultRules() []core.Rule {
 	return []core.Rule{
@@ -64,7 +126,11 @@ func DefaultRules() []core.Rule {
 		// === SQL Injection — immediate / high score ===
 		{ID: "SQLI-001", Name: "SQLi Union Select", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "UNION SELECT pattern", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)union(\s+|/\*[\s\S]{0,100}\*/)+(all(\s+|/\*[\s\S]{0,100}\*/)+)?select`},
 		{ID: "SQLI-002", Name: "SQLi Stacked Destructive", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Stacked destructive query", Targets: []string{"args", "body"}, Pattern: `(?i);\s*(drop|delete|truncate|insert|update)\s`},
-		{ID: "SQLI-003", Name: "SQLi Tautology + Comment", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Tautology with comment sequence", Targets: []string{"args", "body"}, Pattern: `(?i)(['"]?\s*\b(?:or|and)\b\s*['"]?[^'"\s=]+['"]?\s*=\s*['"]?[^'"\s=]+|\d+\s*=\s*\d+)`},
+		// Operands exclude "<" / ">" so natural-language "and >= for" / "use <=
+		// and ..." is not read as the tautology "and X=Y": a real SQL tautology
+		// operand (1, 'x', col) never starts with an angle bracket, and the
+		// inequality forms are covered by SQLI-005.
+		{ID: "SQLI-003", Name: "SQLi Tautology + Comment", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Tautology with comment sequence", Targets: []string{"args", "body"}, Pattern: `(?i)(['"]?\s*\b(?:or|and)\b\s*['"]?[^'"\s=<>]+['"]?\s*=\s*['"]?[^'"\s=<>]+|\d+\s*=\s*\d+)`},
 		{ID: "SQLI-004", Name: "SQLi Time-based Function", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Time-based SQLi function", Targets: []string{"args", "body"}, Pattern: `(?i)(sleep\s*\(|benchmark\s*\(|pg_sleep\s*\(|waitfor\s+delay)`},
 		{ID: "SQLI-005", Name: "SQLi Blind Boolean", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Blind boolean tautology", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(\band\b\s*\(?\s*1\s*=\s*1|\bor\b\s*\(?\s*1\s*=\s*1|\band\b\s*\(?\s*2\s*>\s*1|\bor\b\s*\(?\s*2\s*>\s*1)`},
 		{ID: "SQLI-006", Name: "SQLi Error Based", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Error-based SQLi information extraction", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(convert\s*\(\s*int\s*,\s*@@version|@@datadir|@@version|@@hostname|db_name\s*\()`},
@@ -87,6 +153,17 @@ func DefaultRules() []core.Rule {
 		{ID: "XXE-001", Name: "XXE DOCTYPE", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "XML DOCTYPE declaration", Targets: []string{"body"}, Pattern: `(?i)<!DOCTYPE\s`},
 		{ID: "XXE-002", Name: "XXE ENTITY", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "XML ENTITY declaration", Targets: []string{"body"}, Pattern: `(?i)<!ENTITY\s`},
 		{ID: "XXE-003", Name: "XXE External Entity", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "External entity SYSTEM/PUBLIC reference", Targets: []string{"body"}, Pattern: `(?i)\b(SYSTEM|PUBLIC)\s+["']`},
+		// XInclude is the DOCTYPE-less XXE alternative: when an attacker controls
+		// only a sub-element of the XML (e.g. a SOAP body) they cannot declare a
+		// DOCTYPE/ENTITY, so XXE-001/002 never fire — but an <xi:include
+		// href="..."/> still pulls in a local file or fires an SSRF. The
+		// scheme/path-qualified forms get caught coincidentally by the SSRF /
+		// traversal rules, but a bare relative href ("config.xml") slips through.
+		// The XInclude namespace URI and the <xi:include element never appear in
+		// benign request data (and do NOT collide with legitimate XSLT
+		// <xsl:include>, which lives in a different namespace), so matching them
+		// is false-positive-free.
+		{ID: "XXE-004", Name: "XXE XInclude", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "XInclude local-file / SSRF (DOCTYPE-less XXE)", Targets: []string{"body"}, Pattern: `(?i)<xi:include\b|www\.w3\.org/2001/xinclude`},
 
 		// === LDAP Injection ===
 		// LDAP filter syntax requires parenthesised expressions with
@@ -96,7 +173,12 @@ func DefaultRules() []core.Rule {
 		{ID: "LDAP-001", Name: "LDAP Filter Injection", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "LDAP filter syntax in user input", Targets: []string{"args", "body"}, Pattern: `\(\s*[|&!]\s*\(|\(\s*(?:cn|uid|sn|objectClass|userPassword|mail|member|sAMAccountName)\s*=\s*[*]`},
 
 		// === CRLF Injection ===
-		{ID: "CRLF-001", Name: "CRLF Injection", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "CRLF line injection sequence", Targets: []string{"args", "headers", "uri", "uri_raw"}, Pattern: `(?i)(%0[dD]%0[aA]|%0[aA]%0[dD]|\r\n)`},
+		// uri_raw deliberately NOT targeted: the raw request target keeps the
+		// literal %0d%0a of a legitimate multi-line query value (e.g. a comment
+		// field), which this blunt pattern would false-positive on. Real CRLF
+		// response-splitting in the raw target — encoded CR/LF followed by a
+		// header name + colon — is caught precisely by engine.crlfInjectionRe.
+		{ID: "CRLF-001", Name: "CRLF Injection", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "CRLF line injection sequence", Targets: []string{"args", "headers", "uri"}, Pattern: `(?i)(%0[dD]%0[aA]|%0[aA]%0[dD]|\r\n)`},
 
 		// === Prototype Pollution ===
 		{ID: "PROTO-001", Name: "Prototype Pollution", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Prototype pollution payload", Targets: []string{"args", "body"}, Pattern: `(?i)(__proto__|constructor\.prototype|constructor\[prototype\])`},
@@ -117,19 +199,60 @@ func DefaultRules() []core.Rule {
 
 		// === SSRF / Protocol Attacks ===
 		{ID: "SSRF-001", Name: "SSRF Cloud Metadata", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Cloud metadata endpoint", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)169\.254\.169\.254`},
-		// Targets args + body only — NOT headers. A private IP in the Host
-		// header is normal (it is the WAF's own bind address on internal /
-		// dev deployments), so scanning headers here flagged every request
-		// to an IP-addressed node. The SSRF signal that matters is a private
-		// IP in a user-supplied parameter or body (e.g. ?url=http://10.0.0.1/).
+		// Bare private IP is matched only in request PARAMETERS and the body,
+		// NOT in headers: X-Forwarded-For / X-Real-IP and friends legitimately
+		// carry internal IPs (the proxy chain adds them), and version tokens
+		// such as "Chrome/120.0.0.0" contain a literal "0.0.0.0" — so a bare-IP
+		// match on header values is a false positive. Header SSRF that actually
+		// matters (the metadata endpoint) is still covered by SSRF-001/006, and
+		// scheme-qualified encoded-IP SSRF by SSRF-007, both of which keep the
+		// "headers" target and never collide with legitimate header content.
 		{ID: "SSRF-002", Name: "SSRF Private IP", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Private IP in URL parameter", Targets: []string{"args", "body"}, Pattern: `(?i)(127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})`},
 		{ID: "SSRF-003", Name: "SSRF Dangerous Protocol", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dangerous protocol in request", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(dict|gopher|ftp|tftp|ldap)://`},
 		{ID: "SSRF-004", Name: "SSRF File Protocol", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "File protocol in request", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)file://`},
 		{ID: "SSRF-005", Name: "SSRF IP Bypass", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "SSRF IP address bypass", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)http://(0[./]|0177\.|0x7f)`},
+		// Decimal / integer-encoded IP host, e.g. http://2130706433/ ==
+		// 127.0.0.1. A documented SSRF filter bypass: SSRF-005 caught the
+		// hex/octal forms but not the dotless decimal integer. A bare 8-10
+		// digit host has no legitimate use, so blocking is FP-safe. SSRF-007
+		// runs in the body phase (form/JSON bodies); SSRF-008 in the header
+		// phase so ?url=http://2130706433/ in a GET query is also caught.
+		{ID: "SSRF-007", Name: "SSRF Decimal IP (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dotless decimal/integer-encoded IP host in URL", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)https?://(?:0x[0-9a-f]{6,8}|0[0-7]{8,11}|\d{8,10})(?:[:/?#]|$)`},
+		{ID: "SSRF-008", Name: "SSRF Decimal IP (args/uri)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Dotless decimal/integer-encoded IP host in query args", Targets: []string{"args", "uri"}, Pattern: `(?i)https?://(?:0x[0-9a-f]{6,8}|0[0-7]{8,11}|\d{8,10})(?:[:/?#]|$)`},
+		// Header-phase SSRF coverage for the QUERY STRING. SSRF-001..006 and
+		// CLOUD-001/002 list "args" as a target but run in the body phase, so
+		// they only see form-parsed POST args — a GET ?url=http://127.0.0.1/
+		// or ?url=http://169.254.170.2/ slipped straight through (verified by
+		// a header-phase probe). These mirror the body-phase patterns at the
+		// header phase. They target "args" only (the parsed query params), NOT
+		// "uri", so an app's own path (e.g. /devices/192.168.1.1/status or a
+		// legitimate /metadata/instance route) does not false-positive — only
+		// a private/loopback IP, dangerous protocol, or metadata endpoint that
+		// appears inside a request PARAMETER is blocked.
+		{ID: "SSRF-010", Name: "SSRF Private/Loopback IP (args)", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Private/loopback/link-local IP in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(127\.0\.0\.1|0\.0\.0\.0|::1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|169\.254\.\d{1,3}\.\d{1,3})`},
+		{ID: "SSRF-011", Name: "SSRF Dangerous Protocol (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Dangerous URL scheme in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(dict|gopher|ftp|tftp|ldap|file)://`},
+		{ID: "SSRF-012", Name: "SSRF Metadata Endpoint (args)", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Cloud metadata endpoint or path in a query parameter", Targets: []string{"args"}, Pattern: `(?i)(169\.254\.169\.254|169\.254\.170\.2|100\.100\.100\.200|192\.0\.0\.192|metadata\.google\.internal|metadata\.azure\.com|/latest/(?:meta-data|user-data|dynamic)|/computeMetadata/|/metadata/(?:instance|identity)|api-version=[^&]*metadata)`},
+		// Path-embedded SSRF: open-redirect / proxy / image-fetch endpoints that
+		// take the target URL as a PATH segment ("/proxy/http://169.254.169.254/")
+		// rather than a query parameter. SSRF-010..012 are args-only, so these
+		// slipped through. Targets the "uri" view (which preserves "://" — the
+		// "path" view collapses it during ../ resolution). FP-safe because it
+		// requires either a dangerous scheme (gopher/dict/file/…) OR an http(s)
+		// URL whose host is internal/loopback/metadata — a legitimate path that
+		// merely contains an external URL or a bare IP (e.g. /devices/10.0.0.1)
+		// does not match.
+		{ID: "SSRF-013", Name: "SSRF URL in path", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "SSRF target URL embedded in the request path (internal host or dangerous scheme)", Targets: []string{"uri"}, Pattern: `(?i)(?:gopher|dict|tftp|ldap|file)://|(?:https?)://(?:[^/?#@]*@)?(?:127\.0\.0\.1|0\.0\.0\.0|localhost|\[?::1\]?|169\.254\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|metadata\.google\.internal|169\.254\.169\.254)`},
+		// Session fixation / session-ID-in-URL marker (OWASP ASVS 3.x: session
+		// tokens must never travel in the URL). Flags framework session tokens
+		// in the query, path matrix (";jsessionid="), or args. Log-level, not a
+		// block — apps that (badly) use URL-rewriting sessions emit these and
+		// legitimate clients echo them back; the value is in the visibility, and
+		// blocking would break those apps.
+		{ID: "SESSIONID-001", Name: "Session ID in URL", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Session token in URL/path (session fixation / session exposure)", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:[?&;]|^)(?:jsessionid|phpsessid|aspsessionid[a-z0-9]*|asp\.net_sessionid|cfid|cftoken|sessionid|session_id|sessid)=`},
 
 		// === HTTP Smuggling ===
 		{ID: "SMUG-001", Name: "HTTP Smuggling TE.CL", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Transfer-Encoding + Content-Length conflict", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic, not regex
-		{ID: "SMUG-002", Name: "HTTP Smuggling Double CL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Duplicate Content-Length headers", Targets: []string{"headers"}, Pattern: `(?i)\A\z`}, // handled by special logic
+		{ID: "SMUG-002", Name: "HTTP Smuggling Double CL", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Duplicate Content-Length headers", Targets: []string{"headers"}, Pattern: `(?i)\A\z`},        // handled by special logic
 
 		// === Scanner / Bot UA ===
 		{ID: "SCAN-001", Name: "Known Scanner UA", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Known malicious scanner User-Agent", Targets: []string{"headers"}, Pattern: `(?i)(sqlmap|nikto|nmap|gobuster|dirbuster|wfuzz|burpsuite|burp|masscan|zgrab|commix)`},
@@ -140,7 +263,12 @@ func DefaultRules() []core.Rule {
 		{ID: "RCE-001", Name: "RCE Command Substitution", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Command substitution $() or backticks", Targets: []string{"args", "body", "headers"}, Pattern: "(?i)(\\$\\([\\s\\S]{0,300}\\)|`[\\s\\S]{0,300}`)"},
 		{ID: "RCE-002", Name: "RCE Reverse Shell", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Reverse shell indicator", Targets: []string{"args", "body"}, Pattern: `(?i)(bash\s+-i|nc\s+-[ev]|python\s+-c\s*['"]import socket)`},
 		{ID: "RCE-003", Name: "RCE Dangerous Chain", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Shell meta-char followed by binary", Targets: []string{"args", "body"}, Pattern: `(?i)[;&|]\s*(curl|wget|python|perl|ruby|bash|sh|cmd|powershell|php|node|nodejs|lua|luajit|awk|gawk|nawk|expect|telnet|ssh|scp|ftp|tftp|nc|netcat|socat)\s+`},
-		{ID: "RCE-004", Name: "RCE IFS Evasion", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionLog, Description: "IFS evasion pattern", Targets: []string{"args", "body"}, Pattern: `(?i)\$\{IFS\}`},
+		// $IFS whitespace-evasion. Bash splits on $IFS, so attackers write
+		// "cat$IFS/etc/passwd" or "cat$IFS$9/etc/passwd" to avoid literal
+		// spaces. The old pattern only matched the braced "${IFS}" form, so
+		// the bare "$IFS" / "$IFS$9" variants slipped past. \b after IFS keeps
+		// a variable literally named "$IFSomething" from matching.
+		{ID: "RCE-004", Name: "RCE IFS Evasion", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionLog, Description: "IFS whitespace-evasion pattern", Targets: []string{"args", "body"}, Pattern: `(?i)\$\{?IFS\b`},
 		{ID: "RCE-005", Name: "RCE Scripting One-Liners", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Scripting language one-liner execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(base64\s+-d|python\s+-c|perl\s+-e|ruby\s+-e|php\s+-r)`},
 		{ID: "RCE-006", Name: "RCE Dangerous Functions", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dangerous PHP/function execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(eval\s*\(|assert\s*\(|exec\s*\(|system\s*\(|passthru\s*\(|popen\s*\(|proc_open\s*\(|shell_exec\s*\()`},
 
@@ -190,7 +318,7 @@ func DefaultRules() []core.Rule {
 		{ID: "CACHE-001", Name: "Cache Poisoning Headers", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Suspicious cache poisoning headers", Targets: []string{"headers"}, Pattern: `(?i)(X-Original-Url|X-Rewrite-Url|X-Forwarded-Host|X-Forwarded-Scheme|X-HTTP-Method-Override|Transfer-Encoding)\s*:\s*[^:\r\n]{2,}`},
 
 		// === HTTP Method Override ===
-		{ID: "METHOD-001", Name: "HTTP Method Override", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "HTTP method override header", Targets: []string{"headers"}, Pattern: `(?i)(X-HTTP-Method|X-HTTP-Method-Override|X-Method-Override|_method)\s*:\s*(?:GET|POST|PUT|DELETE|PATCH|TRACE|CONNECT|OPTIONS)`},
+		{ID: "METHOD-001", Name: "HTTP Method Override", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "HTTP method-override header (can bypass method-based access control)", Targets: []string{"headers.x-http-method", "headers.x-http-method-override", "headers.x-method-override"}, Pattern: `(?i)^\s*(?:GET|POST|PUT|DELETE|PATCH|TRACE|TRACK|CONNECT|OPTIONS|HEAD|PROPFIND)\s*$`},
 
 		// === Spring4Shell ===
 		{ID: "SPRING-001", Name: "Spring4Shell", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Spring4Shell classloader manipulation", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)class\.module\.classLoader\.`},
@@ -203,11 +331,14 @@ func DefaultRules() []core.Rule {
 		{ID: "RCE-008", Name: "RCE Perl Open", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Perl open command execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)perl\s+-e\s*['"][^'"]*\bopen\s*[\s\(]`},
 
 		// === XSS Template Injection / Polyglots ===
-		// headers target dropped — `${…}` appears routinely in benign cookies
-		// and template-ish header values, so scanning headers here hard-blocked
-		// ordinary traffic. The Log4Shell-specific `${jndi:` is caught by the
-		// separate JNDI-001 rule (which DOES keep headers). Still scans args + body.
-		{ID: "XSS-012", Name: "XSS Template Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Template expression or polyglot payload", Targets: []string{"args", "body"}, Pattern: `(?i)\$\{[^}]{0,200}\}`},
+		// Require a CODE indicator inside "${...}" — digit arithmetic (the 7*7
+		// SSTI probe), a call, a scope operator, a string/backtick literal, or a
+		// dangerous keyword — not a bare "${identifier}". The old catch-all
+		// "\$\{[^}]{0,200}\}" blocked every "${price}" / "${user.name}" / JS
+		// template literal, a heavy false positive (now that query args reach
+		// the body phase, "?q=cost is ${price}" hit it too). The dangerous EL
+		// forms remain covered here and by EL-001 / SSTI-002 / SSTI-006.
+		{ID: "XSS-012", Name: "XSS Template Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Template expression or polyglot payload", Targets: []string{"args", "body", "headers"}, Pattern: "(?i)\\$\\{[^}]*(?:\\d\\s*[-+*/%]\\s*\\d|\\(|::|`|['\"]|java\\b|runtime|exec|process|class\\b|system\\b|getRuntime|new\\s)[^}]*\\}"},
 
 		// === JSON Injection ===
 		{ID: "JSON-001", Name: "JSON Injection", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Suspicious JSON privilege escalation", Targets: []string{"args", "body"}, Pattern: `(?i)\{\s*["']?(?:admin|role|isAdmin|permissions|access)\s*["']?\s*:\s*(?:true|1|null)\s*\}`},
@@ -304,7 +435,7 @@ func DefaultRules() []core.Rule {
 		{ID: "PROTO-002", Name: "HTTP2 Pseudo Header Abuse", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "HTTP/2 pseudo-header in HTTP/1.1 request", Targets: []string{"headers"}, Pattern: `(?i)[\r\n]:(authority|method|path|scheme)\s*:`},
 		{ID: "SMUG-003", Name: "HTTP Smuggling Chunked Abuse", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Chunked encoding body containing embedded HTTP request", Targets: []string{"body"}, Pattern: `(?i)\r\n0\r\n[\s\S]{0,1000}(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+/`},
 		{ID: "HOST-002", Name: "Host Header Injection", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Multiple or injected Host headers", Targets: []string{"headers"}, Pattern: `(?i)Host\s*:[^:\r\n]*[\r\n][\s\S]{0,200}Host\s*:`},
-		{ID: "HOST-003", Name: "X-Forwarded-Host Poisoning", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "X-Forwarded-Host pointing to loopback or metadata", Targets: []string{"headers"}, Pattern: `(?i)X-Forwarded-Host\s*:\s*[^:\r\n]*(?:127\.0\.0\.1|0\.0\.0\.0|localhost|::1|\.local|\.internal|169\.254\.\d+\.\d+)`},
+		{ID: "HOST-003", Name: "X-Forwarded-Host Poisoning", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Forwarding/host header pointing at an internal, loopback, or metadata host (web-cache / password-reset poisoning, SSRF)", Targets: []string{"headers.x-forwarded-host", "headers.x-host", "headers.x-forwarded-server", "headers.forwarded"}, Pattern: `(?i)(?:\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|::1|\b169\.254\.\d{1,3}\.\d{1,3}\b|\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b|\blocalhost\b|\.(?:local|internal)\b|\bmetadata\.google\.internal\b)`},
 
 		// === Cloud Metadata Attacks ===
 		{ID: "CLOUD-001", Name: "AWS Metadata Access", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "AWS metadata endpoint or token in request", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:/latest/meta-data|/latest/user-data|/latest/dynamic/instance-identity|X-aws-ec2-metadata-token)`},
@@ -326,8 +457,25 @@ func DefaultRules() []core.Rule {
 		{ID: "LDAP-002", Name: "LDAP Search Injection", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "LDAP injection in search filter parameters", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\*\)|\(\||\(&|\)\()[\s\S]{0,200}(?:objectclass|objectCategory|uid|cn|dc|ou|\*)(?:\s*=\s*\*|\))`},
 		{ID: "SSTI-003", Name: "SSTI Jinja2 Flask Django", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Jinja2, Flask or Django template injection pattern", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\{\{\s*request\s*\|(?:\s*attr)?|\{\{\s*config\s*\.\s*items\s*\(|\{\{\s*self\s*\.__class__\s*\}\}|\{%\s*(?:for|if)\s+.*?request|\{\{\s*.*?\.__class__\s*\.__bases__\s*\}\})`},
 		{ID: "EL-001", Name: "Expression Language Injection", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "EL injection with dangerous class or runtime access", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\$\{[^}]*(?:java|runtime|exec|process|environment|classloader)[^}]*\}|\#\{[^}]*(?:java|runtime|exec|process|environment)[^}]*\})`},
+		// Header-phase (query-string) variants of the template / EL injection
+		// rules above. SSTI-001/003 and EL-001 run in the body phase, so a
+		// GET ?name={{7*7}} or ?x=${T(java.lang.Runtime)...} slipped through.
+		// Same dangerous-token tightness, so no new false positives.
+		{ID: "SSTI-005", Name: "SSTI template injection (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Server-side template injection in query args", Targets: []string{"args", "uri"}, Pattern: querySSTIPattern},
+		{ID: "SSTI-006", Name: "EL injection (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Expression-language injection with dangerous class/runtime access in query args", Targets: []string{"args", "uri"}, Pattern: `(?i)(?:\$\{[^}]*(?:java|runtime|exec|process|environment|classloader)[^}]*\}|\#\{[^}]*(?:java|runtime|exec|process|environment)[^}]*\})`},
+		// Bracket-notation NoSQL operator in the query string / form param key.
+		{ID: "NOSQL-005", Name: "NoSQL bracket operator (args)", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "MongoDB operator via bracket-notation param (username[$ne]=...)", Targets: []string{"uri", "args"}, Pattern: queryNoSQLBracketPattern},
 		{ID: "XPATH-002", Name: "XPath Injection Variant", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "XPath injection with axis or boolean bypass", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:\/(?:child|parent|descendant|ancestor|attribute|self)::|count\s*\(\s*\/\/|(?:'|")\s*(?:or|and)\s+(?:'|")?\d+(?:'|")?\s*=\s*(?:'|")?\d+|\/\/\*\[|\]\s*\|\s*\/\/|\*\[local-name\s*\()`},
 		{ID: "XSS-013", Name: "CSS Style Attribute Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "CSS injection or style attribute XSS payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(?:style\s*=\s*["']?[^"'>]{0,200}(?:javascript\s*:|@import\s+|(?:-moz-binding|behavior)\s*:|data\s*:\s*text\/css|url\s*\(\s*["']?\s*javascript\s*:))`},
+		// CSS script-execution constructs anywhere (e.g. inside a <style> TAG,
+		// not just a style= attribute, which XSS-013 covers). These are
+		// script-executing CSS features that legitimate stylesheets never use,
+		// so blocking them is FP-safe — UNLIKE @import / url() of an external
+		// resource, which is deliberately NOT matched here because Google Fonts
+		// and CDNs use exactly that ("@import url('//fonts.googleapis.com')").
+		// Covers -moz-binding (XBL), IE behavior:url() (HTC), javascript:/
+		// vbscript: in url(), and @import of a javascript:/data:text/html sink.
+		{ID: "XSS-014", Name: "CSS script-execution construct", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Script-executing CSS construct (-moz-binding / behavior:url / url(javascript:) / @import javascript:)", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)-moz-binding\s*:|behavior\s*:\s*url\s*\(|(?:url|src)\s*\(\s*['"]?\s*(?:javascript|vbscript)\s*:|@import\s+(?:url\s*\(\s*)?['"]?\s*(?:javascript:|data\s*:\s*text/html)`},
 		// === Information Disclosure ===
 		{ID: "INFO-001", Name: "Stack Trace Disclosure", Phase: core.PhaseResponseBody, Score: 50, Action: core.ActionLog, Description: "Stack trace or exception details leaked in response", Targets: []string{"body"}, Pattern: `(?i)(stack\s*trace|traceback\s*\(most\s*recent\s*call\s*last\)|exception\s*in\s*thread|error\s*at\s*line\s*\d+|caused\s*by\s*:\s*\S{3,})`},
 		{ID: "INFO-002", Name: "Git Directory Exposure", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Git repository directory exposed in URL", Targets: []string{"uri"}, Pattern: `(?i)/\.git(/|$|\s|\?|&)`},
@@ -376,7 +524,18 @@ func DefaultRules() []core.Rule {
 		{ID: "DESER-NODE-001", Name: "Node Deserialization RCE", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "node-serialize _$$ND_FUNC$$_ gadget", Targets: []string{"body", "args"}, Pattern: `_\$\$ND_FUNC\$\$_function`},
 		{ID: "DESER-PYTHON-001", Name: "Python Pickle / base64", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Python cPickle / __reduce__ byte markers", Targets: []string{"body"}, Pattern: `(?:\\x80\\x04\\x95|cposix\nsystem|c__builtin__\nglobals)`},
 		{ID: "DESER-RUBY-001", Name: "Ruby Marshal Gadget", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Ruby Marshal.load / DeprecatedInstance gadget", Targets: []string{"body"}, Pattern: `(?i)Gem::DependencyList|Rails::Info|DeprecatedInstanceVariableProxy`},
-		{ID: "DESER-YAML-001", Name: "YAML Ruby tag injection", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "!!ruby/object or !!python/object tag", Targets: []string{"body"}, Pattern: `(?i)!!(?:ruby|python)/(?:object|struct|module)(?::[^\s]+)?\s`},
+		// The previous pattern required ":tag" or whitespace right after
+		// "object", so the actual PyYAML RCE forms "!!python/object/apply:os.
+		// system" and "!!python/object/new:" (the /apply and /new suffixes)
+		// slipped through. The "!!ruby/" and "!!python/" deserialization tags
+		// are never legitimate request input, so matching the prefix (with any
+		// /apply, /new, :tag continuation) is both broader and FP-safe.
+		{ID: "DESER-YAML-001", Name: "YAML deserialization tag", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "!!ruby/* or !!python/* deserialization tag (incl. /apply, /new)", Targets: []string{"args", "body"}, Pattern: `(?i)!!(?:ruby|python)/(?:object|struct|module|hash|exec|sym|name|new|apply)\b`},
+		// Json.NET (and other .NET JSON) TypeNameHandling gadget: a "$type"
+		// directive naming a known deserialization gadget chain. "$type" alone
+		// is used legitimately by apps with TypeNameHandling enabled, so we
+		// require a dangerous gadget type to stay FP-safe.
+		{ID: "DESER-NET-002", Name: "Json.NET $type gadget", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: ".NET TypeNameHandling deserialization gadget in $type", Targets: []string{"args", "body"}, Pattern: `(?i)"\$type"\s*:\s*"[^"]*\b(?:ObjectDataProvider|WindowsIdentity|WindowsPrincipal|ClaimsIdentity|FileSystemWatcher|ProcessStartInfo|XamlReader|LosFormatter|ObjectStateFormatter|ActivitySurrogateSelector|TextFormattingRunProperties|AxHostState|ResourceDictionary|SortedSet|TypeConfuseDelegate|PSObject)\b`},
 
 		// --- Server-Side Includes / Edge-Side Includes ---
 		{ID: "SSI-002", Name: "SSI exec cmd", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "<!--#exec cmd= SSI injection", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)<!--#\s*(?:exec|include|printenv|config)\s`},
@@ -402,11 +561,39 @@ func DefaultRules() []core.Rule {
 		// the per-segment count below 1000 — that would push CPU into
 		// false-positive territory on legitimate large session cookies.
 		{ID: "HDR-003", Name: "Oversized Cookie Header", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Cookie header >4KB used in scanner probes", Targets: []string{"headers.Cookie"}, Pattern: `.{1000}.{1000}.{1000}.{1000}`},
+		// URL-override access-control bypass. IIS (URL Rewrite) and Symfony
+		// honour X-Original-URL / X-Rewrite-URL as the effective request path,
+		// so a request to an allowed path (e.g. "/") with one of these headers
+		// set to "/admin" is routed to /admin AFTER the edge made its decision.
+		// A client should never send these — they are internal-proxy headers —
+		// so their mere presence is a strong bypass signal. Matched against the
+		// specific header value (presence) rather than a Name:value blob.
+		{ID: "HDR-004", Name: "URL Override Header", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Client-supplied X-Original-URL / X-Rewrite-URL path override (front-end access-control bypass)", Targets: []string{"headers.x-original-url", "headers.x-rewrite-url", "headers.x-original-uri", "headers.x-override-url", "headers.x-forwarded-prefix"}, Pattern: `\S`},
+		// Source-IP spoofing. A forged client-IP forwarding header carrying a
+		// private/loopback range from an external client is used to defeat IP
+		// allowlists, rate limits, and audit trails. The trusted-proxy policy in
+		// clientip decides which of these to honour; this rule records the
+		// attempt. Log-level — a legitimate edge sets these to the real client.
+		{ID: "HDR-005", Name: "Spoofed Client-IP Header", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "Private/loopback IP in True-Client-IP / X-Real-IP / X-Client-IP header (source-IP spoofing)", Targets: []string{"headers.true-client-ip", "headers.x-real-ip", "headers.x-client-ip", "headers.x-cluster-client-ip"}, Pattern: `(?i)(?:\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|::1|\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}\b|\b169\.254\.\d{1,3}\.\d{1,3}\b|\blocalhost\b)`},
 
 		// --- Path traversal / file inclusion variants ---
 		{ID: "LFI-010", Name: "Unicode traversal", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Unicode / alt-encoded ../ sequences", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:%c0%ae|%c1%9c|%uff0e|%u002e|\.\\\.\\|\.\./\\)`},
-		{ID: "LFI-011", Name: "PHP wrapper", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PHP stream wrappers (data, expect, phar, zip)", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)\b(?:data|expect|phar|zip|compress\.zlib|compress\.bzip2|glob|ogg|ssh2|rar):/{0,2}[^\s]`},
+		// Require "://" (two slashes): every real stream-wrapper use is
+		// "scheme://...". The old ":/{0,2}" also matched the single-colon
+		// "data:" form, false-positiving on legitimate "data:image/png;base64,"
+		// URIs (now that query args reach the body phase, a ?img=data:... query
+		// hit it too). XSS data: URIs are still covered by XSS-008.
+		{ID: "LFI-011", Name: "PHP wrapper", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PHP stream wrappers (data, expect, phar, zip)", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)\b(?:data|expect|phar|zip|compress\.zlib|compress\.bzip2|glob|ogg|ssh2|rar)://[^\s]`},
 		{ID: "LFI-012", Name: "Windows sensitive file", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "Windows system path in request", Targets: []string{"uri", "args"}, Pattern: `(?i)\b(?:c:\\windows\\system32\\|boot\.ini|win\.ini|\\sam|\\security|\\ntds\.dit)\b`},
+		// PHP / stream wrappers in the QUERY STRING. LFI-011, TRAV-003 and
+		// CRS-933140 all cover the wrappers but run in the body phase, so they
+		// only see form-parsed POST args — a GET ?file=php://filter/... or
+		// ?file=expect://id slipped straight through (only file:// was caught,
+		// incidentally, by the header-phase SSRF-011). Mirror the body coverage
+		// in the header phase for uri/path/args. The "://" (two slashes) is
+		// required so this never collides with a legitimate "data:" image URI
+		// (single colon) — every dangerous wrapper form uses scheme://.
+		{ID: "LFI-013", Name: "PHP wrapper (args/uri)", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "PHP/stream wrapper in query string (php://, expect://, phar://, zip://, data://)", Targets: []string{"uri", "path", "args"}, Pattern: `(?i)(?:php|expect|phar|zip|glob|ssh2|ogg|rar|data|zlib|compress\.(?:zlib|bzip2))://`},
 
 		// --- SQLi extensions ---
 		{ID: "SQLI-020", Name: "PostgreSQL pg_sleep", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Time-based pg_sleep injection", Targets: []string{"args", "body", "uri"}, Pattern: `(?i)pg_sleep\s*\(`},
@@ -414,12 +601,68 @@ func DefaultRules() []core.Rule {
 		{ID: "SQLI-022", Name: "Hex-encoded SQLi payload", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "0x68657870... hex-encoded strings", Targets: []string{"args", "body"}, Pattern: `(?i)0x[0-9a-f]{20,}`},
 		{ID: "SQLI-023", Name: "Stacked queries", Phase: core.PhaseRequestHeaders, Score: 90, Action: core.ActionBlock, Description: "Semicolon-separated query followed by keyword", Targets: []string{"args", "body"}, Pattern: `(?i);\s*(?:select|insert|update|delete|drop|create|alter|exec|xp_cmdshell)\b`},
 		{ID: "SQLI-024", Name: "Comment-based evasion", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "MySQL /*!...*/ or -- evasion", Targets: []string{"args", "body"}, Pattern: `(?i)/\*!\d{5}.*\*/|\bunion\b\s*(?:/\*.*?\*/\s*)?select`},
+		// Symbolic-logical tautology (sqlmap symboliclogical tamper): OR/AND
+		// replaced by ||/&& with quoted operands, e.g. 1'||'1'='1.
+		{ID: "SQLI-025", Name: "Symbolic logical tautology (body)", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "SQL ||/&& string tautology (OR/AND keyword evasion)", Targets: []string{"args", "body"}, Pattern: symbolicLogicalSQLiPattern},
+		{ID: "SQLI-026", Name: "Symbolic logical tautology (args)", Phase: core.PhaseRequestHeaders, Score: 70, Action: core.ActionBlock, Description: "SQL ||/&& string tautology in query args", Targets: []string{"args"}, Pattern: symbolicLogicalSQLiPattern},
+		// LIKE / RLIKE / REGEXP tautology (sqlmap "=" → "LIKE" filter bypass).
+		{ID: "SQLI-027", Name: "LIKE tautology (body)", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Blind boolean tautology using LIKE/RLIKE/REGEXP", Targets: []string{"args", "body", "headers"}, Pattern: likeTautologyPattern},
+		{ID: "SQLI-028", Name: "LIKE tautology (args)", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Blind boolean LIKE/RLIKE/REGEXP tautology in query args", Targets: []string{"args", "uri"}, Pattern: likeTautologyPattern},
+		// MySQL PROCEDURE ANALYSE() column-count / info disclosure.
+		{ID: "SQLI-029", Name: "PROCEDURE ANALYSE (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "MySQL PROCEDURE ANALYSE() information disclosure", Targets: []string{"args", "body", "headers"}, Pattern: procedureAnalysePattern},
+		{ID: "SQLI-030", Name: "PROCEDURE ANALYSE (args)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "MySQL PROCEDURE ANALYSE() in query args", Targets: []string{"args", "uri"}, Pattern: procedureAnalysePattern},
 
 		// --- RCE / command injection extensions ---
 		{ID: "RCE-010", Name: "Powershell encoded command", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "PowerShell -EncodedCommand / IEX DownloadString", Targets: []string{"args", "body"}, Pattern: `(?i)(?:-EncodedCommand|iex\s*\(\s*new-object\s+net\.webclient|DownloadString\s*\()`},
 		{ID: "RCE-011", Name: "bash curl|sh", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Classic curl ... | (sh|bash) install pattern", Targets: []string{"args", "body"}, Pattern: `(?i)(?:curl|wget|fetch)\s+[^|&]{3,}\s*\|\s*(?:sh|bash|zsh|python|perl|ruby|php)\b`},
-		{ID: "RCE-012", Name: "Shellshock", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Bash Shellshock (CVE-2014-6271) function definition", Targets: []string{"headers"}, Pattern: `\(\s*\)\s*\{\s*[:_].*?\}\s*;`},
+		// Shellshock works because a CGI/cgi-bin backend exports each request
+		// header into a bash environment variable, and vulnerable bash executes
+		// a value shaped like a function definition. The *technique* marker is
+		// the empty-parameter function prelude "() {" — independent of the body
+		// (":;", "_;", "ignored;", the CVE-2014-7169 ">_[...]" form, etc.) — so
+		// matching the full "() { :; };" payload (as the old RCE-012/CRS-932150
+		// did) missed every variant. We anchor "()" to a non-word boundary so a
+		// legitimate "function() {" in a header value does not false-positive.
+		{ID: "RCE-012", Name: "Shellshock", Phase: core.PhaseRequestHeaders, Score: 100, Action: core.ActionBlock, Description: "Bash Shellshock env-var function definition in a header (CVE-2014-6271/6278/7169)", Targets: []string{"headers"}, Pattern: `(?:^|[^\w$])\(\s*\)\s*\{`},
 		{ID: "RCE-013", Name: "Python one-liner revshell", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Python socket-based reverse shell one-liner", Targets: []string{"args", "body"}, Pattern: `(?i)python.{0,20}-c.{0,50}(?:socket|subprocess).{0,100}(?:connect|dup2)`},
+		// Unix command injection: a shell metacharacter immediately followed
+		// by a common command. RCE-003 only covers a small binary list and
+		// requires a trailing space, so recon one-liners like ";id", "| id",
+		// "&& whoami", "; ls -la /" slipped through (confirmed by the engine
+		// fuzz corpus). Aligned with OWASP CRS 932160. The trigger set is
+		// deliberately {; | backtick newline && ||} and NOT a bare "&" —
+		// single "&" is the URL/form parameter separator, so allowing it
+		// would false-positive on "&id=5"-style query strings. The command
+		// ends on a word boundary so prose ("to id the file", "chmod the
+		// chicken") with a space — not a metacharacter — before the word does
+		// not match. Two phases mirror the SQLi rules: RCE-014 inspects the
+		// buffered body, RCE-015 inspects query args / the URI.
+		{ID: "RCE-014", Name: "Unix command injection (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Shell metacharacter followed by a common Unix command", Targets: []string{"args", "body"}, Pattern: cmdInjectionPattern},
+		{ID: "RCE-015", Name: "Unix command injection (args/uri)", Phase: core.PhaseRequestHeaders, Score: 80, Action: core.ActionBlock, Description: "Shell metacharacter followed by a common Unix command in query args", Targets: []string{"args", "uri"}, Pattern: cmdInjectionPattern},
+		// Sensitive-file access in the BODY. TRAV-004 covers args/uri (header
+		// phase) but a quote/backslash/wildcard-obfuscated command
+		// ("c'a't /etc/passwd", "/bin/c?t /etc/passwd", "{cat,/etc/passwd}")
+		// hides the COMMAND, not its target — so matching the target file path
+		// catches the whole obfuscation class robustly, in the body where
+		// command-injection params usually live. FP-safe: these absolute paths
+		// to credential/secret files have no place in a legitimate request body.
+		{ID: "LFI-020", Name: "Sensitive file access (body)", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Absolute path to a credential/secret system file in the body", Targets: []string{"args", "body"}, Pattern: `(?i)/etc/(?:passwd|shadow|gshadow|sudoers|mysql/my\.cnf|ssh/sshd_config)\b|/proc/self/(?:environ|cmdline|maps|status)\b|/root/\.(?:ssh|bash_history|aws)\b|/\.aws/credentials\b|/\.ssh/(?:id_(?:rsa|dsa|ecdsa|ed25519)|authorized_keys)\b`},
+		// Bash brace expansion: "{cat,/etc/passwd}" expands to "cat /etc/passwd"
+		// with no spaces, a documented WAF bypass. Anchored to a known command
+		// then a comma then a non-space arg, which a legitimate JS object
+		// literal ("{cat, dog}", space after comma) or JSON ("{"k":...}") does
+		// not produce.
+		{ID: "RCE-016", Name: "Shell brace expansion", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Bash brace-expansion command obfuscation", Targets: []string{"args", "body"}, Pattern: `(?i)\{(?:cat|curl|wget|nc|ncat|netcat|bash|sh|zsh|python|perl|ruby|php|id|whoami|uname|ls|rm|cp|mv|chmod|chown|ping|nslookup|dig|head|tail|base64)\b,[^\s},]`},
+		// Windows command execution: cmd /c and PowerShell encoded-command
+		// (-e / -enc / -encodedcommand abbreviations). RCE-010 only matched the
+		// full "-EncodedCommand"; real payloads use the abbreviated flags.
+		{ID: "RCE-017", Name: "Windows command execution", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Windows cmd.exe / PowerShell encoded-command execution", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\bcmd(?:\.exe)?\s+/c\s|\bpowershell(?:\.exe)?\b[^\n]{0,80}?\s-e(?:nc(?:odedcommand)?)?\s+[A-Za-z0-9+/]{8,}`},
+		// Ruby / JSP "#{...}" string interpolation probe. The dangerous
+		// variants (with java/runtime/exec) are blocked by EL-001; this
+		// log-only rule flags the bare interpolation canary ("#{7*7}") that
+		// EL-001 misses. Kept ActionLog + a word/operator inside the braces so
+		// it doesn't fire on every "#{" that appears in posted SCSS/Ruby code.
+		{ID: "SSTI-RUBY-001", Name: "Ruby/JSP interpolation probe", Phase: core.PhaseRequestBody, Score: 40, Action: core.ActionLog, Description: "#{...} template interpolation with an expression", Targets: []string{"args", "body"}, Pattern: `#\{[^}]*[-+*/0-9][^}]*\}`},
 
 		// --- Request shape anomalies ---
 		// ANOM-001 (GET with body) was removed in 2026-04 — as a pure regex

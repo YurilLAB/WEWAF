@@ -45,25 +45,9 @@ func canonSeeds() []string {
 	return seeds
 }
 
-func FuzzCanonicalize(f *testing.F) {
-	for _, s := range canonSeeds() {
-		f.Add(s)
-	}
-	f.Fuzz(func(t *testing.T, s string) {
-		out := Canonicalize(s)
-		// stripControlChars is the last stage and iterates runes, so the
-		// result is always well-formed UTF-8 regardless of how mangled the
-		// input was. A regression that emits invalid UTF-8 would break
-		// downstream rule matching in subtle ways.
-		if !utf8.ValidString(out) {
-			t.Fatalf("Canonicalize produced invalid UTF-8 for %q -> %q", s, out)
-		}
-		// NOTE: strict idempotence is intentionally NOT asserted. The decoder
-		// is bounded to 3 passes as a DoS guard, so a payload encoded more than
-		// 3 times is deliberately left partially decoded and a second pass would
-		// keep going. That's an accepted trade-off, not a bug.
-	})
-}
+// FuzzCanonicalize lives in fuzz_targets_test.go (merged from the parallel
+// fuzz-harness line). The targets below cover the canonicalizer helpers that
+// file does not.
 
 func FuzzCanonicalizePath(f *testing.F) {
 	for _, s := range canonSeeds() {

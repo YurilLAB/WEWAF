@@ -54,8 +54,10 @@ const (
 )
 
 // Session captures the state we track for a single logical client.
-// Fields written by multiple goroutines are behind Tracker.mu; the
-// atomic counters are hot-path friendly (every request touches RequestCount).
+// All fields are guarded by Tracker.mu — they are written under the write
+// lock (touchSession/RecordBlock/RecordBeacon/…) and must only be read while
+// holding the lock (see Tracker.View / Tracker.List). Snapshot() copies the
+// maps, so it too must run under the lock.
 type Session struct {
 	ID              string
 	FirstSeen       time.Time
@@ -612,14 +614,23 @@ func (t *Tracker) RecordBeacon(id string, mouseDelta, keyDelta, timeOnPageDeltaM
 
 // Lookup returns the session with the given ID, or nil if none. Used by
 // the admin API to render per-session detail.
-func (t *Tracker) Lookup(id string) *Session {
+// View returns a locked snapshot of one session by ID. The read lock is held
+// across Snapshot() so the map iteration inside it (Paths/UserAgents/IPs)
+// cannot race a concurrent touchSession() write — that race is a FATAL
+// "concurrent map iteration and map write", not a recoverable error, so it
+// would crash the whole process. Callers must use this rather than reading
+// fields off a bare *Session pointer.
+func (t *Tracker) View(id string) (SessionView, bool) {
 	if t == nil || id == "" {
-		return nil
+		return SessionView{}, false
 	}
 	t.mu.RLock()
-	s := t.sessions[id]
-	t.mu.RUnlock()
-	return s
+	defer t.mu.RUnlock()
+	s, ok := t.sessions[id]
+	if !ok {
+		return SessionView{}, false
+	}
+	return s.Snapshot(), true
 }
 
 // List returns a snapshot of every active session, most-recent first.

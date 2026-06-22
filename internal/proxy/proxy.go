@@ -40,6 +40,13 @@ import (
 // WAFProxy wraps a reverse proxy with WAF inspection.
 type WAFProxy struct {
 	cfg       *config.Config
+	// cfgSnap holds an immutable snapshot of cfg, published atomically by
+	// RefreshConfig after every config mutation (admin /api/config edit or
+	// hot-reload). Hot-path reads go through conf() so they never race the
+	// writers, which mutate the live cfg fields under cfg's lock. The live
+	// cfg pointer is retained only to build new snapshots and for the
+	// internally-synchronised mode accessor.
+	cfgSnap atomic.Pointer[config.Config]
 	eng       *engine.Engine
 	metrics   *telemetry.Metrics
 	bf        *bruteforce.Detector
@@ -260,7 +267,7 @@ func (wp *WAFProxy) inspectJA3(r *http.Request) (fp ja3.Fingerprint, verdict ja3
 // on a public API means we're testing the exact branches the real hot
 // path takes, not a parallel implementation.
 func (wp *WAFProxy) applyHeadersForTest(res *http.Response) {
-	if wp.cfg.SecurityHeadersEnabled {
+	if wp.conf().SecurityHeadersEnabled {
 		res.Header.Set("X-Content-Type-Options", "nosniff")
 		res.Header.Set("X-Frame-Options", "DENY")
 		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -287,16 +294,16 @@ func (wp *WAFProxy) applyHeadersForTest(res *http.Response) {
 			res.Header.Set("Cross-Origin-Opener-Policy", "same-origin")
 		}
 	}
-	if wp.cfg.HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
-		maxAge := wp.cfg.HSTSMaxAgeSec
+	if wp.conf().HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
+		maxAge := wp.conf().HSTSMaxAgeSec
 		if maxAge <= 0 {
 			maxAge = 15552000
 		}
 		v := fmt.Sprintf("max-age=%d", maxAge)
-		if wp.cfg.HSTSIncludeSubdoms {
+		if wp.conf().HSTSIncludeSubdoms {
 			v += "; includeSubDomains"
 		}
-		if wp.cfg.HSTSPreload {
+		if wp.conf().HSTSPreload {
 			v += "; preload"
 		}
 		res.Header.Set("Strict-Transport-Security", v)
@@ -502,6 +509,9 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	// nothing when JA3 is disabled.
 	wp.ja3Anomaly = ja3.NewAnomalyDetector()
 
+	// Publish the initial config snapshot for hot-path reads (conf()).
+	wp.RefreshConfig()
+
 	wp.proxy = httputil.NewSingleHostReverseProxy(backend)
 	// A reverse proxy left on DefaultTransport has no per-connection timeouts
 	// and no pool caps — a slow backend can park proxy goroutines for the full
@@ -529,6 +539,30 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	}
 
 	return wp, nil
+}
+
+// conf returns the current immutable config snapshot for hot-path reads. The
+// snapshot is published by RefreshConfig under cfg's lock, so reading its
+// fields never races the admin handler / hot-reload watcher mutating the live
+// cfg. Falls back to the live cfg when no snapshot has been published yet
+// (e.g. a WAFProxy constructed directly in a unit test) — safe there because
+// such tests don't mutate config concurrently.
+func (wp *WAFProxy) conf() *config.Config {
+	if c := wp.cfgSnap.Load(); c != nil {
+		return c
+	}
+	return wp.cfg
+}
+
+// RefreshConfig republishes the config snapshot from the live cfg. Callers must
+// invoke it after every config mutation (admin /api/config edit, hot-reload)
+// so hot-path readers observe the change. cfg.Snapshot() takes the read lock,
+// producing a consistent copy even if a writer is mid-update.
+func (wp *WAFProxy) RefreshConfig() {
+	if wp == nil || wp.cfg == nil {
+		return
+	}
+	wp.cfgSnap.Store(wp.cfg.Snapshot())
 }
 
 // newBackendTransport returns an http.Transport with explicit timeouts and
@@ -593,7 +627,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if w != nil {
 				// Failsafe: block on panic unless operator opted into
 				// fail-open. 503 + Retry-After lets clients back off.
-				if wp.cfg.FailsafeMode == "open" {
+				if wp.conf().FailsafeMode == "open" {
 					w.Header().Set("X-WAF-Failsafe", "open-pass")
 					wp.proxy.ServeHTTP(w, r)
 					return
@@ -664,12 +698,12 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// rejecting a bad handshake is cheaper than admitting it. When the
 	// feature is off we skip the detection entirely so a plain HTTP
 	// request costs nothing here.
-	if wp.cfg.WebSocketInspect && dpi.WSUpgradeRequest(r) {
+	if wp.conf().WebSocketInspect && dpi.WSUpgradeRequest(r) {
 		wp.wsUpgrades.Add(1)
 		verdict := dpi.CheckWSUpgrade(r, dpi.WSUpgradeConfig{
-			OriginAllowlist:      wp.cfg.WebSocketOriginAllowlist,
-			SubprotocolAllowlist: wp.cfg.WebSocketSubprotoAllowlist,
-			RequireSubprotocol:   wp.cfg.WebSocketRequireSubproto,
+			OriginAllowlist:      wp.conf().WebSocketOriginAllowlist,
+			SubprotocolAllowlist: wp.conf().WebSocketSubprotoAllowlist,
+			RequireSubprotocol:   wp.conf().WebSocketRequireSubproto,
 		})
 		if !verdict.Allow {
 			wp.wsRejected.Add(1)
@@ -748,9 +782,23 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Skipped for the PoW assets themselves, the verify endpoint, and
 	// anything served by the WAF's own admin/challenge surface — those
 	// MUST always pass through.
-	if wp.shouldGateWithPoW(r, scoreFor(wp, sessID), sessID) && !isPoWBypassPath(r.URL.Path) {
-		wp.servePoWChallenge(w, r, scoreFor(wp, sessID))
+	hdrScore := scoreFor(wp, sessID)
+	if wp.shouldGateWithPoW(r, hdrScore, sessID) && !isPoWBypassPath(r.URL.Path) {
+		wp.servePoWChallenge(w, r, hdrScore)
 		return
+	}
+
+	// Graduated throttle band (Island-style step-down from a hard block).
+	// A session whose risk is elevated but below the challenge trigger pays
+	// a bounded latency tax instead of being blocked outright. Opt-in: the
+	// band is off unless SessionThrottleThreshold is set, so existing
+	// deployments are unchanged. Never terminal — the request continues to
+	// full inspection after the delay. A challenge would already have
+	// returned above, and a block-band score is left for the body-phase
+	// SessionBlockThreshold check, so only a true throttle-band score lands
+	// here.
+	if !isPoWBypassPath(r.URL.Path) && wp.riskActionFor(hdrScore) == RiskThrottle {
+		wp.applyThrottle(r.Context(), r, hdrScore)
 	}
 
 	// Pre-WAF admission control: if the shaper is enabled and the global
@@ -911,7 +959,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Enforce body size limit before reading.
-	if r.ContentLength > wp.cfg.MaxBodyBytes && r.ContentLength > 0 {
+	if r.ContentLength > wp.conf().MaxBodyBytes && r.ContentLength > 0 {
 		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
 		wp.eng.ProcessLogging(tx)
 		return
@@ -926,7 +974,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// would pass through inspection with the trailing N bytes
 		// dropped — the engine would happily allow a request whose
 		// real payload is bigger than it ever saw.
-		limit := wp.cfg.MaxBodyBytes
+		limit := wp.conf().MaxBodyBytes
 		limited := io.LimitReader(r.Body, limit+1)
 		var err error
 		body, err = io.ReadAll(limited)
@@ -973,9 +1021,9 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// handing it to the engine so a 10 KB bomb expanding to 1 GB cannot
 		// starve inspection memory. On failure we reject the request rather
 		// than silently forwarding an uninspected compressed payload.
-		if wp.cfg.DecompressInspect {
+		if wp.conf().DecompressInspect {
 			if decoded, reason := maybeDecompressBody(r.Header, body,
-				wp.cfg.DecompressRatioCap, wp.cfg.MaxDecompressBytes); reason != "" {
+				wp.conf().DecompressRatioCap, wp.conf().MaxDecompressBytes); reason != "" {
 				wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "COMPRESS-BOMB", reason, 100)
 				http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
 				wp.eng.ProcessLogging(tx)
@@ -1021,14 +1069,14 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// clean block reason, and string-like fields are surfaced for rule
 	// matching. Runs only when both the feature is on and the content
 	// type identifies the request as gRPC.
-	if wp.cfg.GRPCInspect && dpi.IsGRPCRequest(r) {
+	if wp.conf().GRPCInspect && dpi.IsGRPCRequest(r) {
 		wp.grpcRequests.Add(1)
 		res := dpi.InspectGRPCBody(body, dpi.GRPCLimits{
-			MaxFrames:       wp.cfg.GRPCMaxFrames,
-			MaxFrameBytes:   wp.cfg.GRPCMaxFrameBytes,
-			BlockCompressed: wp.cfg.GRPCBlockCompressed,
+			MaxFrames:       wp.conf().GRPCMaxFrames,
+			MaxFrameBytes:   wp.conf().GRPCMaxFrameBytes,
+			BlockCompressed: wp.conf().GRPCBlockCompressed,
 		})
-		if res.Blocked && wp.cfg.GRPCBlockOnError {
+		if res.Blocked && wp.conf().GRPCBlockOnError {
 			wp.grpcBlocked.Add(1)
 			intr := &core.Interruption{
 				Action:  core.ActionBlock,
@@ -1099,7 +1147,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// changing any rule.
 	if sessID != "" && wp.sessions != nil && wp.sessions.Enabled() {
 		risk := wp.sessions.Score(sessID)
-		if threshold := wp.cfg.SessionBlockThreshold; threshold > 0 && risk >= threshold {
+		if threshold := wp.conf().SessionBlockThreshold; threshold > 0 && risk >= threshold {
 			intr := &core.Interruption{
 				Action:  core.ActionBlock,
 				Status:  http.StatusForbidden,
@@ -1135,7 +1183,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Brute-force enforcement.
 	if wp.bf != nil && isLogin {
 		key := bruteforce.Key(tx.ClientIP, "")
-		if wp.bf.IsBruteForce(key, wp.cfg.BruteForceThreshold) {
+		if wp.bf.IsBruteForce(key, wp.conf().BruteForceThreshold) {
 			mode := wp.cfg.ModeSnapshot()
 			if mode != "detection" && mode != "learning" {
 				wp.metrics.RecordBlock(tx.ClientIP, r.Method, r.URL.Path, "BRUTE-FORCE", "Brute-force threshold exceeded", 100)
@@ -1209,7 +1257,7 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	if res.Body == nil {
 		return nil
 	}
-	maxInspect := wp.cfg.MaxBodyBytes
+	maxInspect := wp.conf().MaxBodyBytes
 	if maxInspect <= 0 {
 		maxInspect = 1 << 20
 	}
@@ -1263,7 +1311,7 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	}
 
 	// Inject security headers and strip identifying ones.
-	if wp.cfg.SecurityHeadersEnabled {
+	if wp.conf().SecurityHeadersEnabled {
 		res.Header.Set("X-Content-Type-Options", "nosniff")
 		res.Header.Set("X-Frame-Options", "DENY")
 		res.Header.Set("Referrer-Policy", "strict-origin-when-cross-origin")
@@ -1293,16 +1341,16 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	// HSTS — only emit on HTTPS backends. Setting Strict-Transport-Security
 	// on http:// is spec-non-compliant and most browsers ignore it anyway,
 	// so we silently skip rather than mis-advertise transport guarantees.
-	if wp.cfg.HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
-		maxAge := wp.cfg.HSTSMaxAgeSec
+	if wp.conf().HSTSEnabled && wp.backend != nil && wp.backend.Scheme == "https" {
+		maxAge := wp.conf().HSTSMaxAgeSec
 		if maxAge <= 0 {
 			maxAge = 15552000
 		}
 		v := fmt.Sprintf("max-age=%d", maxAge)
-		if wp.cfg.HSTSIncludeSubdoms {
+		if wp.conf().HSTSIncludeSubdoms {
 			v += "; includeSubDomains"
 		}
-		if wp.cfg.HSTSPreload {
+		if wp.conf().HSTSPreload {
 			v += "; preload"
 		}
 		res.Header.Set("Strict-Transport-Security", v)
@@ -1899,17 +1947,16 @@ func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Dial through safeDialContext, NOT net.DialTimeout(r.Host): a raw dial
-	// performs a second, independent DNS resolution at connect time, so a
-	// rebinding record (TTL-0 / rotating answers) can pass the dangerReason
-	// validation above with a public IP and then resolve to 127.0.0.1 /
-	// 169.254.169.254 here. safeDialContext resolves through the same cache,
-	// re-runs classifyIP on the chosen address, and dials the LITERAL
-	// validated IP — pinning the connection so the CONNECT tunnel gets the
-	// same DNS-rebinding SSRF protection as the plain-HTTP egress path.
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	// Dial through safeDial so the CONNECT tunnel validates the exact IP it
+	// connects to — net.DialTimeout would re-resolve r.Host and could be
+	// rebound to an internal / metadata IP after the dangerReason pre-check.
+	dialHost := r.Host
+	if _, _, err := net.SplitHostPort(dialHost); err != nil {
+		dialHost = net.JoinHostPort(dialHost, "443")
+	}
+	dialCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	destConn, err := ep.safeDialContext(ctx, "tcp", r.Host)
+	destConn, err := ep.safeDial(dialCtx, "tcp", dialHost)
 	if err != nil {
 		if ep.eng != nil {
 			ep.eng.LogError("egress: CONNECT dial blocked/failed for %s: %v", r.Host, err)
@@ -1966,6 +2013,50 @@ func (ep *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	_ = destConn.Close()
 	_ = clientConn.Close()
 	<-done
+}
+
+// safeDial resolves addr's host, validates the resolved IPs, and dials a
+// validated IP directly — so the address that is security-checked is exactly
+// the one connected to. This closes the DNS-rebinding TOCTOU: the pre-flight
+// dangerReason check resolves the hostname, but the dial previously re-resolved
+// it independently (net.DialTimeout for CONNECT, the default DialContext for
+// HTTP) and could land on 169.254.169.254 / an internal IP that the check never
+// saw. By re-classifying the exact IP at dial time, the guard holds even if the
+// attacker's DNS flips between the two lookups. When EgressBlockPrivateIPs is
+// off the operator has opted out of IP classification, so we resolve+pin
+// without rejecting. TLS ServerName / Host stay the hostname (net/http sets
+// them from the URL), so certificate verification is unaffected.
+func (ep *EgressProxy) safeDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := ep.dnsCache.Lookup(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("egress: resolve %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("egress: no addresses for %q", host)
+	}
+	d := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+	var lastErr error
+	for _, ip := range ips {
+		if ep.cfg != nil && ep.cfg.EgressBlockPrivateIPs {
+			if reason := classifyIP(ip); reason != "" {
+				lastErr = fmt.Errorf("egress: blocked dial to %s (%s): %s", host, ip, reason)
+				continue
+			}
+		}
+		conn, derr := d.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if derr == nil {
+			return conn, nil
+		}
+		lastErr = derr
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("egress: no dialable address for %q", host)
+	}
+	return nil, lastErr
 }
 
 func (ep *EgressProxy) recordEgressBlock(targetURL, reason string) {

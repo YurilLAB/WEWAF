@@ -484,6 +484,8 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			BrowserChallengeEnabled   *bool `json:"browser_challenge_enabled"`
 			BrowserChallengeBlock     *bool `json:"browser_challenge_block"`
 			SessionBlockThreshold     *int  `json:"session_block_threshold"`
+			SessionThrottleThreshold  *int  `json:"session_throttle_threshold"`
+			SessionThrottleDelayMs    *int  `json:"session_throttle_delay_ms"`
 			SessionRequestRateCeiling int       `json:"session_request_rate_ceiling"`
 			SessionPathCountCeiling   int       `json:"session_path_count_ceiling"`
 			ChallengeTTLSec           int       `json:"challenge_ttl_sec"`
@@ -691,6 +693,16 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		if payload.SessionBlockThreshold != nil {
 			if v := *payload.SessionBlockThreshold; v >= 0 && v <= 100 {
 				s.cfg.SessionBlockThreshold = v
+			}
+		}
+		if payload.SessionThrottleThreshold != nil {
+			if v := *payload.SessionThrottleThreshold; v >= 0 && v <= 100 {
+				s.cfg.SessionThrottleThreshold = v
+			}
+		}
+		if payload.SessionThrottleDelayMs != nil {
+			if v := *payload.SessionThrottleDelayMs; v >= 0 && v <= 2000 {
+				s.cfg.SessionThrottleDelayMs = v
 			}
 		}
 		if payload.SessionRequestRateCeiling > 0 {
@@ -948,6 +960,9 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		// leaves the previous policy in place and surfaces in the log
 		// — refusing to apply is safer than silently dropping the gate.
 		if s.proxy != nil {
+			// Republish the proxy's hot-path config snapshot so the edits
+			// above are observed without racing the live cfg fields.
+			s.proxy.RefreshConfig()
 			if ipx := s.proxy.IPExtractor(); ipx != nil {
 				if err := ipx.Update(updateTrustXFF, updateTrustedProxies); err != nil {
 					log.Printf("config: trusted_proxies update rejected: %v", err)

@@ -166,12 +166,12 @@ func TestRotateSessionMovesStateToNewID(t *testing.T) {
 		t.Fatal("rotate should produce a new ID")
 	}
 	// Old ID must be unreachable.
-	if tr.Lookup(old) != nil {
+	if _, ok := tr.View(old); ok {
 		t.Fatal("old ID still resolves after rotate")
 	}
 	// New ID carries the counters.
-	live := tr.Lookup(newID)
-	if live == nil || live.BlockCount != 2 {
+	live, ok := tr.View(newID)
+	if !ok || live.BlockCount != 2 {
 		t.Fatalf("new session missing state: %+v", live)
 	}
 	// A fresh cookie must be on the response.
@@ -200,7 +200,7 @@ func TestIdleTTLSweep(t *testing.T) {
 	}
 	time.Sleep(80 * time.Millisecond)
 	tr.sweep()
-	if tr.Lookup(s.ID) != nil {
+	if _, ok := tr.View(s.ID); ok {
 		t.Fatal("sweep left an idle session alive")
 	}
 }

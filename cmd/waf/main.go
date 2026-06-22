@@ -328,6 +328,31 @@ func main() {
 		}
 	}
 
+	// Risk-tier ordering sanity. The graduated bands should ascend
+	// throttle < challenge(PoW trigger) < block; riskTier is fail-secure so
+	// a mis-order is a usability footgun (a stricter low band shadows a
+	// looser high one), not a security hole — warn rather than refuse.
+	if cfg.SessionThrottleThreshold > 0 {
+		log.Printf("session: throttle band enabled (threshold=%d delay=%dms)",
+			cfg.SessionThrottleThreshold, cfg.SessionThrottleDelayMs)
+		if cfg.PoWEnabled && cfg.SessionThrottleThreshold >= cfg.PoWTriggerScore {
+			log.Printf("WARN: session_throttle_threshold (%d) >= pow_trigger_score (%d) — "+
+				"the throttle band is empty because the challenge fires first",
+				cfg.SessionThrottleThreshold, cfg.PoWTriggerScore)
+		}
+		if cfg.SessionBlockThreshold > 0 && cfg.SessionThrottleThreshold >= cfg.SessionBlockThreshold {
+			log.Printf("WARN: session_throttle_threshold (%d) >= session_block_threshold (%d) — "+
+				"the throttle band is empty because the block fires first",
+				cfg.SessionThrottleThreshold, cfg.SessionBlockThreshold)
+		}
+	}
+	if cfg.SessionBlockThreshold > 0 && cfg.PoWEnabled &&
+		cfg.SessionBlockThreshold <= cfg.PoWTriggerScore {
+		log.Printf("WARN: session_block_threshold (%d) <= pow_trigger_score (%d) — "+
+			"high-risk sessions will be blocked before they are ever challenged",
+			cfg.SessionBlockThreshold, cfg.PoWTriggerScore)
+	}
+
 	// Background telemetry collectors.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
@@ -627,13 +652,20 @@ func main() {
 				return
 			}
 			eng.Reload(compiled)
-			cfg.SetMode(fresh.Mode)
+			cfg.SetMode(fresh.Mode) // mode is atomic, no lock needed
+			// Mutate the shared live fields under cfg's lock — the engine
+			// reads them via cfg.Snapshot() (RLock) and the proxy via its
+			// published snapshot, so an unlocked write here was a data race.
+			cfg.Lock()
 			cfg.BlockThreshold = fresh.BlockThreshold
 			cfg.ParanoiaLevel = fresh.ParanoiaLevel
 			cfg.RateLimitRPS = fresh.RateLimitRPS
 			cfg.RateLimitBurst = fresh.RateLimitBurst
 			cfg.TrustXFF = fresh.TrustXFF
 			cfg.TrustedProxies = append([]string(nil), fresh.TrustedProxies...)
+			cfg.Unlock()
+			// Republish the proxy's hot-path config snapshot.
+			wp.RefreshConfig()
 			// Apply the fresh trust policy atomically. A bad CIDR keeps
 			// the previous policy in place and surfaces in the log.
 			if ipx := wp.IPExtractor(); ipx != nil {

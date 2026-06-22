@@ -131,11 +131,18 @@ func CRSRules() []core.Rule {
 		// ============================================================
 		// REQUEST-933: PHP Injection (PL1-PL3)
 		// ============================================================
-		{ID: "CRS-933100", Name: "CRS PHP Open Tag", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 70, Action: core.ActionBlock, Description: "CRS: PHP open tag in request body", Targets: []string{"args", "body"}, Pattern: `<\?(?:php|=)?`},
+		// The bare "<?" short-tag form must still match (a real PHP injection
+		// vector), but the XML declaration "<?xml ...?>" must NOT — otherwise
+		// every legitimate XML / SOAP / RSS / SVG / SAML request body is blocked
+		// as a "PHP open tag". Upstream OWASP CRS 933100 carves out the XML
+		// prolog the same way: match "<?" unless it is exactly "<?xml" followed
+		// by whitespace, "/", ">", or "?". "<?php", "<?=", and "<? <code>" still hit
+		// via the [^x] branch.
+		{ID: "CRS-933100", Name: "CRS PHP Open Tag", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 70, Action: core.ActionBlock, Description: "CRS: PHP open tag in request body", Targets: []string{"args", "body"}, Pattern: `<\?(?:[^x]|x[^m]|xm[^l]|xml[^\s/>?])`},
 		{ID: "CRS-933110", Name: "CRS PHP Script File Upload", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 80, Action: core.ActionBlock, Description: "CRS: PHP file upload by extension", Targets: []string{"body"}, Pattern: `(?i)filename\s*=\s*"[^"]*\.(?:php[3457s]?|phtml|phar|inc|ph[pt]|pl|py|jsp|asp[xh]?|cgi|sh|exe|bat|cmd)"`},
 		{ID: "CRS-933120", Name: "CRS PHP Config Directive", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 70, Action: core.ActionBlock, Description: "CRS: PHP ini directive injection", Targets: []string{"args", "body"}, Pattern: `(?i)(?:allow_url_(?:include|fopen)|auto_prepend_file|auto_append_file|disable_functions|open_basedir|safe_mode)\s*=`},
 		{ID: "CRS-933130", Name: "CRS PHP Magic Variables", Phase: core.PhaseRequestBody, Paranoia: 2, Category: "crs.php", Score: 60, Action: core.ActionBlock, Description: "CRS: PHP superglobals in user input", Targets: []string{"args", "body"}, Pattern: `(?i)\$(?:GLOBALS|_(?:GET|POST|COOKIE|SESSION|REQUEST|SERVER|ENV|FILES))\b`},
-		{ID: "CRS-933140", Name: "CRS PHP IO Stream Wrapper", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 80, Action: core.ActionBlock, Description: "CRS: PHP stream wrappers (php://, data://, expect://)", Targets: []string{"args", "body"}, Pattern: `(?i)(?:php|data|expect|phar|zip|compress\.(?:zlib|bzip2)|ogg|ssh2|rar|zlib):\/{0,2}`},
+		{ID: "CRS-933140", Name: "CRS PHP IO Stream Wrapper", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 80, Action: core.ActionBlock, Description: "CRS: PHP stream wrappers (php://, data://, expect://)", Targets: []string{"args", "body"}, Pattern: `(?i)(?:php|data|expect|phar|zip|compress\.(?:zlib|bzip2)|ogg|ssh2|rar|zlib):\/\/`},
 		{ID: "CRS-933150", Name: "CRS PHP High-Risk Function", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 80, Action: core.ActionBlock, Description: "CRS: dangerous PHP functions", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:eval|assert|create_function|system|exec|passthru|popen|proc_open|shell_exec|pcntl_exec|call_user_func(?:_array)?|include(?:_once)?|require(?:_once)?|preg_replace[^(]*\/e|base64_decode|gzinflate|str_rot13)\s*\(`},
 		{ID: "CRS-933160", Name: "CRS PHP Low-Value Function", Phase: core.PhaseRequestBody, Paranoia: 2, Category: "crs.php", Score: 40, Action: core.ActionBlock, Description: "CRS: less-critical PHP functions used in attack chains", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:phpinfo|get_(?:defined_functions|current_user|cfg_var)|ini_(?:get|set|restore)|posix_(?:kill|mkfifo|setuid)|apache_(?:child_terminate|setenv)|error_reporting|parse_str|array_map|array_filter|array_walk|array_walk_recursive|array_reduce|dl)\s*\(`},
 		{ID: "CRS-933170", Name: "CRS PHP Object Injection", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.php", Score: 80, Action: core.ActionBlock, Description: "CRS: PHP serialize/unserialize payload", Targets: []string{"args", "body"}, Pattern: `(?i)O:\d+:"\w+":\d+:\{|C:\d+:"\w+":\d+:\{`},
@@ -179,7 +186,14 @@ func CRSRules() []core.Rule {
 		// ============================================================
 		// REQUEST-942: SQLi (PL1-PL3)
 		// ============================================================
-		{ID: "CRS-942100", Name: "CRS SQLi Basic via libinjection", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.sqli", Score: 80, Action: core.ActionBlock, Description: "CRS: classic SQL tautology patterns", Targets: []string{"args", "body"}, Pattern: `(?i)(?:'\s*or\s+['"0-9]|\bor\s+1\s*=\s*1\b|\bor\s+['"][^'"]*['"]\s*=\s*['"][^'"]*['"]|\bunion\s+(?:all\s+)?select\b|--\s|#\s|\/\*|;\s*(?:select|insert|update|delete|drop))`},
+		// The "--" and "#" trailing-comment markers require a single-quote /
+		// closing-paren breakout immediately before them (the "admin'--" /
+		// "1')#" auth-bypass shape). Excluding the double-quote keeps JSON / CSS
+		// values like "#f97316" and "--css-var" clean, and the quote/paren
+		// requirement keeps "C# vs Java", hashtags and prose dashes clean — all
+		// heavy false positives once query args reach this rule. Bare "/*" stays
+		// so the inline-comment keyword-split evasion (";/**/ping") is caught.
+		{ID: "CRS-942100", Name: "CRS SQLi Basic via libinjection", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.sqli", Score: 80, Action: core.ActionBlock, Description: "CRS: classic SQL tautology patterns", Targets: []string{"args", "body"}, Pattern: `(?i)(?:'\s*or\s+['"0-9]|\bor\s+1\s*=\s*1\b|\bor\s+['"][^'"]*['"]\s*=\s*['"][^'"]*['"]|\bunion\s+(?:all\s+)?select\b|[')]\s*--|[')]\s*#|\/\*|;\s*(?:select|insert|update|delete|drop))`},
 		{ID: "CRS-942110", Name: "CRS SQLi Benchmark/Sleep", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.sqli", Score: 80, Action: core.ActionBlock, Description: "CRS: time-based SQLi (benchmark / sleep)", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:benchmark\s*\(|sleep\s*\(\s*\d|pg_sleep\s*\(|waitfor\s+delay\s+["']|dbms_lock\.sleep)`},
 		// Tightened: plain "like" / "mod" / "div" are common English words
 		// that triggered on any prose ("advice is to like"). Require them

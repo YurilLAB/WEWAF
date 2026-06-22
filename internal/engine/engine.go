@@ -2,15 +2,18 @@ package engine
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"wewaf/internal/config"
 	"wewaf/internal/core"
@@ -73,7 +76,57 @@ func (e *Engine) Reload(rs *rules.RuleSet) {
 var (
 	headlessUARe = regexp.MustCompile(`(?i)(headlesschrome|phantomjs|selenium|webdriver|puppeteer|playwright|cypress)`)
 	toolUARe     = regexp.MustCompile(`(?i)(scrapy|curl|wget|python-requests|java|libwww|httpclient|okhttp|axios)`)
+
+	// crlfInjectionRe detects HTTP response-splitting / header-injection in the
+	// RAW (still percent-encoded) request target: an encoded or literal CR/LF
+	// — single, paired, or multiply-encoded (%0d, %0a, %250d, …) — followed by
+	// an HTTP-header-like "token:". Requiring the trailing header token keeps
+	// legitimate multi-line GET parameters (plain "%0a"-separated text) from
+	// matching, while catching "%0d%0aSet-Cookie:", "%0d%0aLocation:", etc.
+	crlfInjectionRe = regexp.MustCompile(`(?i)(?:%(?:25)*0[ad]|[\r\n])(?:%(?:25)*0[ad]|[\r\n])?(?:%(?:25)*20|\+|\s)*[a-z][a-z0-9-]{1,40}\s*(?:%(?:25)*3a|:)`)
+
+	// jwtRe matches a JWT-shaped token. A JWT header is base64url of {"alg"...,
+	// which always begins "eyJ", so the prefix is a reliable, low-FP marker.
+	jwtRe = regexp.MustCompile(`eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]*`)
+	// jwtAlgNoneRe matches an unsigned-token "alg":"none" (any case) in a
+	// DECODED JWT header — the classic signature-bypass.
+	jwtAlgNoneRe = regexp.MustCompile(`(?i)"alg"\s*:\s*"?\s*none\b`)
+	// jwtKidRe extracts the "kid" (key id) header parameter value.
+	jwtKidRe = regexp.MustCompile(`(?i)"kid"\s*:\s*"([^"]*)"`)
+	// jwtDangerousKidRe flags a kid value carrying injection metacharacters or
+	// traversal — the kid is used to look up a key and is a documented SQLi /
+	// LFI / command-injection sink. Legitimate kids are plain identifiers
+	// (alphanumerics, '-', '_', ':') and never contain these.
+	jwtDangerousKidRe = regexp.MustCompile("[\"'<>;|$`\\\\]|\\.\\.|\\x00|(?i)\\b(?:union|select|sleep|or\\s+1=1|etc/passwd)\\b")
+	// jwtJkuRe flags a client-presented jku/x5u (external key-set URL) header —
+	// attacker-supplied key sources (CVE-2018-0114 class). Log-level: some
+	// issuers legitimately use jku, so it is recorded rather than blocked.
+	jwtJkuRe = regexp.MustCompile(`(?i)"(?:jku|x5u)"\s*:`)
+
+	// nullByteRe detects a NUL byte in the RAW request target — encoded
+	// (%00, %2500, …) or literal. The canonicalizer strips NUL before rules
+	// run, hiding null-byte injection (CWE-158, e.g. "shell.php%00.jpg" to
+	// truncate an extension check). A NUL in a URL has no legitimate use, so
+	// flagging it cannot cause false positives.
+	nullByteRe = regexp.MustCompile(`(?i)%(?:25)*00|\x00`)
+
+	// openRedirectRe matches a redirect-param value pointing off-site: a
+	// protocol-relative "//host" / "/\host" / "\/host" / "\\host", an absolute
+	// "scheme://host", or a scheme with a single slash/backslash ("https:/",
+	// "https:\"). Tested against the RAW (decoded-once) query value, because
+	// the canonicalizer collapses "//evil.com" to "/evil.com" and hides it. A
+	// single-slash relative path ("/dashboard") deliberately does NOT match.
+	openRedirectRe = regexp.MustCompile(`(?i)^[\s\x00-\x20]*(?:(?:https?|ftp):?)?[\\/]{2}|^[\s\x00-\x20]*https?:[\\/]`)
 )
+
+// redirectParamNames are the query parameters commonly used for redirects; an
+// off-site value in one of these is an open-redirect indicator.
+var redirectParamNames = map[string]bool{
+	"redirect": true, "redirect_uri": true, "redirect_url": true, "redirecturl": true,
+	"redir": true, "url": true, "next": true, "return": true, "returnurl": true,
+	"return_url": true, "returnto": true, "goto": true, "continue": true, "dest": true,
+	"destination": true, "callback": true, "forward": true, "location": true, "rurl": true,
+}
 
 // DetectBot analyzes the request for bot signatures.
 func (e *Engine) DetectBot(tx *core.Transaction) (isBot bool, botName string, score int) {
@@ -195,18 +248,205 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 		}
 	}
 
-	// gRPC deep-inspection: the proxy extracts printable string runs from
-	// protobuf frames into "grpc_targets". Fold them into the body inspection
-	// surface so the existing XSS / SQLi / RCE signatures evaluate proto string
-	// fields — otherwise the advertised gRPC rule coverage never executes (the
-	// raw length-prefixed protobuf framing does not match canonicalised rules).
-	if val, ok := tx.MetadataValue("grpc_targets"); ok {
-		if runs, ok := val.([]string); ok && len(runs) > 0 {
-			joined := strings.Join(runs, "\n")
-			if targets["body"] == "" {
-				targets["body"] = joined
+	// Whitespace / zero-width normalized body. The raw "body" target is kept
+	// verbatim so structural rules that rely on exact bytes (e.g. the SMUG
+	// chunked-smuggling rules that match literal "\r\n0\r\n") still fire. This
+	// adds a parallel normalized view so injection rules also catch the
+	// "UNION\vSELECT" / "U​NION" / NBSP-separator evasions that the raw
+	// body would slip past (RE2 \s excludes \v, and the body is otherwise
+	// matched un-normalized). Added only when normalization actually changed
+	// something, so ordinary ASCII bodies cost nothing extra. Keyed under
+	// "body.norm" so it is matched by the "body" target prefix.
+	if norm := NormalizeForMatch(body); norm != body {
+		targets["body.norm"] = norm
+	}
+
+	// JSON-unescaped body view. A JSON payload that hides "<script>" /
+	// "UNION SELECT" behind backslash-u escapes is literal text to the regex
+	// rules but the app's JSON parser decodes it — a real bypass (confirmed by
+	// fuzzing). Inspect the decoded form too, plus its normalized variant so a
+	// decoded payload that also uses \v / unicode separators is caught. Added
+	// only when decoding changed something, so non-escaped bodies cost nothing.
+	if dec := decodeJSONEscapes(body); dec != body {
+		targets["body.jsondecoded"] = dec
+		if dn := NormalizeForMatch(dec); dn != dec {
+			targets["body.jsonnorm"] = dn
+		}
+	}
+
+	// Cookie inspection with the full body-phase rule set. Header-phase rules
+	// only cover a subset of injection signatures (XSS-001/SQLI-001/RCE-001/…
+	// declare a "headers" target but run in the BODY phase, so they never see
+	// header values). Apps routinely read cookie values into SQL queries, HTML,
+	// shell commands, or template engines, so a cookie is a first-class
+	// injection sink. Expose it under "headers.cookie" (matched by the
+	// "headers" target prefix) using NormalizeForMatch — NFKC + homoglyph +
+	// whitespace folding, but NO URL-decode, since apps read the raw cookie
+	// value rather than a percent-decoded one. Avoids the "+"→space mangling
+	// that would otherwise false-positive base64 cookies on the crypto rule.
+	if tx.Request != nil {
+		if c := tx.Request.Header.Get("Cookie"); c != "" {
+			// PathUnescape (not QueryUnescape) decodes %XX while leaving "+"
+			// intact, so a percent-encoded payload in a cookie is caught
+			// without "+"→space mangling that would false-positive base64 /
+			// JWT cookies on the crypto rule. Fall back to raw on a malformed
+			// escape (e.g. a literal "%").
+			if dec, err := url.PathUnescape(c); err == nil {
+				c = dec
+			}
+			targets["headers.cookie"] = NormalizeForMatch(c)
+		}
+
+		// Request-header injection sinks. The injection signatures (XSS / SQLi /
+		// RCE / …) run in the body phase, where the cookie was the only header
+		// they saw. But apps routinely read other client-controlled headers into
+		// the very same sinks: the User-Agent and Referer land in access logs and
+		// admin dashboards (stored XSS) and analytics queries (SQLi); the
+		// forwarding / real-IP headers are written verbatim into databases (SQLi)
+		// and trusted for access decisions. Expose a curated allowlist of these
+		// sink-carrying headers to the body-phase rule set under
+		// "headers.<name>" (matched by the "headers" prefix) so the same
+		// signatures that protect args / body / cookie cover them too. The list
+		// is an allowlist — structured negotiation / auth headers (Accept*,
+		// Content-*, Authorization, Sec-*) are intentionally excluded to stay
+		// false-positive free — and uses the no-URL-decode NormalizeForMatch
+		// treatment (NFKC + homoglyph + whitespace fold) so base64 tokens aren't
+		// mangled into rule hits.
+		const maxHeaderSinkLen = 8192
+		for _, name := range injectionSinkHeaders {
+			if vs := tx.Request.Header.Values(name); len(vs) > 0 {
+				joined := strings.Join(vs, ", ")
+				if joined == "" {
+					continue
+				}
+				if len(joined) > maxHeaderSinkLen {
+					joined = joined[:maxHeaderSinkLen]
+				}
+				targets["headers."+strings.ToLower(name)] = NormalizeForMatch(joined)
+			}
+		}
+	}
+
+	// Decompressed body inspection. When DecompressInspect is enabled the
+	// proxy decodes a gzip/brotli request body and stores the plaintext
+	// under "decoded_body" *specifically so body rules can run against the
+	// content the backend will actually process*. The raw "body" target is
+	// the compressed bytes, which match no signature — so without inspecting
+	// the decoded form here, any attack wrapped in Content-Encoding: gzip
+	// bypasses every body rule. Keyed as "body.decoded" so existing rules
+	// that target "body" match it via the evaluator's prefix rule, with no
+	// rule changes required. Only added when it differs from the raw body so
+	// a single match can't be scored twice.
+	if val, ok := tx.MetadataValue("decoded_body"); ok {
+		if b, ok := val.([]byte); ok && len(b) > 0 && string(b) != body {
+			targets["body.decoded"] = string(b)
+		}
+	}
+
+	// Form-urlencoded body decoding. Query-string args are URL-decoded and
+	// homoglyph-folded before matching (see buildRequestHeaderTargets); the
+	// raw body is not. So `comment=%3Cscript%3E...` in an
+	// application/x-www-form-urlencoded POST reaches the backend decoded to
+	// `<script>...` while the engine only ever saw the percent-encoded form —
+	// a clean bypass of every body/args rule. Parse the body the same way the
+	// backend will and expose each value under an "args.NAME" key so the
+	// existing arg/body signatures fire. Bounded to maxFormFields so a body
+	// packed with parameters can't blow up the target map.
+	if e.isFormURLEncoded(tx.Request) && body != "" {
+		const maxFormFields = 256
+		if values, err := url.ParseQuery(body); err == nil {
+			added := 0
+			for k, vs := range values {
+				if added >= maxFormFields {
+					e.logger.Warnf("engine: form-field limit (%d) reached", maxFormFields)
+					break
+				}
+				decoded := strings.Join(vs, ", ")
+				targets["args."+k] = FoldHomoglyphs(Canonicalize(decoded))
+				added++
+			}
+		}
+	}
+
+	// Query-string args + request target into the BODY phase. The header phase
+	// builds args.* / uri from the query string, but only the SUBSET of rules
+	// marked PhaseRequestHeaders runs there — the bulk of the signature set
+	// (XSS, XPath, SSI, deserialization, prototype pollution, Spring4Shell,
+	// LDAP, JSON NoSQL, …) is PhaseRequestBody and so never saw the query
+	// string. The result was a gaping hole: a reflected ?q=<script>alert(1)
+	// </script> — the most common XSS vector — bypassed every XSS rule, and
+	// likewise for the other body-only classes. Mirror the query args and the
+	// URI into the body-phase target map so the FULL rule set inspects them,
+	// decoded and homoglyph-folded exactly like the header phase. Query args
+	// are merged into the existing "args.NAME" keys (so a name present in both
+	// the query and a form body keeps both payloads); the URI is added only if
+	// a form body did not already populate it. Bounded so a query packed with
+	// params can't blow up the target map.
+	if tx.Request != nil && tx.Request.URL != nil {
+		const maxQueryFields = 256
+		added := 0
+		for k, vs := range tx.Request.URL.Query() {
+			if added >= maxQueryFields {
+				e.logger.Warnf("engine: query-field limit (%d) reached", maxQueryFields)
+				break
+			}
+			raw := strings.Join(vs, ", ")
+			decoded := raw
+			if d, err := url.QueryUnescape(raw); err == nil {
+				decoded = d
+			}
+			val := FoldHomoglyphs(Canonicalize(decoded))
+			key := "args." + k
+			if existing, ok := targets[key]; ok && existing != val {
+				targets[key] = existing + ", " + val
 			} else {
-				targets["body"] += "\n" + joined
+				targets[key] = val
+			}
+			added++
+		}
+		if _, ok := targets["uri"]; !ok {
+			if uri, err := url.PathUnescape(tx.Request.URL.RequestURI()); err == nil {
+				targets["uri"] = FoldHomoglyphs(Canonicalize(uri))
+			} else {
+				targets["uri"] = FoldHomoglyphs(Canonicalize(tx.Request.URL.RequestURI()))
+			}
+		}
+	}
+
+	// UTF-7 decoded body view. A payload like "+ADw-script+AD4-" is inert ASCII
+	// to every signature rule, but a backend that honors charset=utf-7 decodes
+	// it to "<script>" — the classic UTF-7 XSS smuggle (confirmed by fuzzing:
+	// the bytes reach the app as live <script>/<img onerror> markup). Decode the
+	// same content the backend will, but ONLY when the request explicitly
+	// declares charset=utf-7. No modern legitimate client sends that charset, so
+	// gating on the declaration keeps this zero-false-positive while still
+	// covering the attacker who sets it hoping a charset-sniffing backend
+	// decodes the body. Keyed "body.utf7" (matched by the "body" prefix) and
+	// added only when decoding actually changes the bytes.
+	if utf7Charset(tx.Request) {
+		if dec := decodeUTF7(body); dec != body {
+			targets["body.utf7"] = NormalizeForMatch(dec)
+		}
+	}
+
+	// gRPC string-field inspection. The DPI layer extracts printable runs
+	// from protobuf frames into "grpc_targets" so XSS/SQLi signatures get a
+	// chance to fire on string fields that the framing bytes would otherwise
+	// split apart. Each run is fed under a "body.grpc.N" key (matched by the
+	// "body" prefix rule). Capped so a frame full of short runs can't blow up
+	// the target map.
+	if val, ok := tx.MetadataValue("grpc_targets"); ok {
+		if runs, ok := val.([]string); ok {
+			const maxGRPCTargets = 256
+			for i, s := range runs {
+				if i >= maxGRPCTargets {
+					e.logger.Warnf("engine: gRPC target limit (%d) reached", maxGRPCTargets)
+					break
+				}
+				if s == "" {
+					continue
+				}
+				targets[fmt.Sprintf("body.grpc.%d", i)] = s
 			}
 		}
 	}
@@ -394,6 +634,102 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 			return matches
 		}
 
+		// CRLF / HTTP response-splitting in the raw request target. The
+		// canonicalizer URL-decodes "%0d%0a" and then normalises the resulting
+		// CR/LF to spaces, so by the time the CRLF-001 regex sees a query arg
+		// the evidence is gone. Inspect the RAW request-target (still
+		// percent-encoded) instead. We only flag a CR/LF that is followed by a
+		// header-like "token:" (the OWASP CRS 921160 approach) so a legitimate
+		// multi-line value in a GET parameter does not false-positive.
+		rawURI := tx.Request.RequestURI
+		if rawURI == "" && tx.Request.URL != nil {
+			rawURI = tx.Request.URL.RequestURI()
+		}
+		if crlfInjectionRe.MatchString(rawURI) {
+			addMatch(core.Match{
+				RuleID:    "CRLF-002",
+				RuleName:  "CRLF Header Injection",
+				Phase:     phase,
+				Target:    "uri",
+				Value:     trunc(rawURI, 64),
+				Score:     80,
+				Action:    core.ActionBlock,
+				Message:   "CR/LF followed by header injection in request target",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
+		// Open-redirect detection. REDIR-001/002 embed the param NAME in their
+		// regex and run against per-arg VALUES, so they never fire on a query
+		// param; and the canonicalizer collapses "//evil.com" to "/evil.com",
+		// hiding the protocol-relative form. Inspect the RAW (decoded-once)
+		// query values of redirect-style params instead. Log-level: legitimate
+		// apps DO redirect off-site (OAuth, SSO, share links), so this is
+		// visibility, not a block.
+		if tx.Request.URL != nil {
+			const maxRedirChecks = 32
+			checked := 0
+			for name, vals := range tx.Request.URL.Query() {
+				if checked >= maxRedirChecks {
+					break
+				}
+				if !redirectParamNames[strings.ToLower(name)] {
+					continue
+				}
+				for _, v := range vals {
+					checked++
+					if openRedirectRe.MatchString(v) {
+						addMatch(core.Match{
+							RuleID:    "REDIR-003",
+							RuleName:  "Open Redirect (off-site param value)",
+							Phase:     phase,
+							Target:    "args." + name,
+							Value:     trunc(v, 64),
+							Score:     40,
+							Action:    core.ActionLog,
+							Message:   "Redirect parameter points to an off-site/protocol-relative URL",
+							Timestamp: time.Now().UTC(),
+						})
+						break
+					}
+				}
+			}
+		}
+
+		// JWT header attacks. JWTs are base64url-encoded, so alg:none / kid
+		// injection / jku abuse are invisible to the regular regex rules
+		// (JWT-001 only sees a literal "alg":"none"). Decode the header and
+		// inspect it. Scan the Authorization and Cookie headers plus query
+		// args — the placements where a token is presented.
+		for key, val := range targets {
+			if !strings.Contains(val, "eyJ") {
+				continue
+			}
+			lk := strings.ToLower(key)
+			if lk == "headers.authorization" || lk == "headers.cookie" ||
+				strings.HasPrefix(lk, "args.") || lk == "uri" {
+				for _, m := range detectJWTAttacks(val) {
+					addMatch(m)
+				}
+			}
+		}
+
+		// NUL-byte injection in the raw request target (canonicalisation strips
+		// it before the rule engine sees it).
+		if nullByteRe.MatchString(rawURI) {
+			addMatch(core.Match{
+				RuleID:    "NULL-001",
+				RuleName:  "Null Byte Injection",
+				Phase:     phase,
+				Target:    "uri",
+				Value:     trunc(rawURI, 64),
+				Score:     80,
+				Action:    core.ActionBlock,
+				Message:   "NUL byte in request target",
+				Timestamp: time.Now().UTC(),
+			})
+		}
+
 		// HTTP Smuggling: Transfer-Encoding + Content-Length
 		te := tx.Request.Header.Get("Transfer-Encoding")
 		cl := tx.Request.Header.Get("Content-Length")
@@ -477,6 +813,37 @@ func (e *Engine) evaluateSpecialRules(tx *core.Transaction, phase core.Phase, ta
 				Message:   "Missing or empty User-Agent header",
 				Timestamp: time.Now().UTC(),
 			})
+		}
+
+	case core.PhaseRequestBody:
+		// Raw Java serialization magic bytes (0xAC 0xED 0x00 0x05 = STREAM_MAGIC
+		// + STREAM_VERSION). The DESER-001 / DESER-JAVA-001 rules only match the
+		// base64 ("rO0AB") and hex-text ("aced0005") representations; an
+		// endpoint that accepts raw serialized objects (custom binary APIs,
+		// some RMI/JMX-over-HTTP bridges) receives the literal bytes, which
+		// Go's UTF-8-oriented regexp cannot express. A body that STARTS with the
+		// magic is unambiguous; embedded (e.g. multipart) we additionally
+		// require the following TC_OBJECT/TC_BLOCKDATA type byte so a stray
+		// 4-byte coincidence in a binary upload can't false-positive.
+		if b, ok := targets["body"]; ok && b != "" {
+			const javaMagic = "\xac\xed\x00\x05"
+			hit := strings.HasPrefix(b, javaMagic) ||
+				strings.Contains(b, javaMagic+"\x73") || // TC_OBJECT
+				strings.Contains(b, javaMagic+"\x77") || // TC_BLOCKDATA
+				strings.Contains(b, javaMagic+"\x7a") // TC_BLOCKDATALONG
+			if hit {
+				addMatch(core.Match{
+					RuleID:    "DESER-JAVA-002",
+					RuleName:  "Java Serialized Object (raw)",
+					Phase:     phase,
+					Target:    "body",
+					Value:     "raw java serialization stream header",
+					Score:     90,
+					Action:    core.ActionBlock,
+					Message:   "Raw Java serialized object stream (0xACED0005)",
+					Timestamp: time.Now().UTC(),
+				})
+			}
 		}
 
 	case core.PhaseResponseBody:
@@ -683,6 +1050,232 @@ func (e *Engine) readBodyString(r *http.Request) (string, error) {
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	r.ContentLength = int64(len(body))
 	return string(body), nil
+}
+
+// detectJWTAttacks finds JWT-shaped tokens in s, base64url-decodes each
+// header segment, and returns matches for attacks the encoded form hides from
+// regular regex rules: alg:none signature bypass, kid header injection
+// (SQLi/LFI/command), and a client-presented jku/x5u external key source. It
+// is bounded (maxJWTs) so a body packed with eyJ-prefixed strings can't blow
+// up cost, and never panics on malformed base64.
+func detectJWTAttacks(s string) []core.Match {
+	const maxJWTs = 8
+	if !strings.Contains(s, "eyJ") {
+		return nil
+	}
+	var matches []core.Match
+	found := jwtRe.FindAllString(s, maxJWTs)
+	for _, tok := range found {
+		seg := tok
+		if i := strings.IndexByte(seg, '.'); i >= 0 {
+			seg = seg[:i]
+		}
+		hdrBytes, err := base64.RawURLEncoding.DecodeString(seg)
+		if err != nil {
+			// Tolerate accidental padding.
+			if hb, err2 := base64.StdEncoding.DecodeString(seg); err2 == nil {
+				hdrBytes = hb
+			} else {
+				continue
+			}
+		}
+		hdr := string(hdrBytes)
+		if !strings.Contains(hdr, "alg") && !strings.Contains(hdr, "kid") && !strings.Contains(hdr, "jku") && !strings.Contains(hdr, "x5u") {
+			continue // decoded to something that isn't a JWT header
+		}
+		if jwtAlgNoneRe.MatchString(hdr) {
+			matches = append(matches, core.Match{
+				RuleID: "JWT-002", RuleName: "JWT alg:none signature bypass", Phase: core.PhaseRequestHeaders,
+				Target: "jwt.header", Value: trunc(hdr, 64), Score: 90, Action: core.ActionBlock,
+				Message: "JWT header declares alg:none (unsigned token)", Timestamp: time.Now().UTC(),
+			})
+		}
+		if m := jwtKidRe.FindStringSubmatch(hdr); m != nil && jwtDangerousKidRe.MatchString(m[1]) {
+			matches = append(matches, core.Match{
+				RuleID: "JWT-003", RuleName: "JWT kid header injection", Phase: core.PhaseRequestHeaders,
+				Target: "jwt.header", Value: trunc(m[1], 64), Score: 90, Action: core.ActionBlock,
+				Message: "JWT kid parameter contains injection metacharacters", Timestamp: time.Now().UTC(),
+			})
+		}
+		if jwtJkuRe.MatchString(hdr) {
+			matches = append(matches, core.Match{
+				RuleID: "JWT-004", RuleName: "JWT external key source", Phase: core.PhaseRequestHeaders,
+				Target: "jwt.header", Value: trunc(hdr, 64), Score: 50, Action: core.ActionLog,
+				Message: "JWT header references an external key set (jku/x5u)", Timestamp: time.Now().UTC(),
+			})
+		}
+	}
+	return matches
+}
+
+// decodeJSONEscapes reveals JSON string escape sequences so signature rules
+// see the content the backend's JSON parser will produce. A JSON value that
+// uses backslash-u escapes for "<", ">", or a letter inside a keyword reads as
+// literal text to a regex but decodes to "<script>" / "UNION SELECT" once the
+// app parses the JSON — a real WAF-bypass class. The decoder correctly handles
+// an escaped backslash so a doubly-escaped sequence is not mis-decoded. Non-JSON
+// input is returned essentially unchanged (the result is only ever used as an
+// ADDITIONAL match target; the verbatim body is preserved).
+func decodeJSONEscapes(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != '\\' || i+1 >= len(s) {
+			b.WriteByte(c)
+			continue
+		}
+		switch s[i+1] {
+		case 'u':
+			if i+6 <= len(s) {
+				if r, err := strconv.ParseUint(s[i+2:i+6], 16, 32); err == nil {
+					b.WriteRune(rune(r))
+					i += 5
+					continue
+				}
+			}
+			b.WriteByte(c)
+		case '/':
+			b.WriteByte('/')
+			i++
+		case 'n':
+			b.WriteByte('\n')
+			i++
+		case 't':
+			b.WriteByte('\t')
+			i++
+		case 'r':
+			b.WriteByte('\r')
+			i++
+		case 'b':
+			b.WriteByte('\b')
+			i++
+		case 'f':
+			b.WriteByte('\f')
+			i++
+		case '"':
+			b.WriteByte('"')
+			i++
+		case '\\':
+			// Escaped backslash: emit one '\' and consume BOTH, so a literal
+			// "\\u003c" is left as "<" (not decoded to "<").
+			b.WriteByte('\\')
+			i++
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// isFormURLEncoded reports whether the request body is
+// application/x-www-form-urlencoded so it can be parsed into args targets.
+func (e *Engine) isFormURLEncoded(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
+	return strings.HasPrefix(ct, "application/x-www-form-urlencoded")
+}
+
+// injectionSinkHeaders is the curated set of client-controlled request headers
+// that commonly reach injection sinks — access logs, admin dashboards,
+// analytics SQL, and IP allowlists. They are inspected by the body-phase
+// signature rules in addition to the cookie. Structured negotiation / auth /
+// fetch-metadata headers are deliberately omitted to avoid false positives,
+// since they carry tokens and q-value lists that no app feeds to an injection
+// sink.
+var injectionSinkHeaders = []string{
+	"User-Agent",
+	"Referer",
+	"X-Forwarded-For",
+	"X-Forwarded-Host",
+	"X-Real-IP",
+	"X-Client-IP",
+	"X-Originating-IP",
+	"True-Client-IP",
+	"CF-Connecting-IP",
+	"Forwarded",
+	"Via",
+	"From",
+	"X-Requested-With",
+}
+
+// utf7Charset reports whether the request explicitly declares a UTF-7 body
+// charset. UTF-7 is honored by essentially no modern client, so gating the
+// decode-and-inspect pass on this declaration keeps it zero-false-positive:
+// ordinary traffic never enters the path.
+func utf7Charset(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	ct := strings.ToLower(r.Header.Get("Content-Type"))
+	// Tolerate "charset=utf-7", quoted, and the non-hyphenated "utf7" spelling.
+	return strings.Contains(ct, "charset=utf-7") ||
+		strings.Contains(ct, "charset=\"utf-7\"") ||
+		strings.Contains(ct, "charset=utf7")
+}
+
+// decodeUTF7 decodes RFC 2152 modified-UTF-7 into UTF-8. A '+' opens a
+// modified-base64 run encoding UTF-16BE code units, closed by '-' (or any
+// non-base64 byte); "+-" is a literal '+'. Anything that isn't a valid
+// sequence is passed through, so the result is always usable as a matching
+// target. Used only when the body explicitly declares charset=utf-7.
+func decodeUTF7(s string) string {
+	rev := func(c byte) int {
+		switch {
+		case c >= 'A' && c <= 'Z':
+			return int(c - 'A')
+		case c >= 'a' && c <= 'z':
+			return int(c-'a') + 26
+		case c >= '0' && c <= '9':
+			return int(c-'0') + 52
+		case c == '+':
+			return 62
+		case c == '/':
+			return 63
+		}
+		return -1
+	}
+	var out strings.Builder
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c != '+' {
+			out.WriteByte(c)
+			i++
+			continue
+		}
+		i++ // consume '+'
+		if i < len(s) && s[i] == '-' {
+			out.WriteByte('+') // "+-" => literal '+'
+			i++
+			continue
+		}
+		var bits uint32
+		var nbits int
+		var units []uint16
+		for i < len(s) {
+			v := rev(s[i])
+			if v < 0 {
+				break
+			}
+			bits = bits<<6 | uint32(v)
+			nbits += 6
+			i++
+			if nbits >= 16 {
+				nbits -= 16
+				units = append(units, uint16(bits>>uint(nbits)))
+			}
+		}
+		out.WriteString(string(utf16.Decode(units)))
+		if i < len(s) && s[i] == '-' {
+			i++ // consume explicit terminator
+		}
+	}
+	return out.String()
 }
 
 func trunc(s string, n int) string {

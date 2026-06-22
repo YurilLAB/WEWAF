@@ -94,9 +94,17 @@ func (b *Breaker) Allow() bool {
 			b.mu.Lock()
 			openedLocked := time.Unix(0, b.openedAt.Load())
 			if BreakerState(b.state.Load()) == BreakerOpen && time.Since(openedLocked) >= b.openTimeout {
-				b.state.Store(int32(BreakerHalfOpen))
-				b.probeInFlight.Store(true) // claim the probe slot
+				// Claim the probe slot and stamp the start time BEFORE publishing
+				// the half-open state. A concurrent caller observes state via the
+				// lock-free Load at the top of Allow() and then CAS-claims
+				// probeInFlight in the half-open branch; if we published HalfOpen
+				// first, that CAS could win in the window before we set the flag
+				// and admit a SECOND probe. Go's atomics are sequentially
+				// consistent, so ordering the claim first guarantees any goroutine
+				// that sees HalfOpen also sees the slot already taken.
+				b.probeInFlight.Store(true)
 				b.probeStartedAt.Store(time.Now().UnixNano())
+				b.state.Store(int32(BreakerHalfOpen))
 				b.mu.Unlock()
 				return true
 			}

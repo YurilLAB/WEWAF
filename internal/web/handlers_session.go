@@ -227,14 +227,20 @@ func (s *Server) handleSessionByID(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	sess := s.sessions.Lookup(id)
-	if sess == nil {
+	if _, ok := s.sessions.View(id); !ok {
 		http.NotFound(w, r)
 		return
 	}
-	// Re-score on lookup so the detail view is current.
+	// Re-score so the detail view is current, then snapshot under the
+	// tracker lock (View holds the read lock across the snapshot, so the
+	// map iteration can't race a concurrent request touching this session).
 	s.sessions.Score(id)
-	writeJSON(w, sess.Snapshot())
+	view, ok := s.sessions.View(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	writeJSON(w, view)
 }
 
 // --- GraphQL admin endpoints --------------------------------------------
