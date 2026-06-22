@@ -70,6 +70,19 @@ func (l banListLister) ActiveBans() []firewall.Ban {
 	return out
 }
 
+// shadowUncoverable maps pseudo-rule IDs that are enforced by separate proxy
+// subsystems (NOT the rule engine) to the operator control that actually
+// governs them. Shadow mode only suppresses rule-engine matches, so listing one
+// of these in shadow_rule_ids is a no-op; main warns when it sees one so the
+// operator isn't misled into thinking a detection is being canaried when it
+// isn't (audit finding S2-2).
+var shadowUncoverable = map[string]string{
+	"GRPC-DPI":         "grpc_block_on_error",
+	"GRAPHQL-VALIDATE": "the graphql_* settings",
+	"SESSION-RISK":     "session_block_threshold",
+	"BRUTE-FORCE":      "brute_force_* settings / mode",
+}
+
 // reputationConfigFrom maps the operator config onto the reputation engine's
 // policy. Escalation Factor / MaxDuration / OffenseWindow are deliberately
 // shared with the ban-backoff knobs so the reputation-driven and BanList-driven
@@ -240,6 +253,35 @@ func main() {
 		repEngine.Purge()
 		log.Printf("history rotated: new db=%s", historyStore.StatsSnapshot().CurrentPath)
 	})
+
+	// Shadow (canary) recorder: a rule listed in shadow_rule_ids evaluates but
+	// never blocks; each would-block is tallied here so an operator can vet a
+	// new/tightened rule against live traffic before promoting it (S2).
+	eng.SetShadowRecorder(func(tx *core.Transaction, m core.Match) {
+		method, path := "", ""
+		if tx.Request != nil {
+			method = tx.Request.Method
+			if tx.Request.URL != nil {
+				path = tx.Request.URL.Path
+			}
+		}
+		metrics.RecordWouldBlock(tx.ClientIP, method, path, m.RuleID, m.RuleName, m.Message, m.Score)
+	})
+	if n := len(cfg.ShadowRuleIDs); n > 0 {
+		log.Printf("shadow mode active: %d rule(s) run in canary (record-only, never block): %s",
+			n, strings.Join(cfg.ShadowRuleIDs, ", "))
+		// Warn on shadow IDs the engine can't cover: these detections are
+		// enforced by separate proxy subsystems outside rule evaluation, so
+		// shadowing them is silently a no-op. Tell the operator to use the
+		// subsystem's own control instead (audit finding S2-2).
+		for _, id := range cfg.ShadowRuleIDs {
+			if knob, ok := shadowUncoverable[strings.ToUpper(strings.TrimSpace(id))]; ok {
+				log.Printf("WARN: shadow_rule_ids lists %q, but that detection is enforced by a proxy "+
+					"subsystem outside the rule engine — shadow mode will NOT suppress it. Use its own "+
+					"control (%s) to disable/observe instead.", id, knob)
+			}
+		}
+	}
 
 	bf := bruteforce.NewDetector(time.Duration(cfg.BruteForceWindowSec) * time.Second)
 	defer bf.Stop()
@@ -779,6 +821,10 @@ func main() {
 			cfg.RateLimitBurst = fresh.RateLimitBurst
 			cfg.TrustXFF = fresh.TrustXFF
 			cfg.TrustedProxies = append([]string(nil), fresh.TrustedProxies...)
+			// Shadow rule set is hot-reloadable: promoting a canaried rule to
+			// enforcement (or shadowing a new one) is a single config edit, no
+			// restart. The engine reads this via cfg.Snapshot() each evaluation.
+			cfg.ShadowRuleIDs = append([]string(nil), fresh.ShadowRuleIDs...)
 			cfg.Unlock()
 			// Hot-swap the reputation policy (window/threshold/decay/jitter)
 			// atomically. The Enabled flag and the persistence/restore wiring

@@ -25,5 +25,6 @@
   "mode": "active",
   "log_level": "info",
   "audit_log_path": "",
-  "rule_files": ["rules.json"]
+  "rule_files": ["rules.json"],
+  "shadow_rule_ids": []
 }

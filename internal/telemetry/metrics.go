@@ -156,6 +156,13 @@ type Metrics struct {
 	// Lazily initialised in RecordBlockWithCategory to keep the zero value
 	// useful for tests.
 	RuleCounters map[string]uint64
+
+	// Shadow (canary) accounting. WouldBlock counts matches a shadow-mode rule
+	// WOULD have blocked but didn't (no user impact); WouldBlockByRule breaks
+	// that down per rule so an operator can read "rule X would have blocked N"
+	// and decide whether to promote it to enforcement.
+	WouldBlock       uint64
+	WouldBlockByRule map[string]uint64
 }
 
 // EgressEvent records an outbound egress decision.
@@ -432,6 +439,34 @@ func (m *Metrics) RecordBlockWithCategory(ip, method, path, ruleID, category, me
 	}
 }
 
+// RecordWouldBlock records a shadow (canary) would-block: a rule running in
+// shadow mode matched and WOULD have blocked, but did not (zero user impact).
+// It deliberately does NOT touch BlockedRequests or RecentBlocks — the request
+// was not blocked — it only accumulates the would-block tallies that drive the
+// promote/keep-shadowing decision. Non-blocking and panic-guarded.
+func (m *Metrics) RecordWouldBlock(ip, method, path, ruleID, category, message string, score int) {
+	if m == nil {
+		return
+	}
+	defer recoverPanic("RecordWouldBlock")
+	m.mu.Lock()
+	m.WouldBlock++
+	if ruleID != "" {
+		if m.WouldBlockByRule == nil {
+			m.WouldBlockByRule = make(map[string]uint64, 16)
+		}
+		// Bound the map like RuleCounters — a crafted-rule-ID flood must not
+		// grow it without limit. Stop adding new keys at 4096 but keep
+		// incrementing existing ones.
+		if len(m.WouldBlockByRule) < 4096 {
+			m.WouldBlockByRule[ruleID]++
+		} else if _, ok := m.WouldBlockByRule[ruleID]; ok {
+			m.WouldBlockByRule[ruleID]++
+		}
+	}
+	m.mu.Unlock()
+}
+
 // RecordPass increments passed requests and records response status.
 // Deprecated shape kept for backwards compatibility — new callers
 // should prefer RecordPassDetailed which records method + path so the
@@ -703,7 +738,19 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"status_code_buckets": statusCounts,
 		"status_codes":        statusCodes,
 		"method_counts":       methodCounts,
+		"would_block":         m.WouldBlock,
+		"would_block_by_rule": copyUint64Map(m.WouldBlockByRule),
 	}
+}
+
+// copyUint64Map returns a defensive copy of a string->uint64 map (nil-safe) so
+// snapshot consumers can't mutate live counters.
+func copyUint64Map(in map[string]uint64) map[string]uint64 {
+	out := make(map[string]uint64, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // PassedPathCountsSnapshot returns a copy of the live passed-traffic

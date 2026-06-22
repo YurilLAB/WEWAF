@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -80,6 +81,20 @@ type Config struct {
 	LogLevel     string   `json:"log_level"`      // "debug", "info", "warn", "error"
 	AuditLogPath string   `json:"audit_log_path"`
 	RuleFiles    []string `json:"rule_files"`
+
+	// ShadowRuleIDs lists RULE-ENGINE rule IDs to run in SHADOW (canary) mode:
+	// they still evaluate and their would-block is recorded, but their score is
+	// excluded from the block decision so they never affect a user. This is the
+	// CRS executing-vs-blocking pattern — vet a new or tightened rule against
+	// live traffic, watch its would-block count, then promote it by removing it
+	// from this list (a single hot-reloadable config change). Empty = none.
+	//
+	// Scope: this covers signatures evaluated by the rule engine (incl. the
+	// bot-fingerprint pseudo-rule). It does NOT cover detections enforced by
+	// separate proxy subsystems — gRPC DPI, GraphQL validation, session-risk,
+	// brute-force — which have their own enable/threshold knobs; listing those
+	// IDs here is a no-op and the daemon warns at startup.
+	ShadowRuleIDs []string `json:"shadow_rule_ids"`
 
 	// Persistent history storage
 	HistoryDir          string `json:"history_dir"`           // default "history"
@@ -1047,6 +1062,7 @@ func (c *Config) Snapshot() *Config {
 		LogLevel:                 c.LogLevel,
 		AuditLogPath:             c.AuditLogPath,
 		RuleFiles:                make([]string, len(c.RuleFiles)),
+		ShadowRuleIDs:            make([]string, len(c.ShadowRuleIDs)),
 		HistoryDir:               c.HistoryDir,
 		HistoryRotateHours:       c.HistoryRotateHours,
 		HistoryBufferSize:        c.HistoryBufferSize,
@@ -1195,6 +1211,7 @@ func (c *Config) Snapshot() *Config {
 		OriginShieldSecretPrevious: c.OriginShieldSecretPrevious,
 	}
 	copy(cp.RuleFiles, c.RuleFiles)
+	copy(cp.ShadowRuleIDs, c.ShadowRuleIDs)
 	copy(cp.EgressAllowlist, c.EgressAllowlist)
 	copy(cp.MeshPeers, c.MeshPeers)
 	cp.modeAtomic = atomic.Value{}
@@ -1214,4 +1231,21 @@ func (c *Config) ModeSnapshot() string {
 		return s
 	}
 	return c.Mode
+}
+
+// IsShadowRule reports whether ruleID is configured to run in shadow (canary)
+// mode. Intended to be called on a *Config snapshot (RuleFiles/ShadowRuleIDs
+// are deep-copied by Snapshot, so the read needs no lock). Matching is
+// case-insensitive and exact. The empty-list fast path keeps this free on the
+// hot evaluation loop when no rule is being canaried (the default).
+func (c *Config) IsShadowRule(ruleID string) bool {
+	if c == nil || len(c.ShadowRuleIDs) == 0 || ruleID == "" {
+		return false
+	}
+	for _, id := range c.ShadowRuleIDs {
+		if strings.EqualFold(id, ruleID) {
+			return true
+		}
+	}
+	return false
 }

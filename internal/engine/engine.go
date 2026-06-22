@@ -22,11 +22,19 @@ import (
 
 // Engine is the central WAF rule evaluator.
 type Engine struct {
-	mu      sync.RWMutex
-	cfg     *config.Config
-	ruleSet *rules.RuleSet
-	logger  Logger
+	mu             sync.RWMutex
+	cfg            *config.Config
+	ruleSet        *rules.RuleSet
+	logger         Logger
+	shadowRecorder ShadowRecorder
 }
+
+// ShadowRecorder is invoked for each rule match SUPPRESSED by shadow mode — a
+// "would-block" event. It lets an operator measure a candidate rule's block
+// rate against live traffic with zero user impact. Kept as a plain func so the
+// engine stays free of a telemetry import; cmd/waf wires it to
+// telemetry.RecordWouldBlock. nil = the match is only logged.
+type ShadowRecorder func(tx *core.Transaction, m core.Match)
 
 // Logger is a minimal logging interface.
 type Logger interface {
@@ -71,6 +79,15 @@ func (e *Engine) Reload(rs *rules.RuleSet) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.ruleSet = rs
+}
+
+// SetShadowRecorder installs the callback fired for each shadow-suppressed
+// (would-block) match. Set once at startup before serving; guarded by the same
+// lock the evaluation path reads under, so it is hot-reload safe.
+func (e *Engine) SetShadowRecorder(rec ShadowRecorder) {
+	e.mu.Lock()
+	e.shadowRecorder = rec
+	e.mu.Unlock()
 }
 
 var (
@@ -178,7 +195,12 @@ func (e *Engine) ProcessRequestHeaders(tx *core.Transaction) *core.Interruption 
 		}()
 		isBot, botName, score := e.DetectBot(tx)
 		if isBot {
-			tx.AddMatch(core.Match{
+			// Route through addOrShadow (not tx.AddMatch directly) so that
+			// listing "BOT-FINGERPRINT" in shadow_rule_ids actually suppresses
+			// its score — this pseudo-rule is emitted here, BEFORE evaluatePhase,
+			// so the shadow guard inside evaluatePhase would otherwise never see
+			// it (audit finding S2-1).
+			e.addOrShadow(tx, core.Match{
 				RuleID:    "BOT-FINGERPRINT",
 				RuleName:  "Bot Fingerprint Detected: " + botName,
 				Phase:     core.PhaseRequestHeaders,
@@ -556,6 +578,7 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 	e.mu.RLock()
 	rs := e.ruleSet
 	cfgSnap := e.cfg.Snapshot()
+	shadowRec := e.shadowRecorder
 	e.mu.RUnlock()
 
 	const maxMatches = 1000
@@ -563,22 +586,34 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 
 	// Isolate rs.Evaluate with its own panic recovery so a bad regex cannot crash the WAF.
 	var matches []core.Match
-	var hardBlock bool
 	func() {
 		defer func() {
 			if rec := recover(); rec != nil {
 				e.logger.Errorf("engine: panic during rule evaluation: %v", rec)
 			}
 		}()
-		matches, hardBlock = rs.EvaluateWithParanoia(phase, targets, cfgSnap.BlockThreshold, cfgSnap.ParanoiaLevel)
+		// The aggregate hardBlock from EvaluateWithParanoia would count shadow
+		// rules; recompute it below from non-shadow matches only so a canaried
+		// rule can never interrupt a request.
+		matches, _ = rs.EvaluateWithParanoia(phase, targets, cfgSnap.BlockThreshold, cfgSnap.ParanoiaLevel)
 	}()
 
+	var hardBlock bool
 	for _, m := range matches {
 		if tx.MatchCount()-preMatchCount >= maxMatches {
 			e.logger.Warnf("engine: match limit (%d) reached for phase %s", maxMatches, phase)
 			break
 		}
+		// Shadow (canary) rules evaluate and are recorded as would-blocks, but
+		// contribute neither score nor a block — they never reach AddMatch.
+		if cfgSnap.IsShadowRule(m.RuleID) {
+			e.recordShadow(tx, m, shadowRec)
+			continue
+		}
 		tx.AddMatch(m)
+		if m.Action == core.ActionBlock || m.Action == core.ActionDrop {
+			hardBlock = true
+		}
 	}
 
 	// Check special non-regex rules.
@@ -587,6 +622,10 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 		if tx.MatchCount()-preMatchCount >= maxMatches {
 			e.logger.Warnf("engine: match limit (%d) reached for phase %s", maxMatches, phase)
 			break
+		}
+		if cfgSnap.IsShadowRule(m.RuleID) {
+			e.recordShadow(tx, m, shadowRec)
+			continue
 		}
 		tx.AddMatch(m)
 		if m.Score >= cfgSnap.BlockThreshold || m.Action == core.ActionBlock || m.Action == core.ActionDrop {
@@ -620,6 +659,44 @@ func (e *Engine) evaluatePhase(tx *core.Transaction, phase core.Phase, targets m
 		}
 	}
 	return nil
+}
+
+// addOrShadow adds m to the transaction, UNLESS its rule is in shadow mode, in
+// which case it is recorded as a would-block and contributes nothing to the
+// score. It is the chokepoint for engine-emitted matches that DON'T flow
+// through evaluatePhase's shadow guard (currently the bot-fingerprint
+// pseudo-rule), so shadow mode covers everything the engine itself scores.
+// Callers that also make a separate block decision must consult IsShadowRule
+// themselves; this helper only governs the score contribution.
+func (e *Engine) addOrShadow(tx *core.Transaction, m core.Match) {
+	e.mu.RLock()
+	cfgSnap := e.cfg.Snapshot()
+	shadowRec := e.shadowRecorder
+	e.mu.RUnlock()
+	if cfgSnap.IsShadowRule(m.RuleID) {
+		e.recordShadow(tx, m, shadowRec)
+		return
+	}
+	tx.AddMatch(m)
+}
+
+// recordShadow logs and reports a would-block: a match from a rule running in
+// shadow (canary) mode. The match contributes nothing to the score or the block
+// decision; this is purely the observability that lets an operator judge a
+// candidate rule's false-positive rate before promoting it to enforcement.
+func (e *Engine) recordShadow(tx *core.Transaction, m core.Match, rec ShadowRecorder) {
+	e.logger.Warnf("[SHADOW] tx=%s rule=%s would block (score=%d target=%s)", tx.ID, m.RuleID, m.Score, m.Target)
+	if rec == nil {
+		return
+	}
+	// The recorder is operator-wired (telemetry); never let a panic in it take
+	// down rule evaluation.
+	defer func() {
+		if r := recover(); r != nil {
+			e.logger.Errorf("engine: panic in shadow recorder: %v", r)
+		}
+	}()
+	rec(tx, m)
 }
 
 // evaluateSpecialRules handles logic that cannot be expressed cleanly with regex.
