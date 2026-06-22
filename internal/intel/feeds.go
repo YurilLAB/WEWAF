@@ -369,6 +369,17 @@ func (m *Manager) fetchOnce(ctx context.Context, s Source) (retErr error) {
 	st.mu.Unlock()
 
 	body, etag, modified, fromCache, err := m.tryAll(ctx, s, st)
+	if errors.Is(err, errNotModified) {
+		// Upstream says our cached version is still current: keep the existing
+		// entries untouched, record a success (not a failure), and skip the
+		// re-parse/re-apply entirely. This is the whole point of conditional GET.
+		st.mu.Lock()
+		st.totalSuccess++
+		st.lastSuccess = time.Now()
+		st.lastError = ""
+		st.mu.Unlock()
+		return nil
+	}
 	if err != nil {
 		m.totalFailures.Add(1)
 		st.mu.Lock()
@@ -451,6 +462,13 @@ func (m *Manager) tryAll(ctx context.Context, s Source, st *sourceState) ([]byte
 	body, newETag, newMod, err := m.httpFetch(ctx, s.URL, etag, modified)
 	if err == nil {
 		return body, newETag, newMod, false, nil
+	}
+	// 304 Not Modified is NOT a failure: upstream confirms our cached version
+	// is current. Propagate the sentinel directly instead of wastefully falling
+	// through to the mirror and disk cache (which would re-download and re-parse
+	// identical data, and record a spurious failure when no fresh cache exists).
+	if errors.Is(err, errNotModified) {
+		return nil, etag, modified, false, err
 	}
 	primaryErr := err
 

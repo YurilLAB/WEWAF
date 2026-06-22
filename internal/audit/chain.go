@@ -181,6 +181,12 @@ type Chain struct {
 	// chain to avoid re-open-per-append costs.
 	file *os.File
 	bw   *bufio.Writer
+	// closed is set by Close. It is distinct from a nil bw (which also means
+	// "memory-only mode"): after Close, Append must refuse rather than silently
+	// advance seq/prevMAC and — critically — write the high-water-mark AHEAD of
+	// the no-longer-written log, which would forge a trailing-truncation alarm
+	// on the next resume.
+	closed bool
 
 	// hwmPath is the high-water-mark sidecar (<FilePath>.hwm). It records the
 	// highest committed seq, MAC'd with the secret, so a "stop the daemon,
@@ -390,6 +396,12 @@ func (c *Chain) computeMAC(e *Entry, prev string) string {
 func (c *Chain) Append(kind, actor, message, metaJSON string) (Entry, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		// Refuse rather than silently advance in-memory state + the HWM while
+		// the log write is skipped — that would both lose the entry and trip a
+		// false tamper alarm on the next start.
+		return Entry{}, errors.New("audit: append on a closed chain")
+	}
 	prevSeq := c.seq
 	prevMAC := c.prevMAC
 	e := Entry{
@@ -628,6 +640,7 @@ func (c *Chain) FirstBadSeq() uint64 {
 func (c *Chain) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closed = true
 	if c.bw != nil {
 		_ = c.bw.Flush()
 		c.bw = nil

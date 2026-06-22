@@ -61,6 +61,36 @@ func TestClassifyIPRejectsDangerousRanges(t *testing.T) {
 	}
 }
 
+// TestClassifyIPRejectsNarrowerDangerousCIDRs guards the fix for a feed
+// smuggling private/loopback hosts past the guard in CIDR form: a CIDR NARROWER
+// than but contained inside a dangerous range (incl. a single private host as
+// /32) must be rejected, while genuinely public CIDRs of any width are accepted.
+func TestClassifyIPRejectsNarrowerDangerousCIDRs(t *testing.T) {
+	reject := []string{
+		"10.5.0.0/16",    // inside 10.0.0.0/8
+		"10.5.6.7/32",    // single private host in CIDR form
+		"192.168.1.0/24", // inside 192.168.0.0/16
+		"172.20.0.0/14",  // inside 172.16.0.0/12
+		"127.0.0.1/32",   // loopback in CIDR form
+		"169.254.1.0/24", // link-local
+		"fc00::1/128",    // ULA host
+		"fe80::abcd/128", // link-local v6 host
+	}
+	for _, c := range reject {
+		if _, ok := classifyIP(c); ok {
+			t.Errorf("classifyIP(%q) accepted a private/dangerous sub-range", c)
+		}
+	}
+	// Public CIDRs — including narrow ones — must STILL be accepted (no
+	// over-rejection from the 0.0.0.0/0 catch-all).
+	accept := []string{"1.2.3.0/24", "8.8.8.0/24", "8.8.8.8/32", "203.0.113.0/24", "2606:4700::/32", "2001:db8::/32"}
+	for _, c := range accept {
+		if _, ok := classifyIP(c); !ok {
+			t.Errorf("classifyIP(%q) wrongly rejected a public CIDR", c)
+		}
+	}
+}
+
 func TestParseLinePerIPRejectsEmptyResult(t *testing.T) {
 	if _, err := ParseLinePerIP([]byte("# only comments\n# nothing useful\n"), "test"); err == nil {
 		t.Fatal("expected 'no records' error")
@@ -191,6 +221,68 @@ func TestManagerFetchesAndCallsSink(t *testing.T) {
 	}
 }
 
+// TestManager304NotModifiedIsSuccess guards the conditional-GET fix: when the
+// server answers a second (conditional) request with 304 Not Modified, the
+// fetch must be a no-op SUCCESS — the sink is not re-invoked, no failure is
+// recorded, and existing entries are kept — rather than cascading to the
+// mirror/disk cache and re-parsing identical data.
+func TestManager304NotModifiedIsSuccess(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.Header.Get("If-None-Match") == "v1" {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", "v1")
+		_, _ = w.Write([]byte("1.2.3.4\n5.6.7.8\n"))
+	}))
+	defer srv.Close()
+
+	var sinkCalls atomic.Int32
+	m, err := NewManager(Config{
+		CacheDir:    t.TempDir(),
+		HTTPTimeout: 2 * time.Second,
+		MinBackoff:  time.Second,
+		MaxStaleAge: time.Hour,
+	}, func(entries []Entry) error { sinkCalls.Add(1); return nil })
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if err := m.AddSource(Source{
+		Name: "test", URL: srv.URL, Kind: KindIPv4, Confidence: ConfMedium,
+		RefreshEvery: time.Minute, Parser: ParseLinePerIP,
+	}); err != nil {
+		t.Fatalf("AddSource: %v", err)
+	}
+
+	// First fetch: 200 OK, sink invoked, ETag remembered.
+	if err := m.fetchOnce(context.Background(), m.sources[0]); err != nil {
+		t.Fatalf("fetchOnce 1: %v", err)
+	}
+	if sinkCalls.Load() != 1 {
+		t.Fatalf("first fetch: sink calls = %d want 1", sinkCalls.Load())
+	}
+
+	// Second fetch: conditional request -> 304. Must be a no-op success.
+	if err := m.fetchOnce(context.Background(), m.sources[0]); err != nil {
+		t.Fatalf("fetchOnce 2 (304) should not error, got: %v", err)
+	}
+	if sinkCalls.Load() != 1 {
+		t.Errorf("304 must NOT re-invoke the sink: calls = %d want 1", sinkCalls.Load())
+	}
+	st := m.getState("test")
+	st.mu.Lock()
+	tf, ts := st.totalFailures, st.totalSuccess
+	st.mu.Unlock()
+	if tf != 0 {
+		t.Errorf("304 recorded %d failures, want 0", tf)
+	}
+	if ts != 2 {
+		t.Errorf("totalSuccess = %d want 2 (200 + 304-as-success)", ts)
+	}
+}
+
 func TestManagerStaleCacheFallback(t *testing.T) {
 	dir := t.TempDir()
 	// Pre-populate the cache.
@@ -289,10 +381,10 @@ func TestManagerStatsReflectFetches(t *testing.T) {
 
 func TestSanitizeFilenameSafe(t *testing.T) {
 	cases := map[string]string{
-		"firehol-level1":     "firehol-level1",
-		"sslbl/ja3":          "sslbl_ja3",
-		"../etc/passwd":      "___etc_passwd",
-		"":                   "_",
+		"firehol-level1": "firehol-level1",
+		"sslbl/ja3":      "sslbl_ja3",
+		"../etc/passwd":  "___etc_passwd",
+		"":               "_",
 	}
 	for in, want := range cases {
 		if got := sanitizeFilename(in); got != want {

@@ -258,6 +258,42 @@ func TestChainDetectsTrailingTruncation(t *testing.T) {
 	}
 }
 
+// TestAppendAfterCloseRefused guards against the silent partial-failure where
+// an Append on a closed chain skipped the (now-nil) log write but still advanced
+// seq/prevMAC AND the high-water-mark — forging the HWM ahead of the on-disk log
+// and tripping a FALSE trailing-truncation alarm on the next restart.
+func TestAppendAfterCloseRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.log")
+
+	c, _ := New(Config{Secret: "stable-secret", FilePath: path})
+	for i := 0; i < 5; i++ {
+		if _, err := c.Append("config_write", "admin", "m", ""); err != nil {
+			t.Fatalf("append: %v", err)
+		}
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The post-Close append must be refused, not silently "succeed".
+	if _, err := c.Append("config_write", "admin", "ghost", ""); err == nil {
+		t.Fatal("Append after Close must return an error")
+	}
+
+	// Reopen: must verify cleanly. If the refused append had advanced the HWM,
+	// Verify would falsely report truncation here.
+	c2, _ := New(Config{Secret: "stable-secret", FilePath: path})
+	defer c2.Close()
+	ok, badSeq, total := c2.Verify()
+	if !ok {
+		t.Fatalf("reopen Verify must be clean (no forged HWM); got ok=false badSeq=%d total=%d", badSeq, total)
+	}
+	if total != 5 {
+		t.Fatalf("expected exactly 5 persisted entries, got %d", total)
+	}
+}
+
 // TestChainFilePersistence — entries written in one session are visible
 // to Verify() run in a fresh Chain on the same file.
 func TestChainFilePersistence(t *testing.T) {
@@ -346,11 +382,11 @@ func TestChainTailOrder(t *testing.T) {
 // the path on the Linux box than silently break it on Windows.
 func TestValidateAuditFilePath_BlocksDevicesAndReservedNames(t *testing.T) {
 	bad := []string{
-		"",                              // empty
-		"audit\x00.log",                 // NUL injection
-		`\\server\share\audit.log`,      // UNC
-		"//server/share/audit.log",      // POSIX-style network share
-		`\\?\C:\audit.log`,              // Windows long-path device namespace
+		"",                         // empty
+		"audit\x00.log",            // NUL injection
+		`\\server\share\audit.log`, // UNC
+		"//server/share/audit.log", // POSIX-style network share
+		`\\?\C:\audit.log`,         // Windows long-path device namespace
 		"/dev/null", "/dev/zero",
 		"/dev/random", "/dev/urandom",
 		"/dev/full", "/dev/tty",

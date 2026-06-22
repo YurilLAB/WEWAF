@@ -82,24 +82,31 @@ var dangerousFeedRanges = func() []*net.IPNet {
 	return out
 }()
 
-// isDangerousRange reports whether ipnet equals or is broader than any
-// of the always-refused ranges. The "broader-than" check uses prefix
-// length: a /0 from a feed should be rejected even if it's labelled
-// "1.2.3.4/0" (technically valid CIDR notation that still covers the
-// whole Internet).
+// isDangerousRange reports whether ipnet overlaps any of the always-refused
+// ranges, in EITHER direction:
+//   - broader-than: a feed range as broad as or broader than a dangerous range
+//     (catches "1.2.3.4/0", ::/0, and over-broad feeds), and
+//   - contained-in: a feed range NARROWER than but inside a SPECIFIC dangerous
+//     range (a /24 inside 10.0.0.0/8, or a single private host in CIDR form
+//     like "10.5.6.7/32"). Without this a feed could smuggle RFC1918 / loopback
+//     hosts past the guard in CIDR form and ban internal targets.
+//
+// The universal /0 catch-alls are excluded from the contained-in rule so an
+// ordinary public CIDR isn't rejected merely for being inside 0.0.0.0/0.
 func isDangerousRange(ipnet *net.IPNet) bool {
 	feedOnes, _ := ipnet.Mask.Size()
 	for _, bad := range dangerousFeedRanges {
-		badOnes, _ := bad.Mask.Size()
-		// Reject if the feed's prefix is at least as broad as a
-		// dangerous range AND covers the same address family.
+		// Same address family only.
 		if (bad.IP.To4() != nil) != (ipnet.IP.To4() != nil) {
 			continue
 		}
-		if feedOnes <= badOnes && bad.Contains(ipnet.IP) {
+		badOnes, _ := bad.Mask.Size()
+		// (a) feed is at least as broad as the dangerous range and overlaps it.
+		if feedOnes <= badOnes && (bad.Contains(ipnet.IP) || ipnet.Contains(bad.IP)) {
 			return true
 		}
-		if feedOnes <= badOnes && ipnet.Contains(bad.IP) {
+		// (b) feed is contained within a specific (non-/0) dangerous range.
+		if badOnes > 0 && bad.Contains(ipnet.IP) {
 			return true
 		}
 	}
