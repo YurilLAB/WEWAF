@@ -67,6 +67,12 @@ type Config struct {
 	RepHalfLifeSec           int  `json:"rep_half_life_sec"`           // default 86400 — reputation-score decay half-life
 	RepJitterSec             int  `json:"rep_jitter_sec"`              // default 60 — random ban padding (unpredictable unban)
 	RepPurgeAgeSec           int  `json:"rep_purge_age_sec"`           // default 2592000 (30d) — quiet offenders purged
+	// ReputationRiskBumpMax caps the session-risk increment a known-bad IP's
+	// decaying reputation score adds, so a returning offender (fresh cookie,
+	// lapsed ban) reaches the session block band faster. 0 = OFF (no friction);
+	// clamped to [0,100]. Only meaningful when ReputationEnabled and
+	// SessionBlockThreshold are both set.
+	ReputationRiskBumpMax int `json:"reputation_risk_bump_max"` // default 0 (off)
 	// Recidive: an IP independently flagged by >= RecidiveThreshold DISTINCT
 	// detection subsystems (engine, ddos, bruteforce, ja3, intel, session,
 	// rate) is banned for RecidiveBanDurationSec. Cross-subsystem agreement is
@@ -653,6 +659,12 @@ func (c *Config) Validate() error {
 	if c.RecidiveBanDurationSec <= 0 {
 		c.RecidiveBanDurationSec = 604800
 	}
+	if c.ReputationRiskBumpMax < 0 {
+		c.ReputationRiskBumpMax = 0
+	}
+	if c.ReputationRiskBumpMax > 100 {
+		c.ReputationRiskBumpMax = 100
+	}
 	if c.HistoryDir == "" {
 		c.HistoryDir = "history"
 	}
@@ -1055,6 +1067,7 @@ func (c *Config) Snapshot() *Config {
 		RepHalfLifeSec:           c.RepHalfLifeSec,
 		RepJitterSec:             c.RepJitterSec,
 		RepPurgeAgeSec:           c.RepPurgeAgeSec,
+		ReputationRiskBumpMax:    c.ReputationRiskBumpMax,
 		RecidiveEnabled:          c.RecidiveEnabled,
 		RecidiveThreshold:        c.RecidiveThreshold,
 		RecidiveBanDurationSec:   c.RecidiveBanDurationSec,

@@ -548,6 +548,43 @@ func (e *Engine) Consult(ip string) Reputation {
 	}
 }
 
+// frictionBump maps a decayed reputation score (0..scoreCap) to a session-risk
+// increment in [0, max]. Pure and total: NaN/negative scores yield 0, and the
+// result never exceeds max. Kept separate from FrictionBump so it can be fuzzed
+// without a live engine.
+func frictionBump(score float64, max int) int {
+	if max <= 0 || score <= 0 || math.IsNaN(score) {
+		return 0
+	}
+	if math.IsInf(score, 1) || score >= float64(max) {
+		return max // +Inf or any score at/above the cap saturates to max
+	}
+	b := int(score)
+	if b > max {
+		b = max
+	}
+	if b < 0 {
+		b = 0
+	}
+	return b
+}
+
+// FrictionBump returns a bounded session-risk increment derived from ip's
+// current (decayed) reputation score: a known-bad IP returns elevated friction
+// so it reaches the risk band faster on its NEXT visit (with a fresh cookie),
+// even after a ban has lapsed. Returns 0 for unknown/clean IPs. Result is in
+// [0, max]. RLock + arithmetic only — safe on the hot path.
+func (e *Engine) FrictionBump(ip string, max int) int {
+	if e == nil || max <= 0 {
+		return 0
+	}
+	rep := e.Consult(ip)
+	if !rep.Known {
+		return 0
+	}
+	return frictionBump(rep.Score, max)
+}
+
 // RestoreActive returns the still-active bans (banUntil in the future) so the
 // caller can re-seed the live BanList after a restart. Lapsed bans are skipped.
 // This is the restart-amnesia fix: an attacker mid-ban stays banned across a

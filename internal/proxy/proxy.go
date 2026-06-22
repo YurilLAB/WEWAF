@@ -31,6 +31,7 @@ import (
 	"wewaf/internal/ja3"
 	"wewaf/internal/limits"
 	"wewaf/internal/pow"
+	"wewaf/internal/reputation"
 	"wewaf/internal/session"
 	"wewaf/internal/shaper"
 	"wewaf/internal/telemetry"
@@ -66,6 +67,11 @@ type WAFProxy struct {
 	// rejected before any inspection or backend contact. Nil-tolerant — when
 	// unset (e.g. in a minimal test harness) banning is simply not enforced.
 	banList *core.BanList
+	// rep is the durable reputation engine, consulted on the hot path to add a
+	// bounded friction bump to a known-bad IP's session risk (returning
+	// offender, fresh cookie, lapsed ban). Nil-tolerant; friction is also gated
+	// by ReputationRiskBumpMax > 0 so the default is zero behaviour change.
+	rep *reputation.Engine
 	// ipExtractor encapsulates the trust_xff + trusted_proxies policy
 	// used to derive the real client IP. Always non-nil after
 	// construction; nil-safe for defensive callers.
@@ -134,6 +140,16 @@ func (wp *WAFProxy) AttachSessionTracker(t *session.Tracker) {
 		return
 	}
 	wp.sessions = t
+}
+
+// AttachReputation wires in the durable reputation engine so the hot path can
+// add a bounded friction bump to a known-bad IP's session risk. Pass nil to
+// disable (friction is also gated by ReputationRiskBumpMax > 0).
+func (wp *WAFProxy) AttachReputation(e *reputation.Engine) {
+	if wp == nil {
+		return
+	}
+	wp.rep = e
 }
 
 // AttachBanList wires in the shared IP ban list so the ingress path can
@@ -1180,11 +1196,29 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// changing any rule.
 	if sessID != "" && wp.sessions != nil && wp.sessions.Enabled() {
 		risk := wp.sessions.Score(sessID)
+		// Reputation friction: a known-bad IP (returning offender, fresh cookie,
+		// lapsed ban) gets a bounded bump toward the block band. Default-off
+		// (ReputationRiskBumpMax == 0) and consult is RLock+arithmetic only, so
+		// the hot path pays nothing unless the operator opts in.
+		repBump := 0
+		if bumpMax := wp.conf().ReputationRiskBumpMax; bumpMax > 0 && wp.rep.Enabled() {
+			repBump = wp.rep.FrictionBump(tx.ClientIP, bumpMax)
+			if repBump > 0 {
+				risk += repBump
+				if risk > 100 {
+					risk = 100
+				}
+			}
+		}
 		if threshold := wp.conf().SessionBlockThreshold; threshold > 0 && risk >= threshold {
+			msg := fmt.Sprintf("Session risk score %d >= threshold %d", risk, threshold)
+			if repBump > 0 {
+				msg += fmt.Sprintf(" (incl. +%d IP reputation)", repBump)
+			}
 			intr := &core.Interruption{
 				Action:  core.ActionBlock,
 				Status:  http.StatusForbidden,
-				Message: fmt.Sprintf("Session risk score %d >= threshold %d", risk, threshold),
+				Message: msg,
 			}
 			tx.SetBlocked(core.PhaseRequestBody)
 			tx.AddMatch(core.Match{

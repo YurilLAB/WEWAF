@@ -22,6 +22,7 @@
   "recidive_enabled": false,
   "recidive_threshold": 3,
   "recidive_ban_duration_sec": 604800,
+  "reputation_risk_bump_max": 0,
   "mode": "active",
   "log_level": "info",
   "audit_log_path": "",

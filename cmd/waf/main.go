@@ -532,6 +532,10 @@ func main() {
 	// reaching the backend. Wiring it here makes every ban source (manual,
 	// threat-feed, mesh, auto-mitigate) actually block the offender.
 	wp.AttachBanList(banList)
+	// Let the hot path consult the durable reputation engine for friction
+	// (a known-bad IP's session risk gets a bounded bump). Nil-tolerant and
+	// gated by reputation_risk_bump_max > 0, so default is zero behaviour change.
+	wp.AttachReputation(repEngine)
 
 	// Never-ban allowlist. Loopback and the unspecified address are always
 	// refused inside BanList; here we add the operator's explicit entries plus

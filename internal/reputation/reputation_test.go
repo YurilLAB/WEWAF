@@ -326,6 +326,35 @@ func TestFailOpen_FullBuffer(t *testing.T) {
 	}
 }
 
+func TestFrictionBump(t *testing.T) {
+	e := testEngine(t, Config{Enabled: true, HalfLife: time.Hour})
+
+	// Unknown IP -> no friction.
+	if b := e.FrictionBump("203.0.113.200", 30); b != 0 {
+		t.Errorf("unknown IP bump = %d want 0", b)
+	}
+
+	// Accumulate ~6 blocks (10 pts each) -> score ~60, decay negligible.
+	ip := "203.0.113.201"
+	for i := 0; i < 6; i++ {
+		e.RecordBlock(ip, "engine", "x")
+	}
+	if b := e.FrictionBump(ip, 30); b != 30 {
+		t.Errorf("bump should clamp to max: got %d want 30", b)
+	}
+	if b := e.FrictionBump(ip, 100); b < 50 || b > 61 {
+		t.Errorf("uncapped bump = %d want ~60", b)
+	}
+	// max<=0 and nil engine -> 0.
+	if b := e.FrictionBump(ip, 0); b != 0 {
+		t.Errorf("max 0 bump = %d want 0", b)
+	}
+	var nilE *Engine
+	if b := nilE.FrictionBump(ip, 30); b != 0 {
+		t.Errorf("nil engine bump = %d want 0", b)
+	}
+}
+
 func TestConsultDecaysScore(t *testing.T) {
 	e := testEngine(t, Config{Enabled: true, HalfLife: time.Hour})
 	ip := "203.0.113.41"

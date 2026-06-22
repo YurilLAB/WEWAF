@@ -60,3 +60,26 @@ func FuzzEscalatedDuration(f *testing.F) {
 		}
 	})
 }
+
+// FuzzFrictionBump guards the reputation-friction math: the bump must always be
+// in [0, max] and never panic for any score (incl. NaN / +Inf / negative) or
+// any max — so a degenerate score can never blow past the operator's cap or
+// crash the hot path.
+func FuzzFrictionBump(f *testing.F) {
+	f.Add(50.0, 30)
+	f.Add(-1.0, 30)
+	f.Add(150.0, 30)
+	f.Add(0.0, 0)
+	f.Fuzz(func(t *testing.T, score float64, max int) {
+		b := frictionBump(score, max)
+		if b < 0 {
+			t.Fatalf("negative bump %d (score=%g max=%d)", b, score, max)
+		}
+		if max > 0 && b > max {
+			t.Fatalf("bump %d exceeds max %d (score=%g)", b, max, score)
+		}
+		if max <= 0 && b != 0 {
+			t.Fatalf("max<=0 must give 0, got %d (score=%g)", b, score)
+		}
+	})
+}
