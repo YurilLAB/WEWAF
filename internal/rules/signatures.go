@@ -141,6 +141,27 @@ func DefaultRules() []core.Rule {
 		{ID: "SQLI-007", Name: "SQLi Hex Encoding", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Hex encoded SQLi payload", Targets: []string{"args", "body"}, Pattern: `(?i)\b0x[0-9a-f]{4,}\b`},
 		{ID: "SQLI-008", Name: "SQLi CHAR Concatenation", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "CHAR concatenation SQLi payload", Targets: []string{"args", "body"}, Pattern: `(?i)char\s*\(\s*\d{1,3}\s*(,\s*\d{1,3}\s*)*\)`},
 		{ID: "SQLI-009", Name: "SQLi Inline Comment", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "MySQL inline comment obfuscation", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)/\*!\d{5}`},
+		// SQLI-031/032/033 close a verified gap: SQLi via SUBQUERY or extraction
+		// function that uses neither UNION SELECT (SQLI-001) nor a simple OR 1=1
+		// tautology (SQLI-003/005). Confirmed bypasses: "1'||(SELECT pass FROM
+		// users)", "1' AND (SELECT 1 FROM users WHERE ...)='1", "1' AND
+		// JSON_EXTRACT(...)=1-- -". Patterns require strong SQL structure
+		// (||-concat before select; and/or + parenthesised select…from; named
+		// extraction functions) to stay low-FP.
+		{ID: "SQLI-031", Name: "SQLi Concat Subquery", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "String-concat (||) subquery injection", Targets: []string{"args", "body"}, Pattern: `(?i)\|\|\s*\(?\s*select\b`},
+		{ID: "SQLI-032", Name: "SQLi Boolean Subquery", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Parenthesised SELECT…FROM subquery in boolean context", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:and|or)\b\s*\(\s*select\b[\s\S]{0,150}?\bfrom\b`},
+		{ID: "SQLI-033", Name: "SQLi Extraction Function", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "JSON/XML extraction function used for blind/error SQLi", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:json_extract|json_unquote|json_keys|json_search|extractvalue|updatexml)\s*\(`},
+		// SQLI-034: scientific-notation token-glue (GoSecure 2021). MySQL/MariaDB
+		// treat a float literal like "1e0" as a token terminator, so "1e0UNION
+		// 1e0SELECT" parses as "UNION SELECT" while SQLI-001's `union\s+select`
+		// (which needs whitespace/comment) never matches — the keyword sits at no
+		// word boundary. Detect a float-exponent literal glued to a SQL keyword.
+		{ID: "SQLI-034", Name: "SQLi SciNotation Glue", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Scientific-notation literal gluing SQL keywords (token-splitter evasion)", Targets: []string{"args", "body"}, Pattern: `(?i)\d[eE]\d+(?:union|select|from|where|having|sleep|benchmark|procedure)`},
+		// SQLI-035: PostgreSQL jsonb operators (Team82 SQL-JSON class). A tautology
+		// expressed via "::jsonb" casts and the @> / <@ containment operators
+		// carries no OR-1=1 / UNION fingerprint. "::jsonb" and the containment
+		// operators between quoted strings are essentially never benign param text.
+		{ID: "SQLI-035", Name: "SQLi Postgres JSONB", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "PostgreSQL jsonb cast / containment operator injection", Targets: []string{"args", "body"}, Pattern: `(?i)::jsonb\b|'\s*@>\s*'|'\s*<@\s*'`},
 
 		// === NoSQL Injection ===
 		// headers target dropped — `$gt`/`$ne`/`$where`-style tokens occur in
@@ -476,6 +497,12 @@ func DefaultRules() []core.Rule {
 		// Covers -moz-binding (XBL), IE behavior:url() (HTC), javascript:/
 		// vbscript: in url(), and @import of a javascript:/data:text/html sink.
 		{ID: "XSS-014", Name: "CSS script-execution construct", Phase: core.PhaseRequestBody, Score: 70, Action: core.ActionBlock, Description: "Script-executing CSS construct (-moz-binding / behavior:url / url(javascript:) / @import javascript:)", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)-moz-binding\s*:|behavior\s*:\s*url\s*\(|(?:url|src)\s*\(\s*['"]?\s*(?:javascript|vbscript)\s*:|@import\s+(?:url\s*\(\s*)?['"]?\s*(?:javascript:|data\s*:\s*text/html)`},
+		// NOTE: a <style>@import of EXTERNAL CSS (e.g. //evil/x.css, not a
+		// javascript:/data: sink) is deliberately NOT blocked — legitimate pages
+		// @import external stylesheets constantly (Google Fonts, CDN CSS), so a
+		// generic <style>@import rule false-positives (see the Google-Fonts
+		// allow-case in TestCSSScriptExecutionBlocked). Only script-EXECUTING CSS
+		// (XSS-014) and the style= attribute vector (XSS-013) are blocked.
 		// === Information Disclosure ===
 		{ID: "INFO-001", Name: "Stack Trace Disclosure", Phase: core.PhaseResponseBody, Score: 50, Action: core.ActionLog, Description: "Stack trace or exception details leaked in response", Targets: []string{"body"}, Pattern: `(?i)(stack\s*trace|traceback\s*\(most\s*recent\s*call\s*last\)|exception\s*in\s*thread|error\s*at\s*line\s*\d+|caused\s*by\s*:\s*\S{3,})`},
 		{ID: "INFO-002", Name: "Git Directory Exposure", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "Git repository directory exposed in URL", Targets: []string{"uri"}, Pattern: `(?i)/\.git(/|$|\s|\?|&)`},
