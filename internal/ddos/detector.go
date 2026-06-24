@@ -500,10 +500,13 @@ func (d *Detector) isSensitivePath(path string) bool {
 			return true
 		}
 		// Path-segment continuation — "/admin/" or "/admin?…" or
-		// "/admin#…". The last two are theoretical (the proxy strips
-		// query / fragment before this point) but cheap to allow.
+		// "/admin#…" or "/admin;jsessionid=…". The query/fragment cases are
+		// theoretical (the proxy strips them before this point) but cheap to
+		// allow; the matrix-param ';' case is real — a servlet backend routes
+		// "/login;jsessionid=x" to /login, so it must count as sensitive or a
+		// distributed login flood evades the botnet detector via that suffix.
 		next := lp[len(prefix)]
-		if next == '/' || next == '?' || next == '#' {
+		if next == '/' || next == '?' || next == '#' || next == ';' {
 			return true
 		}
 	}

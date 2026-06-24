@@ -439,6 +439,59 @@ func (m *Metrics) RecordBlockWithCategory(ip, method, path, ruleID, category, me
 	}
 }
 
+// RecordSecurityEvent records a non-blocking, OBSERVE-ONLY security signal — a
+// JA3/UA anomaly flag, a simulated zero-trust policy, a throttle, or a PoW
+// challenge issuance. The request was NOT blocked (it continues, or is merely
+// challenged/delayed), so this deliberately does NOT increment BlockedRequests:
+// folding observe-only events into the block total inflates the headline
+// "blocked" number and the wewaf_blocked_total Prometheus counter operators
+// alert on, so a PoW-challenge wave or a staged simulate policy would read as a
+// flood of blocks. It still surfaces the event on the dashboard timeline
+// (RecentBlocks ring + per-rule counters) and fires the block hook so the
+// reputation observer sees the signal — only the block COUNT is withheld.
+// Mirrors RecordWouldBlock's discipline for shadow rules.
+func (m *Metrics) RecordSecurityEvent(ip, method, path, ruleID, category, message string, score int) {
+	if m == nil {
+		return
+	}
+	defer recoverPanic("RecordSecurityEvent")
+	now := time.Now().UTC()
+	rec := BlockRecord{
+		Timestamp:    now,
+		IP:           ip,
+		Method:       method,
+		Path:         path,
+		RuleID:       ruleID,
+		RuleCategory: category,
+		Score:        score,
+		Message:      message,
+	}
+	m.mu.Lock()
+	// NOTE: intentionally NO m.BlockedRequests++ — observe-only, not a block.
+	m.RecentBlocks = append(m.RecentBlocks, rec)
+	if len(m.RecentBlocks) > m.recentBlocksCap {
+		over := len(m.RecentBlocks) - m.recentBlocksCap
+		copy(m.RecentBlocks, m.RecentBlocks[over:])
+		m.RecentBlocks = m.RecentBlocks[:m.recentBlocksCap]
+	}
+	if ruleID != "" {
+		if m.RuleCounters == nil {
+			m.RuleCounters = make(map[string]uint64, 64)
+		}
+		if len(m.RuleCounters) < 4096 || func() bool { _, ok := m.RuleCounters[ruleID]; return ok }() {
+			m.RuleCounters[ruleID]++
+		}
+	}
+	hook := m.blockHook
+	m.mu.Unlock()
+	if hook != nil {
+		func() {
+			defer recoverPanic("blockHook")
+			hook(ip, method, path, ruleID, category, message, score)
+		}()
+	}
+}
+
 // RecordWouldBlock records a shadow (canary) would-block: a rule running in
 // shadow mode matched and WOULD have blocked, but did not (zero user impact).
 // It deliberately does NOT touch BlockedRequests or RecentBlocks — the request

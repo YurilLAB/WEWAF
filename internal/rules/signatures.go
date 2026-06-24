@@ -101,6 +101,17 @@ var queryNoSQLBracketPattern = `(?i)\[\$(?:ne|gt|gte|lt|lte|in|nin|eq|regex|wher
 // bare "{{ }}", so legitimate client-side template fragments are not flagged.
 var querySSTIPattern = `(?i)\{\{\s*(?:7\*7|config|self|_self|lipsum|joiner|namespace|cycler|request)\b|\{\{[^}]*__(?:class|mro|subclasses|globals|builtins|bases|init)__`
 
+// twigFilterGadgetPattern detects the Twig/Symfony filter-callback RCE gadget:
+// `{{ ['id']|filter('system') }}`, `|map('system')|join`, and the `|reduce`/
+// `|sort` variants. Twig's map/filter/reduce/sort apply their string argument
+// as a PHP callback (array_map / array_filter), so `filter('system')` executes
+// system() — the modern Twig RCE primitive used by tplmap/SSTImap (CVE-2025-68454,
+// CVE-2026-28784) that carries NONE of the _self.env / app.request /
+// registerUndefinedFilterCallback / getFilter( tokens SSTI-TWIG-001 keys on.
+// Anchored inside an unclosed `{{ …` with a known-dangerous PHP callable, so it
+// cannot fire on ordinary text or a benign `.map(` JS call.
+var twigFilterGadgetPattern = `(?i)\{\{[^}]*\|\s*(?:map|filter|reduce|sort)\s*\(\s*['"](?:system|exec|shell_exec|passthru|popen|proc_open|assert|eval|file_get_contents|file_put_contents|call_user_func(?:_array)?|create_function|phpinfo|scandir|md5_file|show_source|highlight_file|fwrite)\b`
+
 // procedureAnalysePattern detects MySQL's PROCEDURE ANALYSE() — used by sqlmap
 // for column-count discovery and information disclosure. The trailing "(" is
 // required so it matches the technique's call form but never the prose
@@ -162,6 +173,14 @@ func DefaultRules() []core.Rule {
 		// carries no OR-1=1 / UNION fingerprint. "::jsonb" and the containment
 		// operators between quoted strings are essentially never benign param text.
 		{ID: "SQLI-035", Name: "SQLi Postgres JSONB", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "PostgreSQL jsonb cast / containment operator injection", Targets: []string{"args", "body"}, Pattern: `(?i)::jsonb\b|'\s*@>\s*'|'\s*<@\s*'`},
+		// SQLI-036: a parenthesised SELECT…FROM subquery anchored to an ORDER BY /
+		// GROUP BY clause — the sort/group-position injection point that carries
+		// neither a UNION nor an AND/OR boolean keyword, so SQLI-032's boolean
+		// anchor misses it. The paren must follow "by" directly (tighter than
+		// SQLI-032), and "ORDER BY (SELECT … FROM …)" in a parameter is SQL, not
+		// natural text. Closes the keyword-anchoring blind spot for the same
+		// subquery-exfil class SQLI-031..033 target.
+		{ID: "SQLI-036", Name: "SQLi Clause Subquery", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Parenthesised SELECT…FROM subquery in an ORDER BY / GROUP BY clause", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:order|group)\s+by\b\s*\(\s*select\b[\s\S]{0,160}?\bfrom\b`},
 
 		// === NoSQL Injection ===
 		// headers target dropped — `$gt`/`$ne`/`$where`-style tokens occur in
@@ -203,6 +222,15 @@ func DefaultRules() []core.Rule {
 
 		// === Prototype Pollution ===
 		{ID: "PROTO-001", Name: "Prototype Pollution", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Prototype pollution payload", Targets: []string{"args", "body"}, Pattern: `(?i)(__proto__|constructor\.prototype|constructor\[prototype\])`},
+		// PROTO-003: the bracket-notation prototype-pollution form. PROTO-001 only
+		// LOGS, and the blocking rules (PROTO-POLL-001 JSON colon-brace, CRS-934130
+		// quoted `constructor["prototype"]`) miss the UNQUOTED query/urlencoded
+		// bracket form `constructor[prototype]` and `__proto__[…]` — the natural
+		// wire encoding for nested params (qs/Express a[b][c]). The engine already
+		// blocks the JSON/quoted forms; this closes the inconsistency where the
+		// equivalent unquoted bracket vector merely logged. Dot-access
+		// `constructor.prototype` is deliberately NOT matched (benign JS).
+		{ID: "PROTO-003", Name: "Prototype Pollution Bracket", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Bracket-notation prototype pollution (__proto__[…] / constructor[prototype])", Targets: []string{"args", "body"}, Pattern: `(?i)(?:__proto__\s*\[|constructor\s*\[\s*["']?prototype)`},
 
 		// === JNDI / Log4j ===
 		{ID: "JNDI-001", Name: "JNDI Lookup", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "JNDI lookup payload", Targets: []string{"args", "headers", "body"}, Pattern: `(?i)\$\{jndi:`},
@@ -531,6 +559,7 @@ func DefaultRules() []core.Rule {
 		// --- SSTI (Server-Side Template Injection) ---
 		{ID: "SSTI-JINJA-001", Name: "Jinja2 Template Injection", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Jinja2 {{ }} with attribute traversal", Targets: []string{"args", "body", "uri"}, Pattern: `\{\{[^{}]*(?:config|self|request|__class__|__mro__|__subclasses__|__globals__|__import__)[^{}]*\}\}`},
 		{ID: "SSTI-TWIG-001", Name: "Twig / Symfony SSTI", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Twig _self or app object escape", Targets: []string{"args", "body"}, Pattern: `\{\{[^{}]*(?:_self\.env|app\.request|registerUndefinedFilterCallback|getFilter\()[^{}]*\}\}`},
+		{ID: "SSTI-TWIG-002", Name: "Twig filter-callback RCE gadget", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Twig |filter/|map/|reduce/|sort('system') PHP-callback RCE gadget", Targets: []string{"args", "body"}, Pattern: twigFilterGadgetPattern},
 		{ID: "SSTI-ERB-001", Name: "ERB / Ruby SSTI", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "ERB <%= ... system/exec ... %>", Targets: []string{"args", "body"}, Pattern: `(?i)<%=?\s*(?:system|exec|%x|IO\.popen|open3|File\.(?:read|open)|eval|instance_eval)\b`},
 		{ID: "SSTI-VELOCITY-001", Name: "Velocity SSTI", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Velocity #set / $class.forName", Targets: []string{"args", "body"}, Pattern: `(?i)\$class\.(?:forName|newInstance|getDeclared)`},
 		{ID: "SSTI-FREEMARKER-001", Name: "Freemarker SSTI", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "Freemarker Execute or freemarker.template.utility", Targets: []string{"args", "body"}, Pattern: `(?i)<#assign[^>]*freemarker\.template\.utility\.Execute`},

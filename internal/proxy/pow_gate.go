@@ -135,9 +135,10 @@ func (wp *WAFProxy) servePoWChallenge(w http.ResponseWriter, r *http.Request, sc
 	tokenJS, saltJS, nextJS := session.PoWPageInjectValues(ser, saltB64, next)
 	fmt.Fprintf(w, session.PoWPageHTML, tokenJS, saltJS, difficulty, nextJS)
 	wp.powIssued.Add(1)
-	// Log-only history event so operators can see PoW activity in the
-	// dashboard timeline.
-	wp.metrics.RecordBlockWithCategory(ip, r.Method, r.URL.Path,
+	// Observe-only history event so operators can see PoW activity in the
+	// dashboard timeline — a challenge was ISSUED, not a block (the user
+	// solves it and proceeds), so it must not inflate the block total.
+	wp.metrics.RecordSecurityEvent(ip, r.Method, r.URL.Path,
 		"POW-ISSUED", "pow",
 		fmt.Sprintf("pow gate fired (difficulty=%d score=%d)", difficulty, score), 0)
 }

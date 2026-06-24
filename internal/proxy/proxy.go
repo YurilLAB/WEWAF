@@ -695,6 +695,18 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Count EVERY admitted request up front — before the early block stages
+	// (header-size, harden, ban, DDoS, rate-limit, zero-trust) — so a request
+	// those stages reject is still in TotalRequests / unique-IPs / the per-IP
+	// request_count. Counting it only after they ran (the old position) made
+	// the dashboard's blocked-vs-total ratio nonsensical under a flood, where
+	// blocked could approach or exceed the counted total.
+	reqBytesIn := int(r.ContentLength)
+	if reqBytesIn < 0 {
+		reqBytesIn = 0
+	}
+	wp.metrics.RecordRequest(wp.ipExtractor.ClientIP(r), reqBytesIn)
+
 	// Reject requests with extremely large headers (>64KB total).
 	var totalHeaderSize int
 	for k, v := range r.Header {
@@ -704,6 +716,13 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if totalHeaderSize > 64*1024 {
+		// Count + surface the rejection: an oversized-header probe (a classic
+		// resource-exhaustion / inspection-limit evasion attempt) used to leave
+		// zero trace — no metric, no history, no audit, and it happens before
+		// the client IP is otherwise resolved.
+		ip := wp.ipExtractor.ClientIP(r)
+		wp.metrics.RecordBlock(ip, r.Method, r.URL.Path, "HEADER-TOO-LARGE", "request header fields too large", 100)
+		wp.auditWrite("size_reject", ip, "request header fields too large", "HEADER-TOO-LARGE")
 		http.Error(w, "Request Header Fields Too Large", http.StatusRequestHeaderFieldsTooLarge)
 		return
 	}
@@ -802,7 +821,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if ar := wp.ja3Anomaly.Check(r.UserAgent(), fp); ar.ScoreBump > 0 {
 					wp.sessions.RecordUAAnomaly(sessID, ar.ScoreBump, ar.HumanReason)
 					ip := wp.ipExtractor.ClientIP(r)
-					wp.metrics.RecordBlockWithCategory(ip, r.Method, r.URL.Path,
+					wp.metrics.RecordSecurityEvent(ip, r.Method, r.URL.Path,
 						"JA3-UA-ANOMALY", "ja3", "ua/tls disagreement: "+ar.HumanReason, 0)
 				}
 			}
@@ -820,7 +839,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// out of the block totals.
 			if verdict.Match == "bad" {
 				ip := wp.ipExtractor.ClientIP(r)
-				wp.metrics.RecordBlockWithCategory(ip, r.Method, r.URL.Path,
+				wp.metrics.RecordSecurityEvent(ip, r.Method, r.URL.Path,
 					"JA3-FLAG:"+hash, "ja3", "ja3 fingerprint match: "+verdict.Reason, 0)
 			}
 		}
@@ -972,12 +991,20 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch decision {
 		case zerotrust.DecisionDeny:
 			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "ZERO-TRUST:"+polID, reason, 100)
+			// A policy DENY is a low-volume, forensically-relevant decision —
+			// record it to the tamper-evident audit chain like the other
+			// enforced blocks (ban/harden/ja3). (The high-volume DDoS/rate-limit
+			// verdicts deliberately do NOT audit per-request; they are aggregate-
+			// counted in metrics+history, and per-request audit under a flood
+			// would let an attacker bloat the MAC-chained log.)
+			wp.auditWrite("zero_trust_deny", clientIP, reason, "ZERO-TRUST:"+polID)
 			http.Error(w, "Forbidden: "+reason, http.StatusForbidden)
 			return
 		case zerotrust.DecisionSimulate:
-			// Would-block — emit as a log-only record so the dashboard's
-			// simulate stats accumulate without breaking production traffic.
-			wp.metrics.RecordBlockWithCategory(clientIP, r.Method, r.URL.Path,
+			// Would-block — emit as an OBSERVE-ONLY record so the dashboard's
+			// simulate stats accumulate without inflating the block total
+			// (the request continues to production).
+			wp.metrics.RecordSecurityEvent(clientIP, r.Method, r.URL.Path,
 				"ZERO-TRUST-SIM:"+polID, "zero_trust_simulate", reason, 0)
 		}
 	}
@@ -991,13 +1018,10 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create WAF transaction.
+	// Create WAF transaction. (The request was already counted in
+	// TotalRequests / unique-IPs at the top of ServeHTTP so early-blocked
+	// requests are still in the denominator.)
 	tx := core.NewTransaction(w, r, wp.ipExtractor)
-	reportedLen := int(r.ContentLength)
-	if reportedLen < 0 {
-		reportedLen = 0
-	}
-	wp.metrics.RecordRequest(tx.ClientIP, reportedLen)
 
 	// WebSocket / upgrade passthrough: skip deep inspection.
 	if isWebSocket(r) {
@@ -1009,6 +1033,11 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Enforce body size limit before reading.
 	if r.ContentLength > wp.conf().MaxBodyBytes && r.ContentLength > 0 {
+		// Surface the rejection — an oversized body (resource exhaustion /
+		// push-payload-past-inspection attempt) used to leave no metric,
+		// history, or audit trace, only a log line.
+		wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "BODY-TOO-LARGE", "request body exceeds size limit", 100)
+		wp.auditWrite("size_reject", clientIP, "request body exceeds size limit", "BODY-TOO-LARGE")
 		http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
 		wp.eng.ProcessLogging(tx)
 		return
@@ -1031,6 +1060,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			wp.eng.LogError("proxy: body read error: %v", err)
 			_ = r.Body.Close()
 			r.Body = io.NopCloser(&bytes.Reader{})
+			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "BODY-READ-ERROR", "request body read error", 100)
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			wp.eng.ProcessLogging(tx)
 			return
@@ -1039,6 +1069,8 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if int64(len(body)) > limit {
 			// Trim the over-read byte and reject so the rule engine
 			// sees a deterministic block rather than a partial body.
+			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "BODY-TOO-LARGE", "request body exceeds size limit", 100)
+			wp.auditWrite("size_reject", clientIP, "request body exceeds size limit (chunked over-read)", "BODY-TOO-LARGE")
 			http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
 			wp.eng.ProcessLogging(tx)
 			return
@@ -1061,6 +1093,9 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if wp.ddos.RecordSlowRead(len(body), slowAge) {
 			wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "DDOS-SLOW-READ",
 				"slow body read", 0)
+			// Slowloris is a low-volume, deliberate attack — worth a
+			// tamper-evident trail (unlike the high-volume volumetric verdicts).
+			wp.auditWrite("ddos_slow_read", clientIP, "slow body read", "DDOS-SLOW-READ")
 			http.Error(w, "Request Timeout", http.StatusRequestTimeout)
 			wp.eng.ProcessLogging(tx)
 			return
@@ -1074,6 +1109,7 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if decoded, reason := maybeDecompressBody(r.Header, body,
 				wp.conf().DecompressRatioCap, wp.conf().MaxDecompressBytes); reason != "" {
 				wp.metrics.RecordBlock(clientIP, r.Method, r.URL.Path, "COMPRESS-BOMB", reason, 100)
+				wp.auditWrite("compress_bomb", clientIP, reason, "COMPRESS-BOMB")
 				http.Error(w, "Payload Too Large", http.StatusRequestEntityTooLarge)
 				wp.eng.ProcessLogging(tx)
 				return
@@ -1144,7 +1180,8 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				Message:   res.Reason,
 				Timestamp: time.Now().UTC(),
 			})
-			wp.auditWrite("grpc_block", clientIP, res.Reason, "")
+			// handleBlock writes the audit entry (kind="block"); don't pre-write
+			// a second "grpc_block" entry for the same request (double-report).
 			wp.handleBlock(w, tx, intr)
 			return
 		}
@@ -1655,11 +1692,40 @@ func isWebSocket(r *http.Request) bool {
 	return dpi.WSUpgradeRequest(r) && r.Header.Get("Sec-WebSocket-Key") != ""
 }
 
+// loginPathVersionRe generalises the versioned REST login endpoint so a
+// deployment exposing /api/v3/login (or /v5/auth, …) is still recognised — the
+// static list below only enumerated v1/v2, so v3+ silently evaded the
+// brute-force counter.
+var loginPathVersionRe = regexp.MustCompile(`^/(?:api/)?v\d+/(?:login|auth|authenticate|signin)$`)
+
+// stripMatrixParams removes RFC 3986 matrix parameters (";jsessionid=…" and
+// friends) from every path segment. Servlet containers (Tomcat/Jetty/Spring)
+// strip these before routing, so "/login;jsessionid=x" reaches the /login
+// handler — a WAF that matched the raw path would never count those credential
+// attempts. Cheap no-op when the path carries no ';'.
+func stripMatrixParams(p string) string {
+	if !strings.Contains(p, ";") {
+		return p
+	}
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		if j := strings.IndexByte(s, ';'); j >= 0 {
+			segs[i] = s[:j]
+		}
+	}
+	return strings.Join(segs, "/")
+}
+
 func isLoginRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	path := strings.ToLower(strings.TrimRight(r.URL.Path, "/"))
+	// Normalise the path the way the backend routes it before matching:
+	// strip matrix params, drop a trailing slash, lower-case. Without this,
+	// /login;jsessionid=x and /api/v3/login both evade brute-force counting
+	// (the counter hangs entirely off this predicate), enabling unthrottled
+	// credential stuffing against a very common backend class.
+	path := strings.ToLower(strings.TrimRight(stripMatrixParams(r.URL.Path), "/"))
 	loginPaths := []string{
 		"/login", "/auth", "/signin", "/wp-login.php", "/admin/login",
 		"/api/login", "/api/auth", "/oauth/token", "/v1/login",
@@ -1671,7 +1737,7 @@ func isLoginRequest(r *http.Request) bool {
 			return true
 		}
 	}
-	return false
+	return loginPathVersionRe.MatchString(path)
 }
 
 // EgressProxy intercepts outbound HTTP requests from the backend app.
@@ -1989,7 +2055,20 @@ func (ep *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		buf := make([]byte, n)
 		read, _ := io.ReadFull(resp.Body, buf)
 		inspected = buf[:read]
-		if findings := inspectEgressResponseBody(inspected); len(findings) > 0 {
+		// Scan the DECOMPRESSED view, not the raw bytes: a gzip/br/deflate
+		// response (the most common encoding, and what Go's transport leaves
+		// compressed whenever the backend sets its own Accept-Encoding) would
+		// otherwise hide AWS keys / PANs from the plaintext scanner — exactly
+		// the bypass the sibling reverse-proxy response path already closes.
+		// Decompress a COPY for inspection only; `inspected` is still forwarded
+		// verbatim so the client gets the Content-Encoding it expects. A
+		// truncated prefix decodes to a usable prefix (maybeDecompressBody
+		// tolerates ErrUnexpectedEOF).
+		scanBuf := inspected
+		if decoded, _ := maybeDecompressBody(resp.Header, inspected, 100, respLimit); len(decoded) > 0 {
+			scanBuf = decoded
+		}
+		if findings := inspectEgressResponseBody(scanBuf); len(findings) > 0 {
 			ep.exfilDetected.Add(1)
 			kinds := make([]string, 0, len(findings))
 			for _, f := range findings {

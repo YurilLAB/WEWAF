@@ -3,12 +3,17 @@
 // without any ML. It is strictly READ-ONLY: it queries the history store and
 // computes rankings, never mutating state or touching the request path.
 //
-// Two signals come out of a mining pass:
-//   - FP-prone rules: rules ranked by block volume AND the number of DISTINCT
-//     IPs they blocked. A rule firing on a huge, diverse client population is a
-//     false-positive candidate to review or move to shadow mode (S2); a rule
-//     firing on a handful of IPs is doing its job. (Cloudflare's blocked-corpus
-//     feedback loop, on-box.)
+// Three signals come out of a mining pass:
+//   - Top rules (TopRules): rules ranked by raw block VOLUME — the "busiest
+//     rules" activity view.
+//   - FP candidates (FPCandidates): rules ranked by the BREADTH of the client
+//     population they block (DISTINCT IPs first). A rule firing across a huge,
+//     diverse population is the false-positive candidate to review or move to
+//     shadow mode (S2); a rule firing many times on a handful of IPs is doing
+//     its job. Ranking these by volume (as the activity view does) buries the
+//     diverse-population FP candidate below busy-but-correct scanner rules and
+//     the TopN cut drops it — so this is a SEPARATE, diversity-first ranking.
+//     (Cloudflare's blocked-corpus feedback loop, on-box.)
 //   - Repeat offenders: IPs ranked by block ratio (blocks ÷ requests) over a
 //     minimum request volume — promotion candidates for a longer ban.
 package corpus
@@ -49,6 +54,7 @@ type Report struct {
 	To              time.Time      `json:"to"`
 	TotalBlocks     int            `json:"total_blocks"`
 	TopRules        []RuleStat     `json:"top_rules"`
+	FPCandidates    []RuleStat     `json:"fp_candidates"`
 	RepeatOffenders []OffenderStat `json:"repeat_offenders"`
 	GeneratedAt     time.Time      `json:"generated_at"`
 }
@@ -92,6 +98,7 @@ func Mine(src Source, now time.Time, opts Options) (*Report, error) {
 		To:              now,
 		GeneratedAt:     now,
 		TopRules:        []RuleStat{},
+		FPCandidates:    []RuleStat{},
 		RepeatOffenders: []OffenderStat{},
 	}
 	if src == nil {
@@ -104,6 +111,7 @@ func Mine(src Source, now time.Time, opts Options) (*Report, error) {
 	}
 	rep.TotalBlocks = len(blocks)
 	rep.TopRules = topRules(blocks, opts.TopN)
+	rep.FPCandidates = fpCandidateRules(blocks, opts.TopN)
 
 	ips, err := src.QueryIPs(rep.From, rep.To, opts.QueryLimit)
 	if err != nil {
@@ -113,9 +121,9 @@ func Mine(src Source, now time.Time, opts Options) (*Report, error) {
 	return rep, nil
 }
 
-// topRules aggregates blocks per rule ID, counting total blocks and the number
-// of distinct IPs each rule blocked, ranked by block volume.
-func topRules(blocks []history.BlockEvent, topN int) []RuleStat {
+// aggregateRules collapses blocks into one RuleStat per rule ID (total blocks +
+// distinct-IP count). Shared by both rule rankings so they agree on the counts.
+func aggregateRules(blocks []history.BlockEvent) []RuleStat {
 	type agg struct {
 		category string
 		count    int
@@ -143,6 +151,12 @@ func topRules(blocks []history.BlockEvent, topN int) []RuleStat {
 	for id, a := range byRule {
 		out = append(out, RuleStat{RuleID: id, Category: a.category, BlockCount: a.count, DistinctIPs: len(a.ips)})
 	}
+	return out
+}
+
+// topRules ranks rules by raw block VOLUME — the busiest-rules activity view.
+func topRules(blocks []history.BlockEvent, topN int) []RuleStat {
+	out := aggregateRules(blocks)
 	// Rank by block volume, then distinct IPs, then ID for a stable order.
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].BlockCount != out[j].BlockCount {
@@ -150,6 +164,39 @@ func topRules(blocks []history.BlockEvent, topN int) []RuleStat {
 		}
 		if out[i].DistinctIPs != out[j].DistinctIPs {
 			return out[i].DistinctIPs > out[j].DistinctIPs
+		}
+		return out[i].RuleID < out[j].RuleID
+	})
+	if len(out) > topN {
+		out = out[:topN]
+	}
+	return out
+}
+
+// fpCandidateRules ranks rules by the BREADTH of the client population they
+// block (DISTINCT IPs first), surfacing false-positive candidates: a rule
+// firing across a huge, diverse population is likely catching legitimate
+// traffic and is a promote-to-shadow (S2) candidate, whereas a rule firing many
+// times on a handful of IPs is doing its job. This is the ranking the package
+// contract describes; topRules (volume-first) buried these candidates below
+// busy-but-correct scanner rules and the TopN cut dropped them. A rule that hit
+// only a single IP cannot be a diverse-population FP, so it is excluded.
+func fpCandidateRules(blocks []history.BlockEvent, topN int) []RuleStat {
+	agg := aggregateRules(blocks)
+	out := make([]RuleStat, 0, len(agg))
+	for _, r := range agg {
+		if r.DistinctIPs < 2 {
+			continue // single-IP rule is not a diverse-population FP candidate
+		}
+		out = append(out, r)
+	}
+	// Rank by distinct-IP breadth, then volume, then ID for a stable order.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].DistinctIPs != out[j].DistinctIPs {
+			return out[i].DistinctIPs > out[j].DistinctIPs
+		}
+		if out[i].BlockCount != out[j].BlockCount {
+			return out[i].BlockCount > out[j].BlockCount
 		}
 		return out[i].RuleID < out[j].RuleID
 	})

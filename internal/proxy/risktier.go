@@ -144,7 +144,9 @@ func (wp *WAFProxy) applyThrottle(ctx context.Context, r *http.Request, score in
 	waited := throttleDelay(ctx, delayMs)
 	if wp.metrics != nil && wp.ipExtractor != nil {
 		ip := wp.ipExtractor.ClientIP(r)
-		wp.metrics.RecordBlockWithCategory(ip, r.Method, r.URL.Path,
+		// Observe-only: the request was delayed, not blocked — keep it out of
+		// the block total (it continues to full inspection after the delay).
+		wp.metrics.RecordSecurityEvent(ip, r.Method, r.URL.Path,
 			"SESSION-THROTTLE", "session",
 			fmt.Sprintf("session throttled %dms (score=%d)", int(waited.Milliseconds()), score), 0)
 	}

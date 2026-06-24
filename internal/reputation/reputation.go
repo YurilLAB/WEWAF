@@ -86,6 +86,14 @@ type Config struct {
 	Recidive          bool
 	RecidiveThreshold int           // distinct subsystems required (<=0 disables)
 	RecidiveBan       time.Duration // base duration for a recidive ban
+	// RecidiveWindow bounds how long a subsystem flag counts toward consensus.
+	// Without it the subsystem bitmask only ever grows (it is never decayed or
+	// windowed like score/blockCount), so an IP flagged by N distinct subsystems
+	// weeks apart stays a permanent recidive-ban magnet — re-banned on any single
+	// later block, which punishes reformed or shared (CGNAT) IPs. When the IP has
+	// been quiet longer than this, the accumulated consensus is reset so recidive
+	// requires CONCURRENT multi-subsystem hostility. Defaults to OffenseWindow.
+	RecidiveWindow time.Duration
 }
 
 func (c Config) sane() Config {
@@ -115,6 +123,11 @@ func (c Config) sane() Config {
 	}
 	if c.RecidiveBan <= 0 {
 		c.RecidiveBan = 7 * 24 * time.Hour
+	}
+	if c.RecidiveWindow <= 0 {
+		// Tie the consensus window to OffenseWindow by default (both answer
+		// "how long do we consider offenses related").
+		c.RecidiveWindow = c.OffenseWindow
 	}
 	return c
 }
@@ -328,6 +341,14 @@ func (e *Engine) RecordBlock(ip, subsystem, reason string) Decision {
 	en.score += scorePerBlock
 	if en.score > scoreCap {
 		en.score = scoreCap
+	}
+	// Window the recidive consensus: if this IP has been quiet for longer than
+	// RecidiveWindow, the previously-accumulated subsystem flags are stale —
+	// reset them so consensus reflects CONCURRENT multi-subsystem hostility, not
+	// bits set far apart over a lifetime. (Checked against the PRIOR lastOffense,
+	// before it is advanced to now below.)
+	if cfg.RecidiveWindow > 0 && !en.lastOffense.IsZero() && now.Sub(en.lastOffense) > cfg.RecidiveWindow {
+		en.subsystems = 0
 	}
 	en.subsystems |= subsystemBit(subsystem)
 	en.lastOffense = now

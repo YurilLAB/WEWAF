@@ -229,6 +229,12 @@ func (v *Validator) Validate(bodyJSON []byte, role string) Result {
 		if primaryOpName == "" {
 			primaryOpName = opNames[idx]
 		}
+		// seen tracks fragment names currently on the expansion stack so a
+		// cyclic fragment (illegal per spec, but an attacker can still send
+		// one) can't drive infinite recursion. Document-scoped; the walker
+		// adds/removes names around each spread so a fragment referenced in
+		// sibling branches is still counted each time.
+		seen := make(map[string]bool)
 		for _, op := range doc.Operations {
 			if op.Operation == ast.Subscription {
 				v.statsSubscriptions.Add(1)
@@ -238,7 +244,7 @@ func (v *Validator) Validate(bodyJSON []byte, role string) Result {
 					break
 				}
 			}
-			walkSelectionSet(op.SelectionSet, schema, rootTypeFor(schema, op), 1, &total, role, cfg)
+			walkSelectionSet(op.SelectionSet, schema, rootTypeFor(schema, op), 1, &total, role, cfg, doc.Fragments, seen)
 			if total.blocked {
 				break
 			}
@@ -314,8 +320,12 @@ func rootTypeFor(schema *ast.Schema, op *ast.OperationDefinition) *ast.Definitio
 }
 
 // walkSelectionSet is the recursive AST walker. Depth is 1-based so a
-// top-level field is depth=1.
-func walkSelectionSet(sel ast.SelectionSet, schema *ast.Schema, parent *ast.Definition, depth int, acc *countStats, role string, cfg *Config) {
+// top-level field is depth=1. frags carries the document's named-fragment
+// definitions so a `...Frag` spread can be resolved and its hidden
+// depth/field cost counted (a depth limit that ignores fragment spreads is
+// trivially bypassed by hiding the nesting behind named fragments). seen
+// guards against fragment cycles.
+func walkSelectionSet(sel ast.SelectionSet, schema *ast.Schema, parent *ast.Definition, depth int, acc *countStats, role string, cfg *Config, frags ast.FragmentDefinitionList, seen map[string]bool) {
 	if depth > acc.maxDepth {
 		acc.maxDepth = depth
 	}
@@ -326,6 +336,16 @@ func walkSelectionSet(sel ast.SelectionSet, schema *ast.Schema, parent *ast.Defi
 	}
 	for _, s := range sel {
 		if acc.blocked {
+			return
+		}
+		// Amplification guard: resolving named fragments means a small query
+		// can expand to a large one (a fragment spread N times, each body
+		// spreading the next). Once the expanded field count passes the
+		// configured cap the query is over-limit and WILL be blocked, so we
+		// stop walking. This bounds total work to MaxFields+O(stack-depth)
+		// nodes regardless of fragment fan-out — closing the validator-side
+		// DoS that naive fragment recursion would otherwise open.
+		if cfg != nil && cfg.MaxFields > 0 && acc.fields > cfg.MaxFields {
 			return
 		}
 		switch f := s.(type) {
@@ -359,16 +379,33 @@ func walkSelectionSet(sel ast.SelectionSet, schema *ast.Schema, parent *ast.Defi
 					}
 				}
 			}
-			walkSelectionSet(f.SelectionSet, schema, childType, depth+1, acc, role, cfg)
+			walkSelectionSet(f.SelectionSet, schema, childType, depth+1, acc, role, cfg, frags, seen)
 		case *ast.InlineFragment:
 			// Inline fragments don't carry a role check themselves, but
 			// their body still counts toward depth/field/alias limits.
-			walkSelectionSet(f.SelectionSet, schema, parent, depth, acc, role, cfg)
+			walkSelectionSet(f.SelectionSet, schema, parent, depth, acc, role, cfg, frags, seen)
 		case *ast.FragmentSpread:
-			// Named fragments are resolved lazily by gqlparser only when
-			// schema + query are loaded together; without that we can't
-			// recurse. Count the spread itself and move on.
+			// Resolve the named fragment and walk its body at the SAME depth
+			// (a spread inlines the fragment, like an inline fragment). Hidden
+			// nesting behind `...Frag` therefore counts toward the depth/field
+			// limits instead of being a free bypass. seen breaks cycles.
 			acc.fields++
+			if seen[f.Name] {
+				continue // cycle — already on the expansion stack
+			}
+			def := frags.ForName(f.Name)
+			if def == nil {
+				continue // undefined fragment; the backend will reject it
+			}
+			fragParent := parent
+			if schema != nil && def.TypeCondition != "" {
+				if t, ok := schema.Types[def.TypeCondition]; ok {
+					fragParent = t
+				}
+			}
+			seen[f.Name] = true
+			walkSelectionSet(def.SelectionSet, schema, fragParent, depth, acc, role, cfg, frags, seen)
+			delete(seen, f.Name)
 		}
 	}
 }
