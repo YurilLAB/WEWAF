@@ -119,6 +119,12 @@ var (
 	// attacker-supplied key sources (CVE-2018-0114 class). Log-level: some
 	// issuers legitimately use jku, so it is recorded rather than blocked.
 	jwtJkuRe = regexp.MustCompile(`(?i)"(?:jku|x5u)"\s*:`)
+	// jwtJwkRe flags a token carrying its OWN public key in the header (embedded
+	// JWK). A verifier that trusts it accepts an attacker-self-signed token
+	// (CVE-2018-0114). Log-level, NOT block: RFC 9449 DPoP proof tokens
+	// legitimately embed a "jwk" header, so this is a signal to surface, not an
+	// automatic block (same rationale as jku/x5u).
+	jwtJwkRe = regexp.MustCompile(`(?i)"jwk"\s*:\s*\{`)
 
 	// nullByteRe detects a NUL byte in the RAW request target — encoded
 	// (%00, %2500, …) or literal. The canonicalizer strips NUL before rules
@@ -1143,12 +1149,29 @@ func (e *Engine) readBodyString(r *http.Request) (string, error) {
 // is bounded (maxJWTs) so a body packed with eyJ-prefixed strings can't blow
 // up cost, and never panics on malformed base64.
 func detectJWTAttacks(s string) []core.Match {
-	const maxJWTs = 8
+	// Inspect up to maxJWTs tokens (decoding a base64url header is cheap, and
+	// this input is a single size-bounded header/arg value, not the body). The
+	// cap previously (8) let an attacker bury a malicious token — alg:none /
+	// kid-injection — behind a handful of inert decoys so the scan stopped
+	// before reaching it. Now the evasion is closed from both sides: with
+	// <=maxJWTs tokens every one is inspected (so a buried malicious token IS
+	// caught), and MORE than maxJWTs tokens is itself blocked as a flood — no
+	// legitimate request carries this many JWTs, so there is no way to push a
+	// malicious token past the cap without tripping the block.
+	const maxJWTs = 32
 	if !strings.Contains(s, "eyJ") {
 		return nil
 	}
 	var matches []core.Match
-	found := jwtRe.FindAllString(s, maxJWTs)
+	found := jwtRe.FindAllString(s, maxJWTs+1)
+	if len(found) > maxJWTs {
+		matches = append(matches, core.Match{
+			RuleID: "JWT-006", RuleName: "Excessive JWT tokens", Phase: core.PhaseRequestHeaders,
+			Target: "jwt", Value: strconv.Itoa(len(found)), Score: 100, Action: core.ActionBlock,
+			Message: "anomalous number of JWT-shaped tokens (scan-cap-evasion flood)", Timestamp: time.Now().UTC(),
+		})
+		found = found[:maxJWTs]
+	}
 	for _, tok := range found {
 		seg := tok
 		if i := strings.IndexByte(seg, '.'); i >= 0 {
@@ -1164,7 +1187,7 @@ func detectJWTAttacks(s string) []core.Match {
 			}
 		}
 		hdr := string(hdrBytes)
-		if !strings.Contains(hdr, "alg") && !strings.Contains(hdr, "kid") && !strings.Contains(hdr, "jku") && !strings.Contains(hdr, "x5u") {
+		if !strings.Contains(hdr, "alg") && !strings.Contains(hdr, "kid") && !strings.Contains(hdr, "jku") && !strings.Contains(hdr, "x5u") && !strings.Contains(hdr, "jwk") {
 			continue // decoded to something that isn't a JWT header
 		}
 		if jwtAlgNoneRe.MatchString(hdr) {
@@ -1186,6 +1209,13 @@ func detectJWTAttacks(s string) []core.Match {
 				RuleID: "JWT-004", RuleName: "JWT external key source", Phase: core.PhaseRequestHeaders,
 				Target: "jwt.header", Value: trunc(hdr, 64), Score: 50, Action: core.ActionLog,
 				Message: "JWT header references an external key set (jku/x5u)", Timestamp: time.Now().UTC(),
+			})
+		}
+		if jwtJwkRe.MatchString(hdr) {
+			matches = append(matches, core.Match{
+				RuleID: "JWT-005", RuleName: "JWT embedded key (jwk)", Phase: core.PhaseRequestHeaders,
+				Target: "jwt.header", Value: trunc(hdr, 64), Score: 50, Action: core.ActionLog,
+				Message: "JWT header embeds its own key (jwk) — self-signed-key risk (CVE-2018-0114)", Timestamp: time.Now().UTC(),
 			})
 		}
 	}

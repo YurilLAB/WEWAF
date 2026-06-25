@@ -178,6 +178,19 @@ func evaluateHardening(r *http.Request) hardenVerdict {
 				RuleID: "HARDEN-HOST-CTL",
 			}
 		}
+		// Authority-syntax sanity: a Host is host[:port] (or [v6]:port), so none
+		// of these belong in it. They signal Host-header injection / absolute-URI
+		// smuggling / deceptive-userinfo tricks ("evil.com/path", "a@evil.com",
+		// "evil.com x") used for password-reset poisoning and routing confusion.
+		switch c {
+		case '/', '\\', ' ', '\t', '@', '"', '\'', '<', '>', '?', '#', ';', ',':
+			return hardenVerdict{
+				Reject: true,
+				Status: http.StatusBadRequest,
+				Reason: "invalid character in Host",
+				RuleID: "HARDEN-HOST-SYNTAX",
+			}
+		}
 	}
 
 	return hardenVerdict{}

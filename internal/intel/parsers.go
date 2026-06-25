@@ -93,6 +93,34 @@ var dangerousFeedRanges = func() []*net.IPNet {
 //
 // The universal /0 catch-alls are excluded from the contained-in rule so an
 // ordinary public CIDR isn't rejected merely for being inside 0.0.0.0/0.
+// canonicalizeFeedCIDR collapses an IPv4-mapped IPv6 CIDR (::ffff:a.b.c.d/N,
+// N>=96) to its true IPv4 form a.b.c.d/(N-96). Without this, a feed can disguise
+// 0.0.0.0/0 as "::ffff:0:0/96" — which reads as a deceptively-narrow /96 in
+// IPv6 form and slips past the same-family /0 dangerous-range check — and ban
+// every IPv4 address. After collapsing, the dangerous-range and over-broad
+// guards see the real scope.
+func canonicalizeFeedCIDR(ipnet *net.IPNet) *net.IPNet {
+	ones, bits := ipnet.Mask.Size()
+	if bits == 128 && ones >= 96 && ipnet.IP.To4() != nil {
+		return &net.IPNet{IP: ipnet.IP.To4(), Mask: net.CIDRMask(ones-96, 32)}
+	}
+	return ipnet
+}
+
+// feedCIDRTooBroad rejects a feed CIDR that covers a huge slice of the address
+// space. A reputation feed lists specific hostile hosts / small ranges, never a
+// /1 or /2; an over-broad entry (whether from a compromised feed or a parser
+// bug) would ban a vast number of legitimate addresses. This catches the
+// "ban-most-of-the-internet" cases (0.0.0.0/1, 128.0.0.0/2, ::/3, …) that the
+// exact-/0 dangerous-range list misses.
+func feedCIDRTooBroad(ipnet *net.IPNet) bool {
+	ones, bits := ipnet.Mask.Size()
+	if bits == 32 {
+		return ones < 8 // IPv4 broader than /8 (>16M addresses)
+	}
+	return ones < 20 // IPv6 broader than /20
+}
+
 func isDangerousRange(ipnet *net.IPNet) bool {
 	feedOnes, _ := ipnet.Mask.Size()
 	for _, bad := range dangerousFeedRanges {
@@ -121,7 +149,11 @@ func classifyIP(s string) (Entry, bool) {
 		if err != nil {
 			return Entry{}, false
 		}
-		if isDangerousRange(ipnet) {
+		// Collapse IPv4-mapped IPv6 to its true IPv4 scope BEFORE the guards so
+		// "::ffff:0:0/96" (= 0.0.0.0/0) can't smuggle a ban-everything entry past
+		// the same-family /0 check.
+		ipnet = canonicalizeFeedCIDR(ipnet)
+		if isDangerousRange(ipnet) || feedCIDRTooBroad(ipnet) {
 			return Entry{}, false
 		}
 		k := KindIPv4

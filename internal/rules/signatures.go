@@ -241,6 +241,15 @@ func DefaultRules() []core.Rule {
 		{ID: "UPLOAD-002", Name: "Upload Null Byte", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Null byte in upload filename", Targets: []string{"body", "headers"}, Pattern: `(?i)filename\s*=\s*["']?[^"']*%00`},
 		{ID: "UPLOAD-003", Name: "Upload Dangerous Extension", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Dangerous file extension in upload", Targets: []string{"body", "headers"}, Pattern: `(?i)filename\s*=\s*["']?[^"']*\.(php[345]?|phtml|jsp|asp|aspx|ashx|sh|py|rb|pl|cgi)\b`},
 		{ID: "UPLOAD-004", Name: "Upload Executable MIME", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "Executable MIME type in upload", Targets: []string{"body", "headers"}, Pattern: `(?i)Content-Type\s*:\s*[^;\r\n]*(application/x-php|application/x-httpd-php|application/x-sh|application/x-python|application/x-ruby|application/x-perl)`},
+		// UPLOAD-005: RFC2231/5987 extended-value filename (filename*=…, filename*0=…)
+		// carrying a dangerous extension — the `filename=` rules above anchor on a
+		// contiguous dangerous extension and miss the extended form, where the dot
+		// is percent-encoded (shell%2Ephp) or the token is `filename*=`. Several
+		// upload stacks (.NET, Apache Commons FileUpload) reassemble RFC2231 to the
+		// real name. The split *0=/*1= form (PHP doesn't reassemble it) is left
+		// to the content-based RCE rules. FP profile matches UPLOAD-003 (a legit
+		// .php upload is already blocked there).
+		{ID: "UPLOAD-005", Name: "Upload Extended-Value Dangerous Extension", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "RFC2231/5987 filename* with a dangerous extension (percent-encoded dot evasion)", Targets: []string{"body", "headers"}, Pattern: `(?i)filename\*[0-9]*\s*=\s*[^;\r\n]*(?:\.|%2e)(?:php[345]?|phtml|jsp|asp|aspx|ashx|sh|py|rb|pl|cgi)\b`},
 
 		// === Open Redirect ===
 		{ID: "REDIR-001", Name: "Open Redirect Protocol Relative", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Open redirect with protocol-relative URL", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(redirect|url|next|return|goto|continue|destination)\s*=\s*(//|/\\)[^&\s]*`},

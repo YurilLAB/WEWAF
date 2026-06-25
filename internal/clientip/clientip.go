@@ -114,9 +114,19 @@ func (e *Extractor) ClientIP(r *http.Request) string {
 	return NormalizeIPKey(e.clientIPRaw(r))
 }
 
+// ClientIPRaw returns the resolved client IP WITHOUT /64 prefix normalisation —
+// the literal address. Access-control decisions that must honour an operator's
+// CIDR at full precision (e.g. an IPv6 /128 block in a zero-trust policy) MUST
+// use this, not ClientIP: ClientIP masks IPv6 to /64 for abuse keying, which
+// silently makes any policy CIDR longer than /64 unreachable (a /128 block can
+// never match the /64-collapsed key). IPv4 is identical to ClientIP.
+func (e *Extractor) ClientIPRaw(r *http.Request) string {
+	return e.clientIPRaw(r)
+}
+
 // clientIPRaw resolves the client IP per the trust policy WITHOUT prefix
 // normalisation. ClientIP wraps it; callers that need the literal address
-// (none today outside ClientIP) could use it directly.
+// (the zero-trust gate) use ClientIPRaw.
 func (e *Extractor) clientIPRaw(r *http.Request) string {
 	if r == nil {
 		return ""

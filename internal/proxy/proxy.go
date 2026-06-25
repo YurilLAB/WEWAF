@@ -983,7 +983,10 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Simulate return DecisionSimulate; we log the would-block but let the
 	// request continue so operators can stage a policy before enforcing it.
 	if wp.zeroTrust != nil {
-		decision, reason, policy := wp.zeroTrust.Evaluate(r, clientIP)
+		// Zero-trust authz must match operator CIDRs at FULL precision, so it
+		// uses the unmasked client IP — not the /64-collapsed abuse key (which
+		// would make any IPv6 policy CIDR longer than /64 silently unreachable).
+		decision, reason, policy := wp.zeroTrust.Evaluate(r, wp.ipExtractor.ClientIPRaw(r))
 		polID := "-"
 		if policy != nil {
 			polID = policy.ID
