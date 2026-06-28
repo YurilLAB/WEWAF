@@ -20,10 +20,10 @@ const DefaultYpanelURL = "https://ypanel.yurillab.dev"
 // Config holds all WAF runtime settings.
 type Config struct {
 	// Proxy settings
-	ListenAddr      string `json:"listen_addr"`      // e.g. ":8080"
-	AdminAddr       string `json:"admin_addr"`       // e.g. ":8443"
-	BackendURL      string `json:"backend_url"`      // e.g. "http://localhost:3000"
-	TrustXFF        bool   `json:"trust_xff"`        // trust X-Forwarded-For header
+	ListenAddr string `json:"listen_addr"` // e.g. ":8080"
+	AdminAddr  string `json:"admin_addr"`  // e.g. ":8443"
+	BackendURL string `json:"backend_url"` // e.g. "http://localhost:3000"
+	TrustXFF   bool   `json:"trust_xff"`   // trust X-Forwarded-For header
 	// TrustedProxies is the CIDR allowlist of upstream proxies whose
 	// X-Forwarded-For / X-Real-Ip headers we honour. When empty AND
 	// TrustXFF is true, the WAF falls back to the legacy left-most
@@ -32,8 +32,8 @@ type Config struct {
 	// CIDRs so an attacker who reaches the WAF directly cannot spoof
 	// the client IP via headers.
 	TrustedProxies  []string `json:"trusted_proxies"`
-	ReadTimeoutSec  int    `json:"read_timeout_sec"`
-	WriteTimeoutSec int    `json:"write_timeout_sec"`
+	ReadTimeoutSec  int      `json:"read_timeout_sec"`
+	WriteTimeoutSec int      `json:"write_timeout_sec"`
 
 	// Operator control plane (ypanel). WEWAF ships no bundled UI; the admin
 	// port's root redirects operators to ypanel — Yuril Security's unified
@@ -47,9 +47,17 @@ type Config struct {
 	MaxConcurrentReq int   `json:"max_concurrent_req"` // connection semaphore
 	MaxBodyBytes     int64 `json:"max_body_bytes"`     // max request body to inspect
 
+	// AdaptiveConcurrency replaces the fixed MaxConcurrentReq semaphore with a
+	// self-tuning limiter (Gradient2 controller): it admits up to MaxConcurrentReq
+	// but shrinks toward AdaptiveConcurrencyMin when backend latency climbs or
+	// requests fail, shedding (503) instead of queueing into timeout. Default OFF
+	// — the static semaphore is unchanged when this is false.
+	AdaptiveConcurrency    bool `json:"adaptive_concurrency"`
+	AdaptiveConcurrencyMin int  `json:"adaptive_concurrency_min"` // floor; 0 => derived
+
 	// Security thresholds
-	BlockThreshold      int `json:"block_threshold"`      // score >= this -> block
-	RateLimitRPS        int `json:"rate_limit_rps"`       // per-IP rate limit
+	BlockThreshold      int `json:"block_threshold"` // score >= this -> block
+	RateLimitRPS        int `json:"rate_limit_rps"`  // per-IP rate limit
 	RateLimitBurst      int `json:"rate_limit_burst"`
 	BruteForceWindowSec int `json:"brute_force_window_sec"`
 	BruteForceThreshold int `json:"brute_force_threshold"`
@@ -83,8 +91,8 @@ type Config struct {
 	RecidiveBanDurationSec int  `json:"recidive_ban_duration_sec"` // default 604800 (7d)
 
 	// Engine behaviour
-	Mode         string   `json:"mode"`           // "active", "detection", "learning"
-	LogLevel     string   `json:"log_level"`      // "debug", "info", "warn", "error"
+	Mode         string   `json:"mode"`      // "active", "detection", "learning"
+	LogLevel     string   `json:"log_level"` // "debug", "info", "warn", "error"
 	AuditLogPath string   `json:"audit_log_path"`
 	RuleFiles    []string `json:"rule_files"`
 
@@ -133,10 +141,10 @@ type Config struct {
 	// HSTS (Strict-Transport-Security). Only emitted when the backend is
 	// reached over HTTPS; browsers ignore HSTS on plain HTTP anyway and
 	// setting it on an http:// response is spec-non-compliant.
-	HSTSEnabled         bool `json:"hsts_enabled"`
-	HSTSMaxAgeSec       int  `json:"hsts_max_age_sec"`
-	HSTSIncludeSubdoms  bool `json:"hsts_include_subdomains"`
-	HSTSPreload         bool `json:"hsts_preload"`
+	HSTSEnabled        bool `json:"hsts_enabled"`
+	HSTSMaxAgeSec      int  `json:"hsts_max_age_sec"`
+	HSTSIncludeSubdoms bool `json:"hsts_include_subdomains"`
+	HSTSPreload        bool `json:"hsts_preload"`
 
 	// Failsafe behaviour when the engine panics or the backend is unhealthy.
 	// "closed" (default) returns 503 to fail secure; "open" forwards the
@@ -150,14 +158,14 @@ type Config struct {
 	BreakerOpenTimeoutSec      int `json:"breaker_open_timeout_sec"`
 
 	// DDoS detection
-	DDoSVolumetricBaseline      int     `json:"ddos_volumetric_baseline"`       // initial "normal" RPS guess, replaced by adaptive EMA after warmup
-	DDoSVolumetricSpike         float64 `json:"ddos_volumetric_spike"`          // multiplier over baseline that counts as a spike
-	DDoSConnRateThreshold       int     `json:"ddos_conn_rate_threshold"`       // per-IP conns in 10s to mitigate (default 300 — CDN-friendly)
-	DDoSSlowReadBPS             int     `json:"ddos_slow_read_bps"`             // bytes/sec below which a slow read is flagged
-	DDoSWarmupSeconds           int     `json:"ddos_warmup_seconds"`            // before adaptive baseline takes over
-	DDoSMinAbsoluteRPS          int     `json:"ddos_min_absolute_rps"`          // floor: never flag under this RPS regardless of multiplier
-	DDoSSpikeWindowsRequired    int     `json:"ddos_spike_windows_required"`    // consecutive spike windows before declaring attack
-	DDoSCoolDownSeconds         int     `json:"ddos_cooldown_seconds"`          // after last spike before releasing attack state
+	DDoSVolumetricBaseline      int     `json:"ddos_volumetric_baseline"`        // initial "normal" RPS guess, replaced by adaptive EMA after warmup
+	DDoSVolumetricSpike         float64 `json:"ddos_volumetric_spike"`           // multiplier over baseline that counts as a spike
+	DDoSConnRateThreshold       int     `json:"ddos_conn_rate_threshold"`        // per-IP conns in 10s to mitigate (default 300 — CDN-friendly)
+	DDoSSlowReadBPS             int     `json:"ddos_slow_read_bps"`              // bytes/sec below which a slow read is flagged
+	DDoSWarmupSeconds           int     `json:"ddos_warmup_seconds"`             // before adaptive baseline takes over
+	DDoSMinAbsoluteRPS          int     `json:"ddos_min_absolute_rps"`           // floor: never flag under this RPS regardless of multiplier
+	DDoSSpikeWindowsRequired    int     `json:"ddos_spike_windows_required"`     // consecutive spike windows before declaring attack
+	DDoSCoolDownSeconds         int     `json:"ddos_cooldown_seconds"`           // after last spike before releasing attack state
 	DDoSBotnetUniqueIPThreshold int     `json:"ddos_botnet_unique_ip_threshold"` // unique IPs on sensitive path in 60s to flag
 	// DDoSBurstThreshold is the sub-second per-IP request count that
 	// triggers VerdictBurst. The connection-rate gate above is averaged
@@ -167,13 +175,13 @@ type Config struct {
 	// produces on a content-heavy page (~10–20 RPS instantaneous) and
 	// well below what a script needs to be useful. Set negative to
 	// disable; 0 picks the default.
-	DDoSBurstThreshold      int `json:"ddos_burst_threshold"`
-	DDoSBurstWindowSeconds  int `json:"ddos_burst_window_seconds"`
+	DDoSBurstThreshold     int `json:"ddos_burst_threshold"`
+	DDoSBurstWindowSeconds int `json:"ddos_burst_window_seconds"`
 
 	// Pre-WAF shaper — admission control that runs before rule evaluation.
 	ShaperEnabled bool `json:"shaper_enabled"`
-	ShaperMaxRPS  int  `json:"shaper_max_rps"`  // process-wide cap
-	ShaperBurst   int  `json:"shaper_burst"`    // token bucket burst size
+	ShaperMaxRPS  int  `json:"shaper_max_rps"` // process-wide cap
+	ShaperBurst   int  `json:"shaper_burst"`   // token bucket burst size
 
 	// OWASP CRS-style paranoia level (1-4). Higher levels enable more
 	// aggressive rules with more false-positive risk. Levels should be
@@ -196,9 +204,9 @@ type Config struct {
 	// into a buffer for inspection, rejecting payloads whose decompressed
 	// size exceeds CompressRatioCap * compressed size (classic zip-bomb
 	// protection). MaxDecompressBytes caps the absolute decompressed size.
-	DecompressInspect   bool  `json:"decompress_inspect"`
-	DecompressRatioCap  int   `json:"decompress_ratio_cap"`  // default 100
-	MaxDecompressBytes  int64 `json:"max_decompress_bytes"`  // default 64 MB
+	DecompressInspect  bool  `json:"decompress_inspect"`
+	DecompressRatioCap int   `json:"decompress_ratio_cap"` // default 100
+	MaxDecompressBytes int64 `json:"max_decompress_bytes"` // default 64 MB
 
 	// Per-rule telemetry. When enabled the engine counts matches per rule
 	// ID so operators can see which rules are firing.
@@ -206,16 +214,16 @@ type Config struct {
 
 	// IP reputation feed ingestion. Populates the BanList with published
 	// DROP / tor-exit lists at the configured interval.
-	IPReputationEnabled       bool     `json:"ip_reputation_enabled"`
-	IPReputationRefreshMin    int      `json:"ip_reputation_refresh_min"` // default 360
-	IPReputationFeeds         []string `json:"ip_reputation_feeds"`
+	IPReputationEnabled    bool     `json:"ip_reputation_enabled"`
+	IPReputationRefreshMin int      `json:"ip_reputation_refresh_min"` // default 360
+	IPReputationFeeds      []string `json:"ip_reputation_feeds"`
 
 	// Exponential-backoff bans. When enabled, repeat bans on the same IP
 	// within a window double the ban duration (up to MaxBanDurationSec).
-	BanBackoffEnabled       bool `json:"ban_backoff_enabled"`
-	BanBackoffMultiplier    int  `json:"ban_backoff_multiplier"`
-	BanBackoffWindowSec     int  `json:"ban_backoff_window_sec"`
-	MaxBanDurationSec       int  `json:"max_ban_duration_sec"`
+	BanBackoffEnabled    bool `json:"ban_backoff_enabled"`
+	BanBackoffMultiplier int  `json:"ban_backoff_multiplier"`
+	BanBackoffWindowSec  int  `json:"ban_backoff_window_sec"`
+	MaxBanDurationSec    int  `json:"max_ban_duration_sec"`
 
 	// Session tracking + browser-integrity challenge + anomaly scoring.
 	SessionTrackingEnabled    bool   `json:"session_tracking_enabled"`
@@ -237,7 +245,7 @@ type Config struct {
 	// is back to baseline after ~25 quiet minutes). Zero disables
 	// decay (legacy monotonic behaviour).
 	SessionScoreDecayPerMin int `json:"session_score_decay_per_min"`
-	SessionBlockThreshold     int    `json:"session_block_threshold"` // risk score at/above which to block; 0 = never
+	SessionBlockThreshold   int `json:"session_block_threshold"` // risk score at/above which to block; 0 = never
 	// SessionThrottleThreshold is the risk score at/above which a session
 	// enters the graduated throttle band: the request proceeds but pays a
 	// bounded latency tax (SessionThrottleDelayMs). It sits below the
@@ -253,19 +261,19 @@ type Config struct {
 	// proxy pre-parses protocol framing before handing payloads to the
 	// rule engine. Block-on-violation is separate so operators can
 	// observe-first, enforce-second.
-	GRPCInspect            bool `json:"grpc_inspect"`
-	GRPCBlockOnError       bool `json:"grpc_block_on_error"`
-	GRPCMaxFrames          int  `json:"grpc_max_frames"`
-	GRPCMaxFrameBytes      int  `json:"grpc_max_frame_bytes"`
+	GRPCInspect       bool `json:"grpc_inspect"`
+	GRPCBlockOnError  bool `json:"grpc_block_on_error"`
+	GRPCMaxFrames     int  `json:"grpc_max_frames"`
+	GRPCMaxFrameBytes int  `json:"grpc_max_frame_bytes"`
 	// Fail-closed on compressed gRPC frames. The default scanner skips
 	// extraction on compressed bodies (binary noise post-codec), which
 	// is a clean rule-engine bypass when the operator wants every body
 	// inspected. Turning this on rejects any compressed frame rather
 	// than letting it through unscanned.
-	GRPCBlockCompressed    bool `json:"grpc_block_compressed"`
-	WebSocketInspect       bool     `json:"websocket_inspect"`
-	WebSocketRequireSubproto bool   `json:"websocket_require_subprotocol"`
-	WebSocketOriginAllowlist []string `json:"websocket_origin_allowlist"`
+	GRPCBlockCompressed        bool     `json:"grpc_block_compressed"`
+	WebSocketInspect           bool     `json:"websocket_inspect"`
+	WebSocketRequireSubproto   bool     `json:"websocket_require_subprotocol"`
+	WebSocketOriginAllowlist   []string `json:"websocket_origin_allowlist"`
 	WebSocketSubprotoAllowlist []string `json:"websocket_subprotocol_allowlist"`
 
 	// Tamper-evident audit log — HMAC-chained, append-only.
@@ -288,51 +296,51 @@ type Config struct {
 	// terminate TLS itself (TLSEnabled + cert/key). Edge mode reads the
 	// hash from a header named JA3Header but only when the request comes
 	// from a CIDR in JA3TrustedSources — anyone else's header is ignored.
-	JA3Enabled         bool     `json:"ja3_enabled"`
-	JA3HardBlock       bool     `json:"ja3_hard_block"`
-	JA3Header          string   `json:"ja3_header"`           // e.g. "Cf-Ja3-Hash"
-	JA3TrustedSources  []string `json:"ja3_trusted_sources"`  // CIDRs allowed to set JA3Header
-	JA3CacheCapacity   int      `json:"ja3_cache_capacity"`
-	JA3CacheTTLSec     int      `json:"ja3_cache_ttl_sec"`
+	JA3Enabled        bool     `json:"ja3_enabled"`
+	JA3HardBlock      bool     `json:"ja3_hard_block"`
+	JA3Header         string   `json:"ja3_header"`          // e.g. "Cf-Ja3-Hash"
+	JA3TrustedSources []string `json:"ja3_trusted_sources"` // CIDRs allowed to set JA3Header
+	JA3CacheCapacity  int      `json:"ja3_cache_capacity"`
+	JA3CacheTTLSec    int      `json:"ja3_cache_ttl_sec"`
 
 	// Proof-of-work challenge for high-risk sessions. When the session
 	// risk score reaches PoWTriggerScore and no valid PoW cookie is
 	// present, the WAF returns the PoW gate page.
-	PoWEnabled        bool   `json:"pow_enabled"`
-	PoWTriggerScore   int    `json:"pow_trigger_score"`   // session score that triggers PoW
-	PoWMinDifficulty  int    `json:"pow_min_difficulty"`  // bits, default 18
-	PoWMaxDifficulty  int    `json:"pow_max_difficulty"`  // bits, default 24
-	PoWTokenTTLSec    int    `json:"pow_token_ttl_sec"`   // server-issued challenge TTL
-	PoWCookieTTLSec   int    `json:"pow_cookie_ttl_sec"`  // client-pass cookie TTL
-	PoWSecret         string `json:"pow_secret"`          // HMAC key for PoW tokens (auto-generated if empty)
+	PoWEnabled       bool   `json:"pow_enabled"`
+	PoWTriggerScore  int    `json:"pow_trigger_score"`  // session score that triggers PoW
+	PoWMinDifficulty int    `json:"pow_min_difficulty"` // bits, default 18
+	PoWMaxDifficulty int    `json:"pow_max_difficulty"` // bits, default 24
+	PoWTokenTTLSec   int    `json:"pow_token_ttl_sec"`  // server-issued challenge TTL
+	PoWCookieTTLSec  int    `json:"pow_cookie_ttl_sec"` // client-pass cookie TTL
+	PoWSecret        string `json:"pow_secret"`         // HMAC key for PoW tokens (auto-generated if empty)
 	// Adaptive (Tier-2) bit management. When enabled, the configured
 	// min/max set the *envelope* and the AdaptiveTier picks the actual
 	// difficulty per-request from session risk + per-IP fail history +
 	// global load + JA4 rarity. Disabled = legacy fixed-suggest behaviour.
-	PoWAdaptiveEnabled bool `json:"pow_adaptive_enabled"`
-	PoWAdaptiveTier2Failures int `json:"pow_adaptive_tier2_failures"` // fails before escalation, default 5
-	PoWAdaptiveTier2PenaltyBits int `json:"pow_adaptive_tier2_penalty_bits"` // bits added during escalation, default 3
+	PoWAdaptiveEnabled          bool `json:"pow_adaptive_enabled"`
+	PoWAdaptiveTier2Failures    int  `json:"pow_adaptive_tier2_failures"`     // fails before escalation, default 5
+	PoWAdaptiveTier2PenaltyBits int  `json:"pow_adaptive_tier2_penalty_bits"` // bits added during escalation, default 3
 
 	// Multi-dimensional rate limiter — runs alongside the per-IP one and
 	// applies the strictest budget across IP/JA4/cookie/query-key
 	// signature dimensions. Zero budget per dim disables that axis.
 	MultiLimitEnabled    bool   `json:"multi_limit_enabled"`
-	MultiLimitWindowSec  int    `json:"multi_limit_window_sec"`   // default 60
-	MultiLimitIPRPM      int    `json:"multi_limit_ip_rpm"`       // 0 = disabled (per-IP limiter already exists)
+	MultiLimitWindowSec  int    `json:"multi_limit_window_sec"` // default 60
+	MultiLimitIPRPM      int    `json:"multi_limit_ip_rpm"`     // 0 = disabled (per-IP limiter already exists)
 	MultiLimitJA4RPM     int    `json:"multi_limit_ja4_rpm"`
 	MultiLimitCookieRPM  int    `json:"multi_limit_cookie_rpm"`
 	MultiLimitCookieName string `json:"multi_limit_cookie_name"`
 	MultiLimitQueryRPM   int    `json:"multi_limit_query_rpm"`
-	MultiLimitMaxEntries int    `json:"multi_limit_max_entries"`  // default 200000
+	MultiLimitMaxEntries int    `json:"multi_limit_max_entries"` // default 200000
 
 	// Auto-updating threat-intel feeds. Toggling on starts the
 	// supervisor that fetches FREE community lists (FireHOL, Spamhaus
 	// DROP, SSLBL JA3, blocklist.de, ET compromised, mitchellkrogza
 	// bad-UAs, CISA KEV) and merges entries into the runtime stores.
 	IntelFeedsEnabled       bool     `json:"intel_feeds_enabled"`
-	IntelFeedsCacheDir      string   `json:"intel_feeds_cache_dir"`       // default <history>/intel
-	IntelFeedsLearningHours int      `json:"intel_feeds_learning_hours"`  // observe-only window for new entries; default 0 (off)
-	IntelFeedsAllowSources  []string `json:"intel_feeds_allow_sources"`   // empty = all defaults; otherwise allowlist of source names
+	IntelFeedsCacheDir      string   `json:"intel_feeds_cache_dir"`      // default <history>/intel
+	IntelFeedsLearningHours int      `json:"intel_feeds_learning_hours"` // observe-only window for new entries; default 0 (off)
+	IntelFeedsAllowSources  []string `json:"intel_feeds_allow_sources"`  // empty = all defaults; otherwise allowlist of source names
 
 	// Host-firewall ban sink — pushes the in-memory ban list down to the OS
 	// packet filter (nftables on Linux, Windows Firewall on Windows) so a
@@ -342,12 +350,12 @@ type Config struct {
 	// and not just the website. Default off; the in-process HTTP ban check
 	// (proxy.go) always stays on, so the sink is a pure add-on that fails
 	// open to L7 enforcement if the kernel call errors.
-	FirewallSinkEnabled  bool     `json:"firewall_sink_enabled"`
-	FirewallBackend      string   `json:"firewall_backend"`       // "auto" | "nft" | "netsh" | "none"
-	FirewallDryRun       bool     `json:"firewall_dry_run"`       // log the exact argv instead of executing — safe trial mode
-	FirewallTable        string   `json:"firewall_table"`         // nftables table name (Linux), default "wewaf"
-	FirewallReconcileSec int      `json:"firewall_reconcile_sec"` // how often the reconcile loop syncs bans to the kernel; default 5
-	FirewallMaxRules     int      `json:"firewall_max_rules"`     // cap on kernel entries (0 = backend default); guards the per-rule netsh path
+	FirewallSinkEnabled  bool   `json:"firewall_sink_enabled"`
+	FirewallBackend      string `json:"firewall_backend"`       // "auto" | "nft" | "netsh" | "none"
+	FirewallDryRun       bool   `json:"firewall_dry_run"`       // log the exact argv instead of executing — safe trial mode
+	FirewallTable        string `json:"firewall_table"`         // nftables table name (Linux), default "wewaf"
+	FirewallReconcileSec int    `json:"firewall_reconcile_sec"` // how often the reconcile loop syncs bans to the kernel; default 5
+	FirewallMaxRules     int    `json:"firewall_max_rules"`     // cap on kernel entries (0 = backend default); guards the per-rule netsh path
 	// BanAllowlist is the never-ban CIDR/IP set. Loopback and the unspecified
 	// address are always refused; these entries add your CDN egress range, the
 	// admin bind, or the default gateway so a threat feed or a confused
@@ -398,6 +406,8 @@ func Default() *Config {
 		MaxCPUCores:              runtime.NumCPU(),
 		MaxMemoryMB:              0,
 		MaxConcurrentReq:         10000,
+		AdaptiveConcurrency:      false,
+		AdaptiveConcurrencyMin:   64,
 		MaxBodyBytes:             10 * 1024 * 1024, // 10 MB
 		BlockThreshold:           100,
 		RateLimitRPS:             100,
@@ -500,13 +510,13 @@ func Default() *Config {
 		SessionThrottleThreshold:  0,     // disabled by default — observe first
 		SessionThrottleDelayMs:    0,     // Validate sets 500 when the band is enabled
 
-		GRPCInspect:            false,
-		GRPCBlockOnError:       false,
-		GRPCMaxFrames:          1024,
-		GRPCMaxFrameBytes:      1 << 20,
-		WebSocketInspect:       false,
-		WebSocketRequireSubproto: false,
-		WebSocketOriginAllowlist: []string{},
+		GRPCInspect:                false,
+		GRPCBlockOnError:           false,
+		GRPCMaxFrames:              1024,
+		GRPCMaxFrameBytes:          1 << 20,
+		WebSocketInspect:           false,
+		WebSocketRequireSubproto:   false,
+		WebSocketOriginAllowlist:   []string{},
 		WebSocketSubprotoAllowlist: []string{},
 
 		AuditEnabled:  false,
@@ -618,6 +628,14 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxConcurrentReq <= 0 {
 		c.MaxConcurrentReq = 10000
+	}
+	// Adaptive concurrency floor: keep it sane and below the ceiling so the
+	// limiter always has room to shrink without collapsing to a 1-wide gate.
+	if c.AdaptiveConcurrencyMin <= 0 {
+		c.AdaptiveConcurrencyMin = 64
+	}
+	if c.AdaptiveConcurrencyMin > c.MaxConcurrentReq {
+		c.AdaptiveConcurrencyMin = c.MaxConcurrentReq
 	}
 	if c.Mode != "active" && c.Mode != "detection" && c.Mode != "learning" {
 		c.Mode = "active"
@@ -1054,6 +1072,8 @@ func (c *Config) Snapshot() *Config {
 		MaxCPUCores:              c.MaxCPUCores,
 		MaxMemoryMB:              c.MaxMemoryMB,
 		MaxConcurrentReq:         c.MaxConcurrentReq,
+		AdaptiveConcurrency:      c.AdaptiveConcurrency,
+		AdaptiveConcurrencyMin:   c.AdaptiveConcurrencyMin,
 		MaxBodyBytes:             c.MaxBodyBytes,
 		BlockThreshold:           c.BlockThreshold,
 		RateLimitRPS:             c.RateLimitRPS,
@@ -1153,14 +1173,14 @@ func (c *Config) Snapshot() *Config {
 		SessionThrottleThreshold:  c.SessionThrottleThreshold,
 		SessionThrottleDelayMs:    c.SessionThrottleDelayMs,
 
-		GRPCInspect:              c.GRPCInspect,
-		GRPCBlockOnError:         c.GRPCBlockOnError,
-		GRPCMaxFrames:            c.GRPCMaxFrames,
-		GRPCMaxFrameBytes:        c.GRPCMaxFrameBytes,
-		GRPCBlockCompressed:      c.GRPCBlockCompressed,
-		WebSocketInspect:         c.WebSocketInspect,
-		WebSocketRequireSubproto: c.WebSocketRequireSubproto,
-		WebSocketOriginAllowlist: append([]string(nil), c.WebSocketOriginAllowlist...),
+		GRPCInspect:                c.GRPCInspect,
+		GRPCBlockOnError:           c.GRPCBlockOnError,
+		GRPCMaxFrames:              c.GRPCMaxFrames,
+		GRPCMaxFrameBytes:          c.GRPCMaxFrameBytes,
+		GRPCBlockCompressed:        c.GRPCBlockCompressed,
+		WebSocketInspect:           c.WebSocketInspect,
+		WebSocketRequireSubproto:   c.WebSocketRequireSubproto,
+		WebSocketOriginAllowlist:   append([]string(nil), c.WebSocketOriginAllowlist...),
 		WebSocketSubprotoAllowlist: append([]string(nil), c.WebSocketSubprotoAllowlist...),
 
 		AuditEnabled:  c.AuditEnabled,
