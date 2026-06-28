@@ -64,6 +64,7 @@ type Server struct {
 	meshPeers    []string
 	meshAPIKey   string
 	meshLastSync time.Time
+	meshReplay   *meshReplayGuard
 	meshMu       sync.RWMutex
 
 	// Recent engine errors ring buffer for the Errors page.
@@ -1581,7 +1582,9 @@ func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var payload struct {
-		Bans []core.BanEntry `json:"bans"`
+		Bans  []core.BanEntry `json:"bans"`
+		Ts    int64           `json:"ts"`
+		Nonce string          `json:"nonce"`
 	}
 	// Mesh peers are trusted enough to skip every other check, so this
 	// is the right place to refuse surprise top-level fields. A peer
@@ -1591,6 +1594,24 @@ func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
 	if err := dec.Decode(&payload); err != nil {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
+	}
+	// Replay protection: require a fresh timestamp + unique nonce so a captured
+	// sync message can't be replayed later to re-inject stale bans.
+	s.meshMu.Lock()
+	if s.meshReplay == nil {
+		s.meshReplay = newMeshReplayGuard(meshReplayWindowSec)
+	}
+	guard := s.meshReplay
+	s.meshMu.Unlock()
+	if ok, reason := guard.check(payload.Nonce, payload.Ts, time.Now().Unix()); !ok {
+		http.Error(w, "mesh: "+reason, http.StatusBadRequest)
+		return
+	}
+	// Bound a single peer's blast radius per message: a compromised/buggy peer
+	// can't dump an unbounded ban list in one sync (the 4MB body cap is coarse).
+	if len(payload.Bans) > meshMaxBansPerSync {
+		log.Printf("mesh sync: peer sent %d bans, capping to %d", len(payload.Bans), meshMaxBansPerSync)
+		payload.Bans = payload.Bans[:meshMaxBansPerSync]
 	}
 	// Merge incoming bans into local ban list.
 	if s.banList != nil {

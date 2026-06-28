@@ -6,6 +6,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -1126,14 +1127,20 @@ func main() {
 				select {
 				case <-ticker.C:
 					localBans := banList.List()
-					payload := map[string]interface{}{"bans": localBans}
-					body, err := json.Marshal(payload)
-					if err != nil {
-						log.Printf("mesh gossip: failed to marshal bans: %v", err)
-						continue
-					}
 					for _, peerURL := range cfg.MeshPeers {
 						if peerURL == "" {
+							continue
+						}
+						// Fresh timestamp + nonce per peer message so the receiver's
+						// replay guard rejects any captured-and-replayed sync.
+						payload := map[string]interface{}{
+							"bans":  localBans,
+							"ts":    time.Now().Unix(),
+							"nonce": meshNonce(),
+						}
+						body, err := json.Marshal(payload)
+						if err != nil {
+							log.Printf("mesh gossip: failed to marshal bans: %v", err)
 							continue
 						}
 						syncURL := strings.TrimSuffix(peerURL, "/") + "/api/mesh/sync"
@@ -1281,6 +1288,17 @@ func startTrafficSampler(m *telemetry.Metrics) func() {
 // hostnames) is treated as a more conservative choice and not warned
 // about. Cross-platform: Windows + Linux + BSD all use the same set
 // of zero-address representations here.
+// meshNonce returns a random hex nonce for mesh-sync replay protection. On the
+// (effectively impossible) RNG failure it falls back to a time-based value; the
+// receiver's freshness window still bounds replay even with a weak nonce.
+func meshNonce() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b[:])
+}
+
 func isWildcardListenAddr(addr string) bool {
 	if addr == "" {
 		return true // net/http defaults to ":http" when blank — wildcard
