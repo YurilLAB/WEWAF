@@ -250,6 +250,10 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// DDoS + circuit-breaker + shaper stats.
 	api.HandleFunc("/api/ddos/stats", s.handleDDoSStats)
+
+	// Cluster threat signal — this node's under-attack flag + recent offenders,
+	// consumed by the ypanel-agent snapshot for cross-node correlation.
+	api.HandleFunc("/api/threats", s.handleThreats)
 	api.HandleFunc("/api/breaker/stats", s.handleBreakerStats)
 	api.HandleFunc("/api/shaper/stats", s.handleShaperStats)
 
@@ -471,23 +475,23 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			ShaperMaxRPS           int      `json:"shaper_max_rps"`
 			ShaperBurst            int      `json:"shaper_burst"`
 			// Newly surfaced fields — all nullable so the UI can leave them alone.
-			DecompressInspect   *bool `json:"decompress_inspect"`
-			DecompressRatioCap  int   `json:"decompress_ratio_cap"`
-			BanBackoffEnabled   *bool `json:"ban_backoff_enabled"`
-			BanBackoffMultiplier int  `json:"ban_backoff_multiplier"`
-			BanBackoffWindowSec int   `json:"ban_backoff_window_sec"`
-			MaxBanDurationSec   int   `json:"max_ban_duration_sec"`
-			PerRuleCounters     *bool `json:"per_rule_counters"`
-			BlockThreshold      int   `json:"block_threshold"`
-			RateLimitRPS        int   `json:"rate_limit_rps"`
-			RateLimitBurst      int   `json:"rate_limit_burst"`
+			DecompressInspect    *bool `json:"decompress_inspect"`
+			DecompressRatioCap   int   `json:"decompress_ratio_cap"`
+			BanBackoffEnabled    *bool `json:"ban_backoff_enabled"`
+			BanBackoffMultiplier int   `json:"ban_backoff_multiplier"`
+			BanBackoffWindowSec  int   `json:"ban_backoff_window_sec"`
+			MaxBanDurationSec    int   `json:"max_ban_duration_sec"`
+			PerRuleCounters      *bool `json:"per_rule_counters"`
+			BlockThreshold       int   `json:"block_threshold"`
+			RateLimitRPS         int   `json:"rate_limit_rps"`
+			RateLimitBurst       int   `json:"rate_limit_burst"`
 
-			SessionTrackingEnabled    *bool `json:"session_tracking_enabled"`
-			BrowserChallengeEnabled   *bool `json:"browser_challenge_enabled"`
-			BrowserChallengeBlock     *bool `json:"browser_challenge_block"`
-			SessionBlockThreshold     *int  `json:"session_block_threshold"`
-			SessionThrottleThreshold  *int  `json:"session_throttle_threshold"`
-			SessionThrottleDelayMs    *int  `json:"session_throttle_delay_ms"`
+			SessionTrackingEnabled    *bool     `json:"session_tracking_enabled"`
+			BrowserChallengeEnabled   *bool     `json:"browser_challenge_enabled"`
+			BrowserChallengeBlock     *bool     `json:"browser_challenge_block"`
+			SessionBlockThreshold     *int      `json:"session_block_threshold"`
+			SessionThrottleThreshold  *int      `json:"session_throttle_threshold"`
+			SessionThrottleDelayMs    *int      `json:"session_throttle_delay_ms"`
 			SessionRequestRateCeiling int       `json:"session_request_rate_ceiling"`
 			SessionPathCountCeiling   int       `json:"session_path_count_ceiling"`
 			ChallengeTTLSec           int       `json:"challenge_ttl_sec"`
@@ -495,15 +499,15 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			TrustXFF                  *bool     `json:"trust_xff"`
 			TrustedProxies            *[]string `json:"trusted_proxies"`
 
-			GRPCInspect            *bool    `json:"grpc_inspect"`
-			GRPCBlockOnError       *bool    `json:"grpc_block_on_error"`
-			GRPCMaxFrames          int      `json:"grpc_max_frames"`
-			GRPCMaxFrameBytes      int      `json:"grpc_max_frame_bytes"`
-			WebSocketInspect       *bool    `json:"websocket_inspect"`
-			WebSocketRequireSubproto *bool  `json:"websocket_require_subprotocol"`
-			WebSocketOriginAllowlist []string `json:"websocket_origin_allowlist"`
+			GRPCInspect                *bool    `json:"grpc_inspect"`
+			GRPCBlockOnError           *bool    `json:"grpc_block_on_error"`
+			GRPCMaxFrames              int      `json:"grpc_max_frames"`
+			GRPCMaxFrameBytes          int      `json:"grpc_max_frame_bytes"`
+			WebSocketInspect           *bool    `json:"websocket_inspect"`
+			WebSocketRequireSubproto   *bool    `json:"websocket_require_subprotocol"`
+			WebSocketOriginAllowlist   []string `json:"websocket_origin_allowlist"`
 			WebSocketSubprotoAllowlist []string `json:"websocket_subprotocol_allowlist"`
-			AuditEnabled           *bool  `json:"audit_enabled"`
+			AuditEnabled               *bool    `json:"audit_enabled"`
 
 			GraphQLEnabled            *bool  `json:"graphql_enabled"`
 			GraphQLBlockOnError       *bool  `json:"graphql_block_on_error"`
