@@ -55,6 +55,15 @@ type Config struct {
 	AdaptiveConcurrency    bool `json:"adaptive_concurrency"`
 	AdaptiveConcurrencyMin int  `json:"adaptive_concurrency_min"` // floor; 0 => derived
 
+	// LoadShedding sheds the highest-risk sessions first when the node is under
+	// load (adaptive-limiter pressure or a confirmed DDoS), preserving capacity
+	// for low-risk users instead of dropping arbitrarily at the concurrency cap.
+	// Default OFF (fail-open at low load). LoadShedMinScore is the session-risk
+	// score shed at full load; the shed threshold ramps down to it from 100 as
+	// load rises.
+	LoadShedding     bool `json:"load_shedding"`
+	LoadShedMinScore int  `json:"load_shed_min_score"`
+
 	// Security thresholds
 	BlockThreshold      int `json:"block_threshold"` // score >= this -> block
 	RateLimitRPS        int `json:"rate_limit_rps"`  // per-IP rate limit
@@ -408,6 +417,8 @@ func Default() *Config {
 		MaxConcurrentReq:         10000,
 		AdaptiveConcurrency:      false,
 		AdaptiveConcurrencyMin:   64,
+		LoadShedding:             false,
+		LoadShedMinScore:         50,
 		MaxBodyBytes:             10 * 1024 * 1024, // 10 MB
 		BlockThreshold:           100,
 		RateLimitRPS:             100,
@@ -636,6 +647,9 @@ func (c *Config) Validate() error {
 	}
 	if c.AdaptiveConcurrencyMin > c.MaxConcurrentReq {
 		c.AdaptiveConcurrencyMin = c.MaxConcurrentReq
+	}
+	if c.LoadShedMinScore <= 0 || c.LoadShedMinScore > 100 {
+		c.LoadShedMinScore = 50
 	}
 	if c.Mode != "active" && c.Mode != "detection" && c.Mode != "learning" {
 		c.Mode = "active"
@@ -1074,6 +1088,8 @@ func (c *Config) Snapshot() *Config {
 		MaxConcurrentReq:         c.MaxConcurrentReq,
 		AdaptiveConcurrency:      c.AdaptiveConcurrency,
 		AdaptiveConcurrencyMin:   c.AdaptiveConcurrencyMin,
+		LoadShedding:             c.LoadShedding,
+		LoadShedMinScore:         c.LoadShedMinScore,
 		MaxBodyBytes:             c.MaxBodyBytes,
 		BlockThreshold:           c.BlockThreshold,
 		RateLimitRPS:             c.RateLimitRPS,

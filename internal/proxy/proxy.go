@@ -875,6 +875,23 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		wp.applyThrottle(r.Context(), r, hdrScore)
 	}
 
+	// Priority load-shedding: under measured load (adaptive-limiter pressure or a
+	// confirmed DDoS), shed the highest-risk sessions FIRST so capacity is kept
+	// for low-risk users — instead of the concurrency cap dropping requests
+	// arbitrarily. Opt-in (LoadShedding) and fail-open below the load floor, so a
+	// healthy node is unaffected. Never sheds the PoW/challenge assets.
+	if wp.conf().LoadShedding && !isPoWBypassPath(r.URL.Path) &&
+		shouldShedForLoad(hdrScore, wp.loadFraction(), wp.conf().LoadShedMinScore) {
+		if wp.metrics != nil && wp.ipExtractor != nil {
+			wp.metrics.RecordSecurityEvent(wp.ipExtractor.ClientIP(r), r.Method, r.URL.Path,
+				"LOAD-SHED", "ddos",
+				fmt.Sprintf("shed under load (score=%d)", hdrScore), 0)
+		}
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Pre-WAF admission control: if the shaper is enabled and the global
 	// token bucket is empty, we early-reject with 429 before spending any
 	// effort on inspection. Under attack the detector tells the shaper to

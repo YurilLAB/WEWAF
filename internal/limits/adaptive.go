@@ -147,3 +147,26 @@ func (a *AdaptiveLimiter) InFlight() int {
 	defer a.mu.Unlock()
 	return a.inFlight
 }
+
+// LoadFraction reports how far the admission limit has shrunk from max toward
+// min, as 0..1 (0 = at max / healthy, 1 = at min / maximally constrained).
+// Returns 0 when min==max. Used as a system-load signal for priority shedding.
+func (a *AdaptiveLimiter) LoadFraction() float64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	span := a.max - a.min
+	if span <= 0 {
+		return 0
+	}
+	frac := (a.max - a.limit) / span
+	if frac < 0 {
+		return 0
+	}
+	if frac > 1 {
+		return 1
+	}
+	return frac
+}
