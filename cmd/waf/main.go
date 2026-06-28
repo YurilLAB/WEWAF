@@ -52,10 +52,18 @@ const wafVersion = "0.2.0"
 // simpleLogger adapts Go's standard log to the engine.Logger interface.
 type simpleLogger struct{}
 
-func (s *simpleLogger) Debugf(format string, args ...interface{}) { log.Printf("[DEBUG] "+format, args...) }
-func (s *simpleLogger) Infof(format string, args ...interface{})  { log.Printf("[INFO] "+format, args...) }
-func (s *simpleLogger) Warnf(format string, args ...interface{})  { log.Printf("[WARN] "+format, args...) }
-func (s *simpleLogger) Errorf(format string, args ...interface{}) { log.Printf("[ERROR] "+format, args...) }
+func (s *simpleLogger) Debugf(format string, args ...interface{}) {
+	log.Printf("[DEBUG] "+format, args...)
+}
+func (s *simpleLogger) Infof(format string, args ...interface{}) {
+	log.Printf("[INFO] "+format, args...)
+}
+func (s *simpleLogger) Warnf(format string, args ...interface{}) {
+	log.Printf("[WARN] "+format, args...)
+}
+func (s *simpleLogger) Errorf(format string, args ...interface{}) {
+	log.Printf("[ERROR] "+format, args...)
+}
 
 // banListLister adapts *core.BanList to firewall.Lister so the host-firewall
 // reconcile loop can read the active ban set without firewall importing core.
@@ -488,6 +496,10 @@ func main() {
 		RetryAttempts:   3,
 		TimeoutMs:       2000,
 	})
+	// Mirror the egress SSRF policy onto the backend probe: cloud-metadata
+	// endpoints are always blocked, and private/loopback targets too when the
+	// operator has enabled egress_block_private_ips (CONN-SSRF-001).
+	connMgr.SetSSRFPolicy(cfg.EgressBlockPrivateIPs)
 	connMgr.Start(rootCtx)
 	defer connMgr.Stop()
 
@@ -656,6 +668,11 @@ func main() {
 		if cfg.IntelFeedsLearningHours > 0 {
 			learningEndsAt = time.Now().Add(time.Duration(cfg.IntelFeedsLearningHours) * time.Hour)
 		}
+		// Cross-source consensus: the documented FP-safety rule is "block only
+		// when >=2 sources agree OR the source is high confidence". The sink is
+		// called per-source, so this tracker carries the distinct-source set
+		// across calls (INTEL-CONSENSUS-001).
+		intelConsensus := intel.NewConsensus(2)
 		sink := func(entries []intel.Entry) error {
 			learning := !learningEndsAt.IsZero() && time.Now().Before(learningEndsAt)
 			ipBatch := 0
@@ -669,6 +686,14 @@ func main() {
 					// when MEDIUM confidence accumulates from ≥2 sources.
 					// Single-source LOW entries get logged but not banned.
 					if learning || e.Confidence == intel.ConfLow {
+						continue
+					}
+					// Honour the advertised consensus rule: a medium-confidence
+					// value enforces only once >=2 distinct sources report it;
+					// high confidence enforces alone. Otherwise one noisy or
+					// poisoned medium feed could 7-day-ban arbitrary public IPs
+					// at L7 (and, with the firewall sink, the kernel).
+					if !intelConsensus.Enforce(e.Value, e.Source, e.Confidence) {
 						continue
 					}
 					reason := "intel:" + e.Source
@@ -685,6 +710,15 @@ func main() {
 					}
 				case intel.KindJA3, intel.KindJA4:
 					if jaDetector == nil {
+						continue
+					}
+					// Mirror the IP branch's gate: honour the observe-only
+					// learning window and drop single-source LOW entries for
+					// fingerprint feeds too. Without this a poisoned/medium JA3
+					// feed enforced immediately during the window the operator
+					// believes is observe-only, affecting every client sharing a
+					// TLS fingerprint (INTEL-JA3-LEARN-002).
+					if learning || e.Confidence == intel.ConfLow {
 						continue
 					}
 					reason := e.Source
@@ -983,8 +1017,15 @@ func main() {
 		}
 		proxyServer.TLSConfig = tlsCfg
 		proxyTLSEnabled = true
-		log.Printf("ssl: native TLS enabled — min_version=%s, certs=%d",
-			sslMgr.ConfigSnapshot().MinTLSVersion, len(sslMgr.List()))
+		// Pin explicit HTTP/2 limits so the stream/frame-flood defenses
+		// (Rapid-Reset CVE-2023-44487, MadeYouReset CVE-2025-8671, CONTINUATION
+		// floods) are owned, not silently inherited from the runtime defaults.
+		// Must run after TLSConfig is set and before ListenAndServeTLS.
+		if err := proxy.HardenHTTP2(proxyServer, 0); err != nil {
+			log.Fatalf("ssl: HardenHTTP2 failed (%v) — refusing to start with unconfigured HTTP/2 limits", err)
+		}
+		log.Printf("ssl: native TLS enabled — min_version=%s, certs=%d, h2_max_streams=%d",
+			sslMgr.ConfigSnapshot().MinTLSVersion, len(sslMgr.List()), proxy.DefaultH2MaxConcurrentStreams)
 	}
 
 	var egressServer *http.Server

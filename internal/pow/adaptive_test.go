@@ -61,6 +61,15 @@ func TestAdaptiveSuccessDecaysCounter(t *testing.T) {
 	for i := 0; i < int(a.tier2Failures); i++ {
 		a.RecordFailure(ip)
 	}
+	// Age the tier-2 escalation past its cooldown: the escalation itself is
+	// sticky for the full cooldown window (see
+	// TestRecordSuccessDoesNotLaunderActiveEscalation), so a clean run of solves
+	// only retires the IP once the deadline has elapsed.
+	a.mu.Lock()
+	if r := a.rep[ip]; r != nil {
+		r.escalatedUntil = time.Now().Add(-time.Minute)
+	}
+	a.mu.Unlock()
 	a.RecordSuccess(ip)
 	a.RecordSuccess(ip)
 	a.RecordSuccess(ip)
@@ -69,6 +78,52 @@ func TestAdaptiveSuccessDecaysCounter(t *testing.T) {
 	want := a.Recommend("", 50, 0)
 	if got != want {
 		t.Fatalf("after several successes the IP should match an unknown IP: got=%d want=%d", got, want)
+	}
+}
+
+// TestRecordSuccessDoesNotLaunderActiveEscalation is the regression for
+// POW-LAUNDER-002: a single successful solve used to wipe an active hour-long
+// tier-2 escalation merely because it halved the failure counter below the
+// threshold, letting an escalating IP launder fail-driven difficulty straight
+// back to the floor. The escalation must now expire on its own cooldown clock.
+func TestRecordSuccessDoesNotLaunderActiveEscalation(t *testing.T) {
+	a := NewAdaptiveTier(newAdaptiveTestIssuer(t))
+	ip := "198.51.100.42"
+	for i := 0; i < int(a.tier2Failures); i++ {
+		a.RecordFailure(ip)
+	}
+	// Precondition: escalation is active (deadline in the future).
+	a.mu.RLock()
+	r := a.rep[ip]
+	active := r != nil && !r.escalatedUntil.IsZero() && time.Now().Before(r.escalatedUntil)
+	a.mu.RUnlock()
+	if !active {
+		t.Fatal("precondition: tier-2 escalation should be active after the fail burst")
+	}
+
+	// One solve must NOT retire the active escalation.
+	a.RecordSuccess(ip)
+	a.mu.RLock()
+	r = a.rep[ip]
+	stillActive := r != nil && time.Now().Before(r.escalatedUntil)
+	a.mu.RUnlock()
+	if !stillActive {
+		t.Fatal("a single solve laundered an active tier-2 escalation back to the floor")
+	}
+
+	// Once the cooldown elapses, a subsequent solve clears it as designed.
+	a.mu.Lock()
+	if r := a.rep[ip]; r != nil {
+		r.escalatedUntil = time.Now().Add(-time.Minute)
+	}
+	a.mu.Unlock()
+	a.RecordSuccess(ip)
+	a.mu.RLock()
+	r = a.rep[ip]
+	cleared := r == nil || r.escalatedUntil.IsZero()
+	a.mu.RUnlock()
+	if !cleared {
+		t.Fatal("an expired escalation should be retired by a subsequent solve")
 	}
 }
 

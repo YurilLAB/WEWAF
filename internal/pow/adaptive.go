@@ -33,9 +33,9 @@ type AdaptiveTier struct {
 	// (failures, lastFail, escalatedUntil). All accesses go through
 	// the mu lock — operations are short and contention is low because
 	// the hot path is read-only when an IP isn't in the map.
-	mu      sync.RWMutex
-	rep     map[string]*ipRep
-	cap     int // max entries before random-drop eviction
+	mu  sync.RWMutex
+	rep map[string]*ipRep
+	cap int // max entries before random-drop eviction
 
 	// Atomic counters for the admin UI.
 	tierBumps    atomic.Uint64
@@ -46,17 +46,17 @@ type AdaptiveTier struct {
 	loadBits atomic.Uint64 // store float64 bits via math.Float64bits
 
 	// Tier-2 thresholds (defaults baked in; not currently exposed).
-	tier2Failures   uint32        // # fails in tier2Window before escalation
-	tier2Window     time.Duration // sliding window for fail counting
-	tier2Penalty    uint8         // bits added to the floor while escalated
-	tier2Cooldown   time.Duration // how long the escalation lasts
+	tier2Failures uint32        // # fails in tier2Window before escalation
+	tier2Window   time.Duration // sliding window for fail counting
+	tier2Penalty  uint8         // bits added to the floor while escalated
+	tier2Cooldown time.Duration // how long the escalation lasts
 }
 
 type ipRep struct {
-	failures        uint32
-	firstFailAt     time.Time
-	lastFailAt      time.Time
-	escalatedUntil  time.Time
+	failures       uint32
+	firstFailAt    time.Time
+	lastFailAt     time.Time
+	escalatedUntil time.Time
 }
 
 // NewAdaptiveTier wraps an Issuer with the default Tier-2 parameters.
@@ -147,9 +147,9 @@ func (a *AdaptiveTier) Recommend(ip string, score int, rareFP float64) uint8 {
 	// for highly-suspicious clients, plenty of friction.
 	failRate := a.recentFailRate(ip)
 	add := 0.0
-	add += rareFP * 2.0          // rare JA4 → up to +2 bits
-	add += failRate * 2.0         // recent fails → up to +2 bits
-	add += a.loadHint() * 2.0     // global load → up to +2 bits
+	add += rareFP * 2.0       // rare JA4 → up to +2 bits
+	add += failRate * 2.0     // recent fails → up to +2 bits
+	add += a.loadHint() * 2.0 // global load → up to +2 bits
 
 	bump := uint8(add + 0.5)
 
@@ -224,12 +224,13 @@ func (a *AdaptiveTier) RecordFailure(ip string) {
 
 // RecordSuccess decays the failure counter for the IP. We don't reset
 // outright — a successful solve right after 4 fails should still carry
-// some weight. Halve the counter and clear escalation if it dropped
-// below the threshold.
+// some weight. Halve the counter, but only RETIRE an active tier-2
+// escalation once its cooldown has actually elapsed.
 func (a *AdaptiveTier) RecordSuccess(ip string) {
 	if a == nil || ip == "" {
 		return
 	}
+	now := time.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	r := a.rep[ip]
@@ -237,12 +238,20 @@ func (a *AdaptiveTier) RecordSuccess(ip string) {
 		return
 	}
 	r.failures /= 2
-	if r.failures < a.tier2Failures {
+	// Only clear the escalation deadline once the cooldown has expired,
+	// mirroring the now.After guard on the set side (RecordFailure). Without
+	// this, a single successful solve that merely halves the counter below the
+	// threshold instantly wiped the hour-long "re-establish trust" penalty,
+	// letting an escalating IP launder fail-driven difficulty straight back to
+	// the floor for the price of one solve. Let the escalation expire on its
+	// own clock (Recommend already gates on time.Now().Before(escalatedUntil)).
+	if now.After(r.escalatedUntil) {
 		r.escalatedUntil = time.Time{}
-	}
-	if r.failures == 0 {
-		// Clean up clean IPs to keep the map small.
-		delete(a.rep, ip)
+		if r.failures == 0 {
+			// Clean up clean IPs to keep the map small. Only when no
+			// escalation is pending, so we never drop an active penalty.
+			delete(a.rep, ip)
+		}
 	}
 }
 

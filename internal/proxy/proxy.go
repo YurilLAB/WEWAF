@@ -40,18 +40,19 @@ import (
 
 // WAFProxy wraps a reverse proxy with WAF inspection.
 type WAFProxy struct {
-	cfg       *config.Config
+	cfg *config.Config
 	// cfgSnap holds an immutable snapshot of cfg, published atomically by
 	// RefreshConfig after every config mutation (admin /api/config edit or
 	// hot-reload). Hot-path reads go through conf() so they never race the
 	// writers, which mutate the live cfg fields under cfg's lock. The live
 	// cfg pointer is retained only to build new snapshots and for the
 	// internally-synchronised mode accessor.
-	cfgSnap atomic.Pointer[config.Config]
+	cfgSnap   atomic.Pointer[config.Config]
 	eng       *engine.Engine
 	metrics   *telemetry.Metrics
 	bf        *bruteforce.Detector
 	sema      *limits.Semaphore
+	adaptive  *limits.AdaptiveLimiter // non-nil when adaptive_concurrency is enabled
 	rl        *limits.RateLimiter
 	backend   *url.URL
 	proxy     *httputil.ReverseProxy
@@ -99,12 +100,12 @@ type WAFProxy struct {
 	powAdapt *pow.AdaptiveTier
 
 	// Counters (atomic so admin-API reads don't contend with hot path).
-	ja3Inspect    atomic.Uint64
-	ja3MatchBad   atomic.Uint64
-	ja3Blocked    atomic.Uint64
-	powIssued     atomic.Uint64
-	powVerified   atomic.Uint64
-	powRejected   atomic.Uint64
+	ja3Inspect  atomic.Uint64
+	ja3MatchBad atomic.Uint64
+	ja3Blocked  atomic.Uint64
+	powIssued   atomic.Uint64
+	powVerified atomic.Uint64
+	powRejected atomic.Uint64
 
 	// powIssueCounters guards a small per-IP fixed-window counter used
 	// to rate-limit PoW issuance. Lazily initialised in
@@ -479,6 +480,10 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 	}
 
 	sema := limits.NewSemaphore(cfg.MaxConcurrentReq)
+	var adaptive *limits.AdaptiveLimiter
+	if cfg.AdaptiveConcurrency {
+		adaptive = limits.NewAdaptiveLimiter(cfg.AdaptiveConcurrencyMin, cfg.MaxConcurrentReq)
+	}
 	rl := limits.NewRateLimiter(cfg.RateLimitRPS, cfg.RateLimitBurst)
 
 	ipx, err := cfg.BuildClientIPExtractor()
@@ -492,6 +497,7 @@ func NewWAFProxy(cfg *config.Config, eng *engine.Engine, metrics *telemetry.Metr
 		metrics:     metrics,
 		bf:          bf,
 		sema:        sema,
+		adaptive:    adaptive,
 		rl:          rl,
 		backend:     backend,
 		ipExtractor: ipx,
@@ -896,11 +902,29 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	semaStart := time.Now()
-	if err := wp.sema.Acquire(r.Context()); err != nil {
-		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-		return
+	// backendStatus is set to the backend's final status after the reverse-proxy
+	// call (see below); the adaptive limiter's deferred Release reads it to learn
+	// whether the request was a backend failure (5xx = overload signal). It stays
+	// 0 on WAF-side early rejects (ban/DDoS/block), which are fast and never
+	// touched the backend, so the controller correctly treats them as healthy.
+	var backendStatus int
+	if wp.adaptive != nil {
+		// Adaptive admission: shed fast (503) at the self-tuned limit instead of
+		// queueing. Latency + drop feedback is fed back on Release.
+		if err := wp.adaptive.Acquire(r.Context()); err != nil {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		slotStart := time.Now()
+		defer func() { wp.adaptive.Release(time.Since(slotStart), backendStatus >= 500) }()
+	} else {
+		if err := wp.sema.Acquire(r.Context()); err != nil {
+			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		defer wp.sema.Release()
 	}
-	defer wp.sema.Release()
 	semaWait := time.Since(semaStart)
 
 	clientIP := wp.ipExtractor.ClientIP(r)
@@ -1321,6 +1345,9 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Forward to backend.
 	wp.proxy.ServeHTTP(rec, r)
+	// Feed the backend's final status to the adaptive limiter's deferred Release
+	// (a 5xx is the overload/failure signal that shrinks the admission limit).
+	backendStatus = rec.statusCode
 
 	if !tx.IsBlocked() {
 		// RecordPassDetailed feeds the per-method, exact-status, and
@@ -1360,65 +1387,84 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 		return wp.replaceWithSynthetic(res, intr)
 	}
 
+	// Strip uninspectable response trailers (RESP-TRAILER-001). Trailer fields
+	// arrive AFTER the body, so their values are visible to neither the Phase-3
+	// header rules above nor the Phase-4 body/DLP scan below — a compromised
+	// origin could relocate a leaked secret into a trailer to bypass egress
+	// inspection. gRPC/streaming responses (which legitimately carry grpc-status
+	// in trailers) are exempt; they are streamed through uninspected by design.
+	stripUninspectableResponseTrailers(res)
+
 	// Phase 4: Response Body (inspect capped prefix, forward full body).
-	if res.Body == nil {
-		return nil
-	}
-	maxInspect := wp.conf().MaxBodyBytes
-	if maxInspect <= 0 {
-		maxInspect = 1 << 20
-	}
-	limited := io.LimitReader(res.Body, maxInspect)
-	inspectBody, err := io.ReadAll(limited)
-	if err != nil {
-		return err
-	}
-
-	// Decompress a Content-Encoding'd response prefix for INSPECTION ONLY.
-	// Without this, gzip/br/deflate responses (the common case once an attacker
-	// sends Accept-Encoding: gzip, which is forwarded to the origin) bypass the
-	// response-phase leak rules and the credential-redaction regex, because the
-	// engine scans compressed bytes that never match. We inspect the decoded
-	// prefix but forward the ORIGINAL compressed stream unchanged. Gated on the
-	// same decompress_inspect flag as the request path; res.Uncompressed means
-	// Go's transport already inflated the body, so we leave it alone.
-	scanBody := inspectBody
-	compressed := false
-	// Read decompression settings from the atomic snapshot, not the live cfg —
-	// the request path already does this (conf()), and reading wp.cfg directly
-	// here races the admin-config writer mutating these fields under lock.
-	rcfg := wp.conf()
-	if rcfg.DecompressInspect && !res.Uncompressed {
-		if decoded, reason := maybeDecompressBody(res.Header, inspectBody,
-			rcfg.DecompressRatioCap, rcfg.MaxDecompressBytes); reason == "" && len(decoded) > 0 {
-			scanBody = decoded
-			compressed = true
+	//
+	// Streaming responses (Server-Sent Events, multipart/x-mixed-replace, gRPC)
+	// must NOT be buffered (RESP-SSE-001): io.ReadAll below blocks until
+	// MaxBodyBytes accumulates or the stream closes, so a long-lived stream
+	// delivers nothing to the client until then (breaking SSE/long-poll/LLM
+	// token streaming) while pinning a ServeHTTP concurrency slot for the whole
+	// duration. Skip the body-prefix inspection/redaction for those and let the
+	// reverse proxy stream them through (its copyResponse flushes
+	// text/event-stream and unknown-length bodies incrementally). The Phase-3
+	// header rules already ran; skipping the body scan here is best-effort DLP,
+	// consistent with the compressed-body case below. Security headers further
+	// down still apply.
+	if res.Body != nil && !isStreamingContentType(res) {
+		maxInspect := wp.conf().MaxBodyBytes
+		if maxInspect <= 0 {
+			maxInspect = 1 << 20
 		}
-	}
+		limited := io.LimitReader(res.Body, maxInspect)
+		inspectBody, err := io.ReadAll(limited)
+		if err != nil {
+			return err
+		}
 
-	if intr := wp.eng.ProcessResponseBody(tx, scanBody); intr != nil {
-		wp.recordBlockFromResponse(tx, intr)
-		return wp.replaceWithSynthetic(res, intr)
-	}
+		// Decompress a Content-Encoding'd response prefix for INSPECTION ONLY.
+		// Without this, gzip/br/deflate responses (the common case once an attacker
+		// sends Accept-Encoding: gzip, which is forwarded to the origin) bypass the
+		// response-phase leak rules and the credential-redaction regex, because the
+		// engine scans compressed bytes that never match. We inspect the decoded
+		// prefix but forward the ORIGINAL compressed stream unchanged. Gated on the
+		// same decompress_inspect flag as the request path; res.Uncompressed means
+		// Go's transport already inflated the body, so we leave it alone.
+		scanBody := inspectBody
+		compressed := false
+		// Read decompression settings from the atomic snapshot, not the live cfg —
+		// the request path already does this (conf()), and reading wp.cfg directly
+		// here races the admin-config writer mutating these fields under lock.
+		rcfg := wp.conf()
+		if rcfg.DecompressInspect && !res.Uncompressed {
+			if decoded, reason := maybeDecompressBody(res.Header, inspectBody,
+				rcfg.DecompressRatioCap, rcfg.MaxDecompressBytes); reason == "" && len(decoded) > 0 {
+				scanBody = decoded
+				compressed = true
+			}
+		}
 
-	// Redact leaked credentials before forwarding. This only works on a
-	// plaintext body we pass through as-is; a compressed body was inspected
-	// (decoded) for BLOCK decisions above but cannot be redacted in place
-	// without re-compressing, so we forward it unredacted — the block path
-	// already neutralises the worst case (e.g. a PEM private key replaces the
-	// whole response).
-	if !compressed {
-		inspectBody = credLeakRE.ReplaceAll(inspectBody, []byte("${1}=[REDACTED]"))
-	}
-	res.Header.Del("Content-Length")
-	res.ContentLength = -1
+		if intr := wp.eng.ProcessResponseBody(tx, scanBody); intr != nil {
+			wp.recordBlockFromResponse(tx, intr)
+			return wp.replaceWithSynthetic(res, intr)
+		}
 
-	// Reconstruct full body: inspected prefix + remainder of original stream.
-	// multiReadCloser propagates Close to the original response body so the
-	// backend connection is released even if the client disconnects early.
-	res.Body = &multiReadCloser{
-		reader: io.MultiReader(bytes.NewReader(inspectBody), res.Body),
-		closer: res.Body,
+		// Redact leaked credentials before forwarding. This only works on a
+		// plaintext body we pass through as-is; a compressed body was inspected
+		// (decoded) for BLOCK decisions above but cannot be redacted in place
+		// without re-compressing, so we forward it unredacted — the block path
+		// already neutralises the worst case (e.g. a PEM private key replaces the
+		// whole response).
+		if !compressed {
+			inspectBody = credLeakRE.ReplaceAll(inspectBody, []byte("${1}=[REDACTED]"))
+		}
+		res.Header.Del("Content-Length")
+		res.ContentLength = -1
+
+		// Reconstruct full body: inspected prefix + remainder of original stream.
+		// multiReadCloser propagates Close to the original response body so the
+		// backend connection is released even if the client disconnects early.
+		res.Body = &multiReadCloser{
+			reader: io.MultiReader(bytes.NewReader(inspectBody), res.Body),
+			closer: res.Body,
+		}
 	}
 
 	// Inject security headers and strip identifying ones.
@@ -1470,6 +1516,39 @@ func (wp *WAFProxy) modifyResponse(res *http.Response) error {
 	res.Header.Del("X-Powered-By")
 
 	return nil
+}
+
+// isStreamingContentType reports whether a backend response is a long-lived
+// stream that must be forwarded incrementally rather than buffered for
+// prefix inspection (RESP-SSE-001). We key on explicit streaming content types
+// only — a plain chunked HTML/JSON response (unknown Content-Length) closes
+// promptly and is still safe to buffer up to the inspection cap, so it stays
+// inspected.
+func isStreamingContentType(res *http.Response) bool {
+	if res == nil {
+		return false
+	}
+	ct := strings.ToLower(strings.TrimSpace(res.Header.Get("Content-Type")))
+	return strings.HasPrefix(ct, "text/event-stream") ||
+		strings.HasPrefix(ct, "multipart/x-mixed-replace") ||
+		strings.HasPrefix(ct, "application/grpc")
+}
+
+// stripUninspectableResponseTrailers removes HTTP response trailers (and their
+// announce header) before the WAF forwards the response (RESP-TRAILER-001).
+// Trailer fields arrive after the body, so the WAF cannot inspect their values
+// without buffering the entire response; rather than forward an uninspected
+// egress channel a hostile origin could hide secrets in, we drop them.
+// Streaming/gRPC responses are exempt — gRPC carries grpc-status/grpc-message as
+// trailers and is streamed through uninspected by design.
+func stripUninspectableResponseTrailers(res *http.Response) {
+	if res == nil || isStreamingContentType(res) {
+		return
+	}
+	if len(res.Trailer) > 0 {
+		res.Trailer = nil
+	}
+	res.Header.Del("Trailer")
 }
 
 func (wp *WAFProxy) recordBlockFromResponse(tx *core.Transaction, intr *core.Interruption) {

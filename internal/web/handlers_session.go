@@ -408,7 +408,7 @@ func (s *Server) handlePowVerify(w http.ResponseWriter, r *http.Request) {
 			s.sessions.RecordPowPass(sessID)
 		}
 	}
-	cookieValue := signPowCookie(s.cfg.PoWSecret, sessID, time.Now().Unix())
+	cookieValue := signPowCookie(s.cfg.PoWSecret, sessID, clientIP, time.Now().Unix())
 	if cookieValue == "" {
 		// PoWSecret was empty — refuse to issue rather than fall back
 		// to a hardcoded constant (the previous bug). PoWSecret is
@@ -502,13 +502,13 @@ func (s *Server) handleJA3Stats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats := s.proxy.JA3Stats()
 	writeJSON(w, map[string]interface{}{
-		"enabled":          true,
-		"hard_block":       s.cfg.JA3HardBlock,
-		"header":           s.cfg.JA3Header,
-		"trusted_sources":  s.cfg.JA3TrustedSources,
-		"cache_capacity":   s.cfg.JA3CacheCapacity,
-		"cache_ttl_sec":    s.cfg.JA3CacheTTLSec,
-		"stats":            stats,
+		"enabled":         true,
+		"hard_block":      s.cfg.JA3HardBlock,
+		"header":          s.cfg.JA3Header,
+		"trusted_sources": s.cfg.JA3TrustedSources,
+		"cache_capacity":  s.cfg.JA3CacheCapacity,
+		"cache_ttl_sec":   s.cfg.JA3CacheTTLSec,
+		"stats":           stats,
 	})
 }
 
@@ -528,14 +528,14 @@ func (s *Server) handlePoWStats(w http.ResponseWriter, r *http.Request) {
 		proxyStats = s.proxy.PoWStats()
 	}
 	writeJSON(w, map[string]interface{}{
-		"enabled":         true,
-		"trigger_score":   s.cfg.PoWTriggerScore,
-		"min_difficulty":  issuerStats.Min,
-		"max_difficulty":  issuerStats.Max,
-		"token_ttl_sec":   issuerStats.TTLSec,
-		"cookie_ttl_sec":  s.cfg.PoWCookieTTLSec,
-		"seen_count":      issuerStats.SeenCount,
-		"proxy_counters":  proxyStats,
+		"enabled":        true,
+		"trigger_score":  s.cfg.PoWTriggerScore,
+		"min_difficulty": issuerStats.Min,
+		"max_difficulty": issuerStats.Max,
+		"token_ttl_sec":  issuerStats.TTLSec,
+		"cookie_ttl_sec": s.cfg.PoWCookieTTLSec,
+		"seen_count":     issuerStats.SeenCount,
+		"proxy_counters": proxyStats,
 	})
 }
 
@@ -552,12 +552,12 @@ func (s *Server) handlePoWAdaptiveStats(w http.ResponseWriter, r *http.Request) 
 	}
 	stats := s.powAdapt.Stats()
 	writeJSON(w, map[string]interface{}{
-		"enabled":          true,
-		"ips_tracked":      stats.IPsTracked,
-		"tier_bumps":       stats.TierBumps,
-		"total_queries":    stats.TotalQueries,
-		"load_hint":        stats.LoadHint,
-		"tier2_failures":   s.cfg.PoWAdaptiveTier2Failures,
+		"enabled":            true,
+		"ips_tracked":        stats.IPsTracked,
+		"tier_bumps":         stats.TierBumps,
+		"total_queries":      stats.TotalQueries,
+		"load_hint":          stats.LoadHint,
+		"tier2_failures":     s.cfg.PoWAdaptiveTier2Failures,
 		"tier2_penalty_bits": s.cfg.PoWAdaptiveTier2PenaltyBits,
 	})
 }
@@ -575,12 +575,12 @@ func (s *Server) handleIntelStats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats := s.intelMgr.Stats()
 	writeJSON(w, map[string]interface{}{
-		"enabled":         true,
-		"learning_hours":  s.cfg.IntelFeedsLearningHours,
-		"total_fetches":   stats.TotalFetches,
-		"total_failures":  stats.TotalFailures,
-		"total_entries":   stats.TotalEntries,
-		"sources":         stats.Sources,
+		"enabled":        true,
+		"learning_hours": s.cfg.IntelFeedsLearningHours,
+		"total_fetches":  stats.TotalFetches,
+		"total_failures": stats.TotalFailures,
+		"total_entries":  stats.TotalEntries,
+		"sources":        stats.Sources,
 	})
 }
 
@@ -597,15 +597,15 @@ func (s *Server) handleMultiLimitStats(w http.ResponseWriter, r *http.Request) {
 	}
 	stats := s.multiLim.Stats()
 	writeJSON(w, map[string]interface{}{
-		"enabled":         true,
-		"window_sec":      s.cfg.MultiLimitWindowSec,
-		"tracked":         stats.Tracked,
-		"cap":             stats.Cap,
-		"checks":          stats.Checks,
-		"allowed":         stats.Allowed,
-		"blocked":         stats.Blocked,
-		"dropped":         stats.Dropped,
-		"blocked_by_dim":  stats.BlockedByDim,
+		"enabled":        true,
+		"window_sec":     s.cfg.MultiLimitWindowSec,
+		"tracked":        stats.Tracked,
+		"cap":            stats.Cap,
+		"checks":         stats.Checks,
+		"allowed":        stats.Allowed,
+		"blocked":        stats.Blocked,
+		"dropped":        stats.Dropped,
+		"blocked_by_dim": stats.BlockedByDim,
 		"budgets": map[string]int{
 			"ip":        s.cfg.MultiLimitIPRPM,
 			"ja4":       s.cfg.MultiLimitJA4RPM,
@@ -648,12 +648,12 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	ok, badSeq, total := s.audit.Verify()
 	appends, verifyFails := s.audit.Stats()
 	writeJSON(w, map[string]interface{}{
-		"enabled":       true,
-		"ok":            ok,
-		"bad_seq":       badSeq,
-		"total":         total,
-		"appends":       appends,
-		"verify_fails":  verifyFails,
+		"enabled":      true,
+		"ok":           ok,
+		"bad_seq":      badSeq,
+		"total":        total,
+		"appends":      appends,
+		"verify_fails": verifyFails,
 	})
 }
 
@@ -693,23 +693,36 @@ func parseUintCapped(s string, max uint64) uint64 {
 }
 
 // signPowCookie produces a value of the form "<id>.<unix>.<mac>" where
-// mac = HMAC-SHA256(secret, id || "." || unix)[:12] base64url-encoded.
+// mac = HMAC-SHA256(secret, id || "." || unix || "|" || ipKey) base64url-encoded.
 // We carry the issuance time so the proxy can reject cookies older than
 // the configured PoW window even if the cookie's own MaxAge is honoured
 // loosely by an old browser.
+//
+// ipKey is the canonical client-IP key (the same v4 /32 // v6 /64 key the rest
+// of the abuse pipeline uses). It is folded into the MAC but NOT stored in the
+// cookie — so a solved cookie minted for one network identity fails verification
+// when presented from a different IP (POW-AMORTIZE-001). Without this binding a
+// single solved cookie is a bearer token an attacker can copy across an entire
+// botnet to skip the gate fleet-wide for the cookie's lifetime. An empty ipKey
+// (e.g. tests without an IP extractor) folds nothing, so verification must use
+// the same empty key.
 //
 // An empty secret returns "" — callers MUST treat that as "do not issue
 // the cookie" rather than falling back to a constant string. A constant
 // fallback would be a globally-known signing key, letting any attacker
 // forge a "pow passed" cookie for any session. The previous code had
 // such a fallback ("wewaf-pow-fallback") and that has been removed.
-func signPowCookie(secret, id string, issuedAt int64) string {
+func signPowCookie(secret, id, ipKey string, issuedAt int64) string {
 	if secret == "" {
 		return ""
 	}
 	body := id + "." + strconv.FormatInt(issuedAt, 10)
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(body))
+	if ipKey != "" {
+		mac.Write([]byte("|"))
+		mac.Write([]byte(ipKey))
+	}
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	return body + "." + sig
 }

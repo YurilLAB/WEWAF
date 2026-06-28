@@ -387,17 +387,47 @@ func (e *Engine) ProcessRequestBody(tx *core.Transaction) *core.Interruption {
 	// packed with parameters can't blow up the target map.
 	if e.isFormURLEncoded(tx.Request) && body != "" {
 		const maxFormFields = 256
-		if values, err := url.ParseQuery(body); err == nil {
-			added := 0
-			for k, vs := range values {
-				if added >= maxFormFields {
-					e.logger.Warnf("engine: form-field limit (%d) reached", maxFormFields)
-					break
-				}
-				decoded := strings.Join(vs, ", ")
-				targets["args."+k] = FoldHomoglyphs(Canonicalize(decoded))
-				added++
+		// Parse the body the way the backend will: split on '&' only and
+		// percent-decode each pair. Go's url.ParseQuery rejects the WHOLE body
+		// with an error on any ';' (Go 1.17+: "invalid semicolon separator in
+		// query") and returns an unusable map — so a single stray ';' anywhere
+		// in the body previously skipped this entire block, leaving the payload
+		// only in the raw, percent-encoded "body" target where no signature
+		// matches: a clean bypass of every args/body rule (XSS/SQLi/RCE/…) on
+		// the most common attack content type. PHP/Java/Node/Python split form
+		// bodies on '&' only and treat ';' as a literal value byte, so do the
+		// same here and keep inspecting regardless of separators.
+		fields := make(map[string]string, 8)
+		for _, pair := range strings.Split(body, "&") {
+			if pair == "" {
+				continue
 			}
+			rawKey, rawVal, _ := strings.Cut(pair, "=")
+			k, err := url.QueryUnescape(rawKey)
+			if err != nil {
+				k = rawKey
+			}
+			if k == "" {
+				continue
+			}
+			v, err := url.QueryUnescape(rawVal)
+			if err != nil {
+				v = rawVal
+			}
+			if existing, ok := fields[k]; ok {
+				fields[k] = existing + ", " + v
+			} else {
+				fields[k] = v
+			}
+		}
+		added := 0
+		for k, v := range fields {
+			if added >= maxFormFields {
+				e.logger.Warnf("engine: form-field limit (%d) reached", maxFormFields)
+				break
+			}
+			targets["args."+k] = FoldHomoglyphs(Canonicalize(v))
+			added++
 		}
 	}
 

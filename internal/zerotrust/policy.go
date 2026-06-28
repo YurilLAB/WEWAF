@@ -160,7 +160,17 @@ func (e *Engine) SetPolicies(policies []*Policy) error {
 		if p.PathExact != "" {
 			p.pathExactNorm = strings.ToLower(normalizePath(p.PathExact))
 		}
-		p.pathPrefixNorm = strings.ToLower(p.PathPrefix)
+		// Canonicalize the prefix the same way the request path is (matches()
+		// compares against lower(normalizePath(req.path))). Previously the
+		// prefix was only lowercased, so an operator prefix like "/admin/"
+		// stayed "/admin/" while a request to the prefix root canonicalized to
+		// "/admin" — HasPrefix("/admin","/admin/") is false, so the prefix
+		// ROOT was served WITHOUT the policy's mTLS/IP/method checks. Guard on
+		// non-empty: normalizePath("") returns "/", which would match every
+		// request.
+		if p.PathPrefix != "" {
+			p.pathPrefixNorm = strings.ToLower(normalizePath(p.PathPrefix))
+		}
 		compiled = append(compiled, &p)
 	}
 	// Warn loudly if a country rule is configured but no GeoIP lookup is wired:

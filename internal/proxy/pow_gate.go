@@ -38,6 +38,21 @@ func (wp *WAFProxy) hasValidPoWCookie(r *http.Request, sessID string) bool {
 	body := parts[0] + "." + parts[1]
 	mac := hmac.New(sha256.New, []byte(wp.conf().PoWSecret))
 	mac.Write([]byte(body))
+	// Fold the client's canonical IP key into the MAC, mirroring
+	// handlers_session.go:signPowCookie. A cookie minted for one IP fails this
+	// check from a different IP, so a solved cookie can't be copied across a
+	// botnet to amortize one solve fleet-wide (POW-AMORTIZE-001). The key is
+	// derived from the request (never stored in the cookie). When no extractor
+	// is wired (tests) ipKey is "" and nothing is folded — matching a cookie
+	// signed with an empty key.
+	ipKey := ""
+	if wp.ipExtractor != nil {
+		ipKey = wp.ipExtractor.ClientIP(r)
+	}
+	if ipKey != "" {
+		mac.Write([]byte("|"))
+		mac.Write([]byte(ipKey))
+	}
 	// Full SHA-256 digest — must match handlers_session.go:signPowCookie.
 	// The previous truncation to 12 bytes provided no security benefit
 	// and was the one footgun shared across all our cookie signers.
@@ -248,4 +263,3 @@ func isPoWBypassPath(p string) bool {
 	// or test setups some operators expose both — this keeps them working.)
 	return false
 }
-

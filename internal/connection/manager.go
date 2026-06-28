@@ -13,9 +13,13 @@ package connection
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,6 +78,13 @@ type Manager struct {
 	probing      atomic.Bool // true while a probe is in flight
 	totalProbes  atomic.Uint64
 	failedProbes atomic.Uint64
+
+	// blockPrivate, when true, makes the probe refuse loopback/private/
+	// link-local targets in addition to the always-blocked cloud-metadata
+	// endpoints. Set once at startup (before Start) from the operator's
+	// egress_block_private_ips policy. Default false because the WAF's own
+	// backend is legitimately often on localhost/RFC1918.
+	blockPrivate bool
 }
 
 // NewManager constructs a manager seeded with initial config.
@@ -98,10 +109,123 @@ func NewManager(initial Config) *Manager {
 	return m
 }
 
+// SetSSRFPolicy configures whether the probe also blocks private/loopback/
+// link-local targets (cloud-metadata endpoints are always blocked). Call once
+// before Start; it has no effect on an already-running probe loop's in-flight
+// request but takes effect on the next dial (the dialer reads it live).
+func (m *Manager) SetSSRFPolicy(blockPrivate bool) {
+	m.mu.Lock()
+	m.blockPrivate = blockPrivate
+	m.mu.Unlock()
+}
+
 func (m *Manager) rebuildClient() {
+	// The probe target is operator-set (admin API / ypanel), so it is an SSRF
+	// sink: a misused/leaked admin key could repoint it at internal services or
+	// the cloud-metadata endpoint and use the reachable/latency response as a
+	// blind oracle. Guard the dialer (classify the resolved IP at dial time, so
+	// DNS-rebinding is caught), reject non-http(s) schemes (done in
+	// UpdateConfig), and refuse to follow redirects (so a public URL can't
+	// bounce the probe into the internal range). See CONN-SSRF-001.
 	m.client = &http.Client{
 		Timeout: time.Duration(m.cfg.TimeoutMs) * time.Millisecond,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Don't follow: surface the redirect itself as the response without
+			// dialing its (possibly internal) target.
+			return http.ErrUseLastResponse
+		},
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           m.guardedDialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
 	}
+}
+
+// guardedDialContext resolves the target host and refuses to connect to a
+// disallowed IP (cloud metadata always; private/loopback/link-local when
+// blockPrivate is set). Classification happens at dial time against the IP we
+// are about to connect to, which also defeats DNS rebinding.
+func (m *Manager) guardedDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	blockPrivate := m.blockPrivate
+	m.mu.RUnlock()
+	var d net.Dialer
+	var firstErr error
+	for _, ipa := range ips {
+		if reason := targetDisallowed(ipa.IP, blockPrivate); reason != "" {
+			firstErr = fmt.Errorf("connection: probe target %s blocked (%s)", ipa.IP, reason)
+			continue
+		}
+		conn, derr := d.DialContext(ctx, network, net.JoinHostPort(ipa.IP.String(), port))
+		if derr == nil {
+			return conn, nil
+		}
+		firstErr = derr
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("connection: no dialable address for %q", host)
+	}
+	return nil, firstErr
+}
+
+// metadataIPs are cloud instance-metadata endpoints — never a legitimate
+// backend, so blocked even when private targets are otherwise allowed.
+var metadataIPs = []net.IP{
+	net.ParseIP("169.254.169.254"), // AWS, GCP, Azure, OpenStack, DigitalOcean
+	net.ParseIP("100.100.100.200"), // Alibaba Cloud
+	net.ParseIP("fd00:ec2::254"),   // AWS IMDS over IPv6
+}
+
+// targetDisallowed returns a non-empty reason if ip must not be dialed.
+func targetDisallowed(ip net.IP, blockPrivate bool) string {
+	if ip == nil {
+		return "unparseable address"
+	}
+	if v4 := ip.To4(); v4 != nil { // unwrap IPv4-mapped IPv6
+		ip = v4
+	}
+	for _, md := range metadataIPs {
+		if ip.Equal(md) {
+			return "cloud metadata endpoint"
+		}
+	}
+	if !blockPrivate {
+		return ""
+	}
+	switch {
+	case ip.IsLoopback():
+		return "loopback"
+	case ip.IsPrivate():
+		return "private (RFC1918/ULA)"
+	case ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast():
+		return "link-local"
+	case ip.IsUnspecified():
+		return "unspecified"
+	}
+	return ""
+}
+
+// validBackendURL reports whether s is an http/https URL with a host. The probe
+// must never be pointed at file://, gopher://, etc.
+func validBackendURL(s string) bool {
+	u, err := url.Parse(strings.TrimSpace(s))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
 }
 
 // Start launches the background probe loop.
@@ -287,7 +411,14 @@ func (m *Manager) EventHistory() []Event {
 func (m *Manager) UpdateConfig(patch Config) Config {
 	m.mu.Lock()
 	if patch.BackendURL != "" {
-		m.cfg.BackendURL = patch.BackendURL
+		// Reject non-http(s) schemes before they reach the probe dialer
+		// (CONN-SSRF-001): file://, gopher://, etc. have no business being a
+		// backend and are classic SSRF amplifiers.
+		if validBackendURL(patch.BackendURL) {
+			m.cfg.BackendURL = patch.BackendURL
+		} else {
+			log.Printf("connection: rejecting backend_url %q — only http/https URLs are allowed", patch.BackendURL)
+		}
 	}
 	if patch.ListenAddr != "" {
 		m.cfg.ListenAddr = patch.ListenAddr

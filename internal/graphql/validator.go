@@ -34,13 +34,13 @@ import (
 
 // Config controls the validator. Zero values fall back to sane defaults.
 type Config struct {
-	Enabled         bool
-	MaxDepth        int // default 7
-	MaxAliases      int // default 10
-	MaxFields       int // default 200
-	SchemaSDL       string
-	RequireRoleHdr  string // header name carrying the requester's role (e.g. "X-User-Role")
-	BlockOnError    bool   // if false, log-only
+	Enabled        bool
+	MaxDepth       int // default 7
+	MaxAliases     int // default 10
+	MaxFields      int // default 200
+	SchemaSDL      string
+	RequireRoleHdr string // header name carrying the requester's role (e.g. "X-User-Role")
+	BlockOnError   bool   // if false, log-only
 	// BlockSubscriptions rejects all `subscription` operations outright.
 	// GraphQL subscriptions usually arrive over WebSocket frames that a
 	// classic HTTP WAF can't fully inspect; if the backend doesn't use
@@ -51,9 +51,9 @@ type Config struct {
 
 // Validator holds compiled schema state. Safe for concurrent use.
 type Validator struct {
-	cfg         atomic.Pointer[Config]
-	schema      atomic.Pointer[ast.Schema]
-	mu          sync.Mutex // serialises schema reloads
+	cfg    atomic.Pointer[Config]
+	schema atomic.Pointer[ast.Schema]
+	mu     sync.Mutex // serialises schema reloads
 
 	// Stats — atomic counters surfaced via /api/graphql/stats.
 	statsRequests        atomic.Uint64
@@ -183,6 +183,19 @@ type Result struct {
 	Fields  int
 }
 
+// maxParseTokens bounds gqlparser's recursive-descent parse. The default
+// (parser.ParseQuery) sets an UNLIMITED token budget, so a body of deeply
+// nested selection sets or list literals ("{a{a{…" / "[[[…", reachable just
+// under the 1 MiB extract cap) recurses ~1M frames and crashes the entire
+// process with a non-recoverable "goroutine stack exceeds 1000000000-byte
+// limit" — BEFORE any post-parse guard (walkSelectionSet/MaxDepth) can run,
+// and recover() cannot catch a fatal stack overflow. A bounded token limit
+// makes the parser reject such input as an ordinary parse error (counted as a
+// parse-fail and forwarded for the backend to reject) after a few thousand
+// tokens: far below any stack/memory pressure, far above any legitimate
+// query's token count.
+const maxParseTokens = 20000
+
 // Validate parses the GraphQL query in bodyJSON (the raw HTTP body) and
 // runs it through the configured structural + schema-aware checks.
 // Returns Result.Blocked=true if the request should be rejected.
@@ -212,7 +225,7 @@ func (v *Validator) Validate(bodyJSON []byte, role string) Result {
 	var subscriptionReason string
 	var primaryOpName string
 	for idx, query := range queries {
-		doc, gerr := parser.ParseQuery(&ast.Source{Name: "request", Input: query})
+		doc, gerr := parser.ParseQueryWithTokenLimit(&ast.Source{Name: "request", Input: query}, maxParseTokens)
 		if gerr != nil {
 			v.statsParseFails.Add(1)
 			// Malformed — let the backend reject it with a native error.
@@ -467,14 +480,14 @@ func (v *Validator) Recent() []Sample {
 // StatsSnapshot returns the counters for the admin API.
 func (v *Validator) StatsSnapshot() map[string]uint64 {
 	return map[string]uint64{
-		"requests":             v.statsRequests.Load(),
-		"blocked":              v.statsBlocked.Load(),
-		"depth_fails":          v.statsDepthFails.Load(),
-		"alias_fails":          v.statsAliasFails.Load(),
-		"field_fails":          v.statsFieldFails.Load(),
-		"auth_fails":           v.statsAuthFails.Load(),
-		"parse_fails":          v.statsParseFails.Load(),
-		"subscriptions":        v.statsSubscriptions.Load(),
-		"subscription_blocks":  v.statsSubscriptBlocks.Load(),
+		"requests":            v.statsRequests.Load(),
+		"blocked":             v.statsBlocked.Load(),
+		"depth_fails":         v.statsDepthFails.Load(),
+		"alias_fails":         v.statsAliasFails.Load(),
+		"field_fails":         v.statsFieldFails.Load(),
+		"auth_fails":          v.statsAuthFails.Load(),
+		"parse_fails":         v.statsParseFails.Load(),
+		"subscriptions":       v.statsSubscriptions.Load(),
+		"subscription_blocks": v.statsSubscriptBlocks.Load(),
 	}
 }
