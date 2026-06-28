@@ -69,6 +69,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return c.get(stdout, stderr, "/api/bans", *jsonOut)
 	case "rules":
 		return c.get(stdout, stderr, "/api/rules", *jsonOut)
+	case "cluster":
+		return c.get(stdout, stderr, "/api/cluster", *jsonOut)
 	case "ban":
 		return c.ban(cmdArgs, stdout, stderr)
 	case "unban":
@@ -105,6 +107,7 @@ Commands:
   config get [field]                print config (all, or a single field)
   config set <field> <value>        set one config field
   rules                             list active rules
+  cluster                           show the WEWAF cluster (this node + peers)
 
 Examples:
   wafctl status

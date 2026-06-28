@@ -145,6 +145,11 @@ type Config struct {
 	MeshAPIKey            string   `json:"mesh_api_key"`
 	MeshSyncTimeoutSec    int      `json:"mesh_sync_timeout_sec"`
 
+	// Native cluster identity (see internal/cluster). NodeName defaults to the
+	// hostname; ClusterName groups nodes in the ypanel / wafctl cluster view.
+	NodeName    string `json:"node_name"`
+	ClusterName string `json:"cluster_name"`
+
 	// Response hardening
 	SecurityHeadersEnabled bool `json:"security_headers_enabled"`
 	// HSTS (Strict-Transport-Security). Only emitted when the backend is
@@ -454,6 +459,7 @@ func Default() *Config {
 		MeshPeers:                []string{},
 		MeshGossipIntervalSec:    60,
 		MeshSyncTimeoutSec:       10,
+		ClusterName:              "default",
 		SecurityHeadersEnabled:   true,
 		// HSTS defaults: opt-in. 180 days is the safe starting value most
 		// guides recommend before ratcheting up to 2 years and preload.
@@ -1128,6 +1134,8 @@ func (c *Config) Snapshot() *Config {
 		MeshGossipIntervalSec:    c.MeshGossipIntervalSec,
 		MeshAPIKey:               c.MeshAPIKey,
 		MeshSyncTimeoutSec:       c.MeshSyncTimeoutSec,
+		NodeName:                 c.NodeName,
+		ClusterName:              c.ClusterName,
 		SecurityHeadersEnabled:   c.SecurityHeadersEnabled,
 		HSTSEnabled:              c.HSTSEnabled,
 		HSTSMaxAgeSec:            c.HSTSMaxAgeSec,

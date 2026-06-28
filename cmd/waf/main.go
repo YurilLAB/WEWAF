@@ -21,6 +21,7 @@ import (
 	"wewaf/internal/audit"
 	"wewaf/internal/bruteforce"
 	"wewaf/internal/clientip"
+	"wewaf/internal/cluster"
 	"wewaf/internal/config"
 	"wewaf/internal/connection"
 	"wewaf/internal/core"
@@ -954,6 +955,27 @@ func main() {
 	wdog.Start(rootCtx)
 	defer wdog.Stop()
 
+	// Native cluster identity + membership manager. WEWAF nodes coordinate
+	// directly over the mesh (no external control plane); the manager tracks this
+	// node's identity and, via the gossip loop below, its peers' health for
+	// /api/cluster and wafctl. NodeName defaults to the hostname.
+	nodeName := cfg.NodeName
+	if nodeName == "" {
+		if hn, herr := os.Hostname(); herr == nil {
+			nodeName = hn
+		} else {
+			nodeName = cfg.ListenAddr
+		}
+	}
+	clusterMgr := cluster.NewManager(cluster.NodeInfo{
+		ID:      nodeName,
+		Name:    nodeName,
+		Cluster: cfg.ClusterName,
+		Addr:    cfg.AdminAddr,
+		Version: wafVersion,
+	})
+	admin.AttachCluster(clusterMgr)
+
 	adminMux := http.NewServeMux()
 	admin.RegisterRoutes(adminMux)
 	// ReadHeaderTimeout closes a Slowloris gap that ReadTimeout alone leaves
@@ -1156,12 +1178,15 @@ func main() {
 							req.Header.Set("X-Mesh-Key", cfg.MeshAPIKey)
 						}
 
+						reqStart := time.Now()
 						resp, err := meshClient.Do(req)
 						cancel()
 						if err != nil {
 							log.Printf("mesh gossip: peer %s sync error: %v", peerURL, err)
+							clusterMgr.RecordPeerResult(peerURL, false, 0, cluster.NodeInfo{}, cluster.NodeSummary{}, time.Now().Unix())
 							continue
 						}
+						rttMs := time.Since(reqStart).Milliseconds()
 
 						// Bound the decoded body so a malicious peer cannot OOM
 						// the daemon. Reading one byte past the cap lets us
@@ -1178,8 +1203,10 @@ func main() {
 							continue
 						}
 						var result struct {
-							Status string          `json:"status"`
-							Bans   []core.BanEntry `json:"bans"`
+							Status  string              `json:"status"`
+							Bans    []core.BanEntry     `json:"bans"`
+							Node    cluster.NodeInfo    `json:"node"`
+							Summary cluster.NodeSummary `json:"summary"`
 						}
 						if err := json.Unmarshal(raw, &result); err != nil {
 							log.Printf("mesh gossip: peer %s decode error: %v", peerURL, err)
@@ -1187,6 +1214,9 @@ func main() {
 						}
 
 						if resp.StatusCode == http.StatusOK && result.Status == "synced" {
+							// Record the peer as reachable + learn its advertised
+							// identity and live summary for the cluster view.
+							clusterMgr.RecordPeerResult(peerURL, true, rttMs, result.Node, result.Summary, time.Now().Unix())
 							// Cap inbound ban durations at the operator's
 							// configured maximum (or 30 days) so a peer can't
 							// pin an IP to year-9999 expiry. Truncate the
@@ -1214,6 +1244,7 @@ func main() {
 							}
 							log.Printf("mesh gossip: peer %s synced, received %d bans", peerURL, len(result.Bans))
 						} else {
+							clusterMgr.RecordPeerResult(peerURL, false, rttMs, cluster.NodeInfo{}, cluster.NodeSummary{}, time.Now().Unix())
 							log.Printf("mesh gossip: peer %s returned status %d (status=%q)",
 								peerURL, resp.StatusCode, result.Status)
 						}

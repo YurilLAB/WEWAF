@@ -18,6 +18,7 @@ import (
 	"strconv"
 
 	"wewaf/internal/audit"
+	"wewaf/internal/cluster"
 	"wewaf/internal/config"
 	"wewaf/internal/connection"
 	"wewaf/internal/core"
@@ -59,6 +60,7 @@ type Server struct {
 	powAdapt   *pow.AdaptiveTier
 	intelMgr   *intel.Manager
 	multiLim   *limits.MultiLimiter
+	cluster    *cluster.Manager
 
 	meshEnabled  bool
 	meshPeers    []string
@@ -224,6 +226,9 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 
 	// Rate-limit + resource configuration.
 	api.HandleFunc("/api/ratelimit/config", s.handleRateLimitConfig)
+
+	// Native cluster view (membership + health of all WEWAF nodes in the mesh).
+	api.HandleFunc("/api/cluster", s.handleCluster)
 
 	// Distributed threat mesh
 	api.HandleFunc("/api/mesh/status", s.handleMeshStatus)
@@ -1645,15 +1650,21 @@ func (s *Server) handleMeshSync(w http.ResponseWriter, r *http.Request) {
 	s.meshLastSync = time.Now().UTC()
 	s.meshMu.Unlock()
 
-	// Return our own active bans.
+	// Return our own active bans + this node's identity/summary so the peer can
+	// render us in its cluster view.
 	var bans []core.BanEntry
 	if s.banList != nil {
 		bans = s.banList.List()
 	}
-	writeJSON(w, map[string]interface{}{
-		"status": "synced",
-		"bans":   bans,
-	})
+	resp := map[string]interface{}{
+		"status":  "synced",
+		"bans":    bans,
+		"summary": s.selfSummary(),
+	}
+	if s.cluster != nil {
+		resp["node"] = s.cluster.Self()
+	}
+	writeJSON(w, resp)
 }
 
 func (s *Server) handleEgressStatus(w http.ResponseWriter, r *http.Request) {
