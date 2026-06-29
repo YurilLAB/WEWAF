@@ -105,9 +105,9 @@ func TestTamperedCookieRejected(t *testing.T) {
 func TestTrustXFFGating(t *testing.T) {
 	// Same client RemoteAddr throughout, but XFF flips between two IPs.
 	cases := []struct {
-		name     string
-		trust    bool
-		wantIPs  int
+		name    string
+		trust   bool
+		wantIPs int
 	}{
 		{"no-trust", false, 1},
 		{"trust", true, 2},
@@ -205,7 +205,12 @@ func TestIdleTTLSweep(t *testing.T) {
 	}
 }
 
-func TestChallengeCookieRoundTrip(t *testing.T) {
+// TestChallengeCookieIssue covers the __wewaf_bc cookie's surviving role: a
+// client-side hint only. It must be JS-readable (HttpOnly:false so the passive
+// probe can self-skip) and carry the expected name. It is no longer verified
+// server-side — that surface (VerifyChallengeCookie) was dead false-protection
+// and was removed; the authoritative pass state is Session.ChallengePassed.
+func TestChallengeCookieIssue(t *testing.T) {
 	tr := NewTracker(Config{Enabled: true})
 	defer tr.Stop()
 
@@ -213,16 +218,11 @@ func TestChallengeCookieRoundTrip(t *testing.T) {
 	if c.Name != ChallengeCookieName {
 		t.Fatalf("wrong cookie name: %q", c.Name)
 	}
-	ts, ok := tr.VerifyChallengeCookie(value, 0)
-	if !ok {
-		t.Fatal("verify rejected our own-issued cookie")
+	if value == "" {
+		t.Fatal("empty cookie value")
 	}
-	if time.Since(ts) > time.Second {
-		t.Fatalf("timestamp implausibly old: %v", ts)
-	}
-	// Swap signature — should be rejected.
-	if _, ok := tr.VerifyChallengeCookie(value+"x", 0); ok {
-		t.Fatal("verify accepted tampered cookie")
+	if c.HttpOnly {
+		t.Fatal("__wewaf_bc must stay JS-readable (HttpOnly:false) for the beacon hint")
 	}
 }
 
@@ -357,36 +357,6 @@ func TestPowPassDoesNotCapScore(t *testing.T) {
 	after := tr.Score(s.ID)
 	if after <= 49 {
 		t.Fatalf("post-PoW score must NOT be capped to 49 (that neuters SessionBlockThreshold); got %d, true score was %d", after, rawHigh)
-	}
-}
-
-// TestVerifyChallengeCookie_TTLRejection closes the "solve once,
-// replay forever" bypass: the previous VerifyChallengeCookie only
-// checked the HMAC, so a captured cookie validated indefinitely. The
-// TTL gate now refuses cookies older than the configured window.
-func TestVerifyChallengeCookie_TTLRejection(t *testing.T) {
-	tr := NewTracker(Config{Enabled: true, IdleTTL: time.Minute})
-	defer tr.Stop()
-	_, value := tr.IssueChallengeCookie(false)
-
-	// ttl = 24h, cookie just issued — must verify.
-	if _, ok := tr.VerifyChallengeCookie(value, 24*time.Hour); !ok {
-		t.Fatal("fresh cookie should verify under 24h TTL")
-	}
-
-	// Forge an old cookie by re-signing a payload an hour in the past.
-	// We can't move time.Now backwards from inside a test, so we issue
-	// a cookie with a custom payload directly using the package-private
-	// signCookie helper would be simplest — but VerifyChallengeCookie's
-	// payload is a unix timestamp, so we just set ttl to 1ns and check
-	// that any non-future cookie is rejected.
-	if _, ok := tr.VerifyChallengeCookie(value, 1*time.Nanosecond); ok {
-		t.Fatal("ttl=1ns should reject any cookie issued before the call")
-	}
-
-	// ttl=0 disables the check (legacy / test path).
-	if _, ok := tr.VerifyChallengeCookie(value, 0); !ok {
-		t.Fatal("ttl=0 should fall through to signature-only verification")
 	}
 }
 

@@ -246,8 +246,37 @@ type Config struct {
 	SessionMaxSessions        int    `json:"session_max_sessions"`
 	SessionRequestRateCeiling int    `json:"session_request_rate_ceiling"`
 	SessionPathCountCeiling   int    `json:"session_path_count_ceiling"`
-	BrowserChallengeEnabled   bool   `json:"browser_challenge_enabled"`
-	BrowserChallengeBlock     bool   `json:"browser_challenge_block"` // if true, failed challenge blocks; else score-only
+	// BrowserChallengeEnabled reflects that the browser-integrity challenge is
+	// active. The passive probe always feeds the session score; Validate()
+	// forces this true whenever BrowserChallengeBlock is set so the two never
+	// contradict on the dashboard.
+	BrowserChallengeEnabled bool `json:"browser_challenge_enabled"`
+	// BrowserChallengeBlock escalates enforcement for un-verified sessions.
+	// Rather than a separate (and inherently forgeable) signal-based gate, it
+	// adds a fixed risk weight (+40) to any session that has NOT cleared a
+	// Proof-of-Work pass, lowering that session's effective PoW trigger to
+	// (PoWTriggerScore - 40). The weight is keyed on the session+IP-bound PoW
+	// pass cookie — NOT the client-supplied browser-integrity signals — so it
+	// can't be forged or replayed and it survives session eviction; the only way
+	// to shed it is to actually solve the PoW. Validate() force-enables session
+	// tracking + PoW (its required mechanism) so block mode can't silently no-op.
+	//
+	// It deliberately does NOT block a session directly: it only drives one into
+	// the PoW gate. Two consequences worth understanding before enabling it:
+	//   - With the default PoWTriggerScore (60), the +40 alone (effective trigger
+	//     20) only challenges an un-verified session once it has ALSO accrued ~20
+	//     of other risk (request-rate, path explosion, missing beacon, JA3
+	//     drift). A low-and-slow bot that rotates/omits its __wewaf_sid cookie
+	//     keeps base score 0 and is NOT caught by this alone — per-IP controls
+	//     (rate limiter, reputation, DDoS) cover that class. To challenge EVERY
+	//     un-verified session outright, lower PoWTriggerScore toward 40; cmd/waf
+	//     warns when the current thresholds leave the +40 unable to reach a band.
+	//   - Driving un-verified sessions into the PoW gate means cross-site top-
+	//     level POSTs (SAML/OIDC form_post, 3DS returns) and non-HTML XHR/API
+	//     calls from clients that don't run JS will be challenged too the moment
+	//     they cross the (lowered) trigger. Size PoWTriggerScore for the traffic
+	//     you actually serve.
+	BrowserChallengeBlock bool `json:"browser_challenge_block"`
 	// ChallengeTTLSec is how long a successful browser challenge stays
 	// valid. Once expired, the session must re-run the challenge before
 	// the missing-challenge score-bump is suppressed. Defaults to 24 h
@@ -816,6 +845,20 @@ func (c *Config) Validate() error {
 	// then shared the cookie" detection.
 	if c.ChallengeTTLSec > 7*86400 {
 		c.ChallengeTTLSec = 7 * 86400
+	}
+	// Block mode escalates an un-verified session's risk toward the Proof-of-Work
+	// gate, which is its hard, unforgeable step. That requires session tracking
+	// (no tracking → no score to escalate) AND PoW (the only way a client can
+	// shed the weight is by solving the challenge). Force all three on so the
+	// operator can't enable a "block" control that silently does nothing — every
+	// prior review of this feature found a silent-no-op footgun in one of these
+	// dependencies. PoWSecret is auto-generated at startup, so forcing PoW on is
+	// safe; the issuer is then built because PoWEnabled is true before cmd/waf
+	// reads it.
+	if c.BrowserChallengeBlock {
+		c.BrowserChallengeEnabled = true
+		c.SessionTrackingEnabled = true
+		c.PoWEnabled = true
 	}
 	if c.SessionScoreDecayPerMin < 0 {
 		c.SessionScoreDecayPerMin = 0

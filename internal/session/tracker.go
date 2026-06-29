@@ -304,16 +304,6 @@ func (t *Tracker) SetScoreDecayPerMin(rate int) {
 	t.scoreDecayPerMin.Store(int64(rate))
 }
 
-// ChallengeTTL returns the current challenge-pass freshness window.
-// Used by the proxy to verify __wewaf_bc cookies with the same TTL
-// the tracker is enforcing on its own ChallengePassed flag.
-func (t *Tracker) ChallengeTTL() time.Duration {
-	if t == nil {
-		return 24 * time.Hour
-	}
-	return time.Duration(t.challengeTTLSec.Load()) * time.Second
-}
-
 // Stop halts the cleanup goroutine. Safe to call multiple times.
 func (t *Tracker) Stop() {
 	t.stopOnce.Do(func() { close(t.stopCh) })
@@ -732,9 +722,15 @@ func (t *Tracker) verifyCookie(value string) (string, bool) {
 	return id, true
 }
 
-// IssueChallengeCookie returns a signed cookie value proving a browser
-// challenge was passed at a given time. The caller writes it via
-// http.SetCookie with the ChallengeCookieName name.
+// IssueChallengeCookie returns the `__wewaf_bc` cookie set after a
+// successful browser challenge. It is a CLIENT-SIDE hint only: the
+// challenge JS reads it (it is HttpOnly:false) to avoid re-running the
+// passive probe on every page, and it is NOT trusted server-side for any
+// enforcement decision. The authoritative, session-bound pass state lives
+// in Session.ChallengePassed (set by RecordChallengePass) and the
+// single-use gate nonce (IssueChallengeNonce) — neither of which a
+// replayable bearer cookie could satisfy. The cookie's value is a signed
+// timestamp purely so the client can reason about its own freshness.
 //
 // `secure` should be true when the originating request arrived over
 // TLS so the cookie is never sent over plaintext after a successful
@@ -756,60 +752,6 @@ func (t *Tracker) IssueChallengeCookie(secure bool) (*http.Cookie, string) {
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int((24 * time.Hour).Seconds()),
 	}, value
-}
-
-// VerifyChallengeCookie returns (timestamp, true) if the cookie value is
-// valid AND was issued within ttl of now. A false return should be
-// treated as "challenge not yet passed" rather than an error.
-//
-// The ttl check is the second half of the cookie's lifecycle:
-// http.Cookie.MaxAge tells the browser to drop the cookie after the
-// window, but a bot client that ignores MaxAge (or scrapes a cookie
-// from a real browser and replays it from somewhere else) doesn't
-// honour MaxAge. Without this server-side check the HMAC signature
-// alone validates a cookie issued months ago — exactly the kind of
-// "solve once, replay forever" bypass a scaled bot operator wants.
-//
-// ttl <= 0 disables the freshness check, preserving the previous
-// signature-only behaviour. Real callers always pass a positive
-// duration; the zero-disabled path is for tests + legacy callers.
-func (t *Tracker) VerifyChallengeCookie(value string, ttl time.Duration) (time.Time, bool) {
-	if value == "" || len(value) > maxCookieLen {
-		return time.Time{}, false
-	}
-	dot := strings.IndexByte(value, '.')
-	if dot <= 0 || dot == len(value)-1 {
-		return time.Time{}, false
-	}
-	payload := value[:dot]
-	mac := hmac.New(sha256.New, t.secret)
-	mac.Write([]byte("challenge:"))
-	mac.Write([]byte(payload))
-	expectSig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expectSig), []byte(value[dot+1:])) {
-		return time.Time{}, false
-	}
-	sec := int64(0)
-	for _, c := range payload {
-		if c < '0' || c > '9' {
-			return time.Time{}, false
-		}
-		sec = sec*10 + int64(c-'0')
-	}
-	issued := time.Unix(sec, 0).UTC()
-	if ttl > 0 {
-		now := time.Now().UTC()
-		// Reject anything issued more than ttl in the past, AND
-		// anything dated more than 5 minutes in the future — the
-		// latter catches a tampered timestamp that managed to retain
-		// a valid HMAC (impossible without the secret, but defensive
-		// in case of a future cryptanalysis or a mis-handled clock
-		// skew on the issuing daemon).
-		if now.Sub(issued) > ttl || issued.Sub(now) > 5*time.Minute {
-			return time.Time{}, false
-		}
-	}
-	return issued, true
 }
 
 // --- Helpers ------------------------------------------------------------

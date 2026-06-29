@@ -55,3 +55,29 @@ func TestDefaultValidates(t *testing.T) {
 		t.Fatalf("Default()+backend must validate: %v", err)
 	}
 }
+
+// TestBrowserChallengeBlockForcesDependencies closes the silent-no-op footgun:
+// turning on block mode without its prerequisites must not yield a control that
+// quietly does nothing. Validate has to force session tracking + PoW (the
+// escalation's mechanism) + the challenge-enabled flag on.
+func TestBrowserChallengeBlockForcesDependencies(t *testing.T) {
+	cfg := Default()
+	cfg.BackendURL = "http://localhost:3000"
+	cfg.BrowserChallengeBlock = true
+	// Operator left every dependency off.
+	cfg.SessionTrackingEnabled = false
+	cfg.PoWEnabled = false
+	cfg.BrowserChallengeEnabled = false
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if !cfg.SessionTrackingEnabled {
+		t.Error("block mode must force SessionTrackingEnabled (no tracking → no score to escalate)")
+	}
+	if !cfg.PoWEnabled {
+		t.Error("block mode must force PoWEnabled (PoW is the only way to shed the escalation)")
+	}
+	if !cfg.BrowserChallengeEnabled {
+		t.Error("block mode must force BrowserChallengeEnabled")
+	}
+}

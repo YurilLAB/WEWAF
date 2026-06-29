@@ -479,6 +479,31 @@ func main() {
 			"high-risk sessions will be blocked before they are ever challenged",
 			cfg.SessionBlockThreshold, cfg.PoWTriggerScore)
 	}
+	if cfg.BrowserChallengeBlock {
+		// PoW is force-enabled under block mode (config.Validate), so the +N
+		// escalation is armed. But it only challenges an un-verified session once
+		// that session's score reaches the PoW trigger; if no band sits at or
+		// below the bump, the +N never gates a session on its own — it only adds
+		// risk that must stack with other signals. Warn so a "block" control that,
+		// with these thresholds, never challenges a quiet un-verified client isn't
+		// mistaken for active enforcement.
+		trigger := cfg.PoWTriggerScore
+		if trigger <= 0 {
+			trigger = 60
+		}
+		bump := proxy.BrowserChallengeRiskBump
+		reaches := trigger <= bump ||
+			(cfg.SessionThrottleThreshold > 0 && cfg.SessionThrottleThreshold <= bump) ||
+			(cfg.SessionBlockThreshold > 0 && cfg.SessionBlockThreshold <= bump)
+		if !reaches {
+			log.Printf("WARN: browser_challenge_block is on but the +%d escalation reaches no "+
+				"action band on its own (pow_trigger_score=%d) — an un-verified session is "+
+				"challenged only after it accrues ~%d of other risk, and a cookie-rotating no-JS "+
+				"bot is not caught. Lower pow_trigger_score toward %d to challenge every un-verified "+
+				"session (this also challenges cross-site POST / XHR / API from non-JS clients).",
+				bump, trigger, trigger-bump, bump)
+		}
+	}
 
 	// Background telemetry collectors.
 	rootCtx, rootCancel := context.WithCancel(context.Background())

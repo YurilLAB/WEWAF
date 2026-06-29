@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// verifyCookie / VerifyChallengeCookie parse attacker-supplied cookie values on
-// every request. A panic there is a per-request DoS, and a logic slip is an
-// auth bypass. Fuzz with arbitrary cookie strings and assert: never panic, and
-// a forged/garbage value never validates (only the tracker's own signing can
-// produce an accepted value).
+// verifyCookie parses attacker-supplied cookie values on every request. A
+// panic there is a per-request DoS, and a logic slip is an auth bypass. Fuzz
+// with arbitrary cookie strings and assert: never panic, and a forged/garbage
+// value never validates (only the tracker's own signing can produce an
+// accepted value).
 //
 // Run:  go test ./internal/session -run x -fuzz FuzzVerifyCookie -fuzztime 30s
 func FuzzVerifyCookie(f *testing.F) {
@@ -33,6 +33,5 @@ func FuzzVerifyCookie(f *testing.F) {
 				t.Fatalf("accepted a value that does not match its own signature: id=%q value=%q", id, value)
 			}
 		}
-		_, _ = tr.VerifyChallengeCookie(value, time.Hour) // must not panic
 	})
 }

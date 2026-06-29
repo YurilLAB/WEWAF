@@ -701,6 +701,18 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if payload.BrowserChallengeBlock != nil {
 			s.cfg.BrowserChallengeBlock = *payload.BrowserChallengeBlock
+			// Block mode escalates un-verified sessions toward the PoW gate, so it
+			// needs session tracking AND PoW (its mechanism) on, and implies the
+			// challenge is active — mirror config.Validate() here because hot-
+			// reload via this endpoint doesn't re-run Validate. (If PoW was off at
+			// startup the issuer won't exist until a restart; the escalation is
+			// still consistent, just not yet armed — block mode is best set in
+			// config so the issuer is built at boot.)
+			if s.cfg.BrowserChallengeBlock {
+				s.cfg.BrowserChallengeEnabled = true
+				s.cfg.SessionTrackingEnabled = true
+				s.cfg.PoWEnabled = true
+			}
 		}
 		if payload.SessionBlockThreshold != nil {
 			if v := *payload.SessionBlockThreshold; v >= 0 && v <= 100 {

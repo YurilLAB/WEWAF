@@ -856,7 +856,17 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Skipped for the PoW assets themselves, the verify endpoint, and
 	// anything served by the WAF's own admin/challenge surface — those
 	// MUST always pass through.
-	hdrScore := scoreFor(wp, sessID)
+	//
+	// Browser-challenge escalation: when BrowserChallengeBlock is on, a session
+	// that has NOT proven itself with an unforgeable PoW pass carries an extra
+	// risk weight (browserChallengeEscalation). This pushes un-verified sessions
+	// up the existing throttle→PoW→block ladder instead of standing up a
+	// separate, forgeable gate — the browser-integrity signals stay a soft score
+	// input, and PoW remains the hard, unspoofable step.
+	hdrScore := scoreFor(wp, sessID) + wp.browserChallengeEscalation(r, sessID)
+	if hdrScore > 100 {
+		hdrScore = 100
+	}
 	if wp.shouldGateWithPoW(r, hdrScore, sessID) && !isPoWBypassPath(r.URL.Path) {
 		wp.servePoWChallenge(w, r, hdrScore)
 		return
@@ -1277,6 +1287,16 @@ func (wp *WAFProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// changing any rule.
 	if sessID != "" && wp.sessions != nil && wp.sessions.Enabled() {
 		risk := wp.sessions.Score(sessID)
+		// NOTE: the browser-challenge escalation is deliberately NOT added here.
+		// It drives the PoW gate at the header phase only. If a request reaches
+		// this body phase with a non-zero escalation, the session is by
+		// definition NOT PoW-gate-eligible (an eligible one would have been
+		// served the challenge and returned above) — so letting the escalation
+		// push it over a low SessionBlockThreshold would hard-block an
+		// un-verified client that was never offered the PoW escape. The block
+		// band therefore enforces on raw session risk; PoW is the un-verified-
+		// session mechanism.
+		//
 		// Reputation friction: a known-bad IP (returning offender, fresh cookie,
 		// lapsed ban) gets a bounded bump toward the block band. Default-off
 		// (ReputationRiskBumpMax == 0) and consult is RLock+arithmetic only, so
