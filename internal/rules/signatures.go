@@ -135,7 +135,7 @@ func DefaultRules() []core.Rule {
 		{ID: "XSS-011", Name: "XSS MHTML Protocol", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "MHTML protocol payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)mhtml:`},
 
 		// === SQL Injection — immediate / high score ===
-		{ID: "SQLI-001", Name: "SQLi Union Select", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "UNION [ALL|DISTINCT] SELECT pattern", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)union(\s+|/\*[\s\S]{0,100}\*/)+((all|distinct)(\s+|/\*[\s\S]{0,100}\*/)+)?select`},
+		{ID: "SQLI-001", Name: "SQLi Union Select", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "UNION [ALL|DISTINCT] SELECT pattern", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)union(\s+|/\*[\s\S]{0,100}\*/|\()+((all|distinct)(\s+|/\*[\s\S]{0,100}\*/|\()+)?select`},
 		{ID: "SQLI-002", Name: "SQLi Stacked Destructive", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Stacked destructive query", Targets: []string{"args", "body"}, Pattern: `(?i);\s*(drop|delete|truncate|insert|update)\s`},
 		// Operands exclude "<" / ">" so natural-language "and >= for" / "use <=
 		// and ..." is not read as the tautology "and X=Y": a real SQL tautology
@@ -181,6 +181,39 @@ func DefaultRules() []core.Rule {
 		// natural text. Closes the keyword-anchoring blind spot for the same
 		// subquery-exfil class SQLI-031..033 target.
 		{ID: "SQLI-036", Name: "SQLi Clause Subquery", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Parenthesised SELECT…FROM subquery in an ORDER BY / GROUP BY clause", Targets: []string{"args", "body"}, Pattern: `(?i)\b(?:order|group)\s+by\b\s*\(\s*select\b[\s\S]{0,160}?\bfrom\b`},
+		// SQLI-037..039 close red-team-confirmed gaps (2026): the set-operator
+		// cousins of UNION, CTE/stacked WITH, and Postgres JSON-path accessors —
+		// all real column-exfil / blind-boolean primitives that carried no UNION /
+		// OR-1=1 fingerprint and so reached the backend unblocked.
+		//
+		// SQLI-037: INTERSECT / EXCEPT / MINUS produce the same column exfil as
+		// UNION. Anchored to a following SQL clause keyword (from/where/limit/…) so
+		// the rare English "everything except select …" prose doesn't false-
+		// positive without a SQL tail. Paren glue ("intersect(select") covered too.
+		{ID: "SQLI-037", Name: "SQLi Set Operator", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "INTERSECT/EXCEPT/MINUS SELECT column-exfil (UNION cousins)", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)[\d'")\]]\s*(?:intersect|except|minus)\b(?:\s+|/\*[\s\S]{0,100}\*/|\()+(?:(?:all|distinct)(?:\s+|/\*[\s\S]{0,100}\*/|\()+)?select\b[\s\S]{0,200}?\b(?:from|where|limit|having|order|group)\b`},
+		// SQLI-038: a CTE (`WITH name AS (SELECT|DELETE|…)`) is a stacked-query and
+		// data-modifying primitive the `;`-keyword list (SQLI-002/023) never named.
+		// The `AS (` + DML shape is SQL, not natural text, so it is low-FP without a
+		// leading `;`.
+		{ID: "SQLI-038", Name: "SQLi CTE Injection", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Common Table Expression (WITH … AS (DML)) injection", Targets: []string{"args", "body"}, Pattern: `(?i)\bwith\s+\w+\s*(?:\([^)]*\))?\s+as\s*\(\s*(?:select|delete|update|insert|values)\b`},
+		// SQLI-039: PostgreSQL/MySQL JSON-path accessors (-> ->> #> #>>) reaching a
+		// quoted key / index — the Team82 SQL-JSON class that defeats the tautology
+		// rules because the operand class can't cross the '>' in '->>'. Requires a
+		// preceding operand char and a following quoted-key/index/brace so a bare
+		// "a -> b" text arrow doesn't match.
+		{ID: "SQLI-039", Name: "SQLi JSON Path Operator", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "SQL JSON-path operator (->>, #>, #>>) to a quoted key (Team82 SQL-JSON)", Targets: []string{"args", "body"}, Pattern: `(?i)[\w)\]]\s*(?:->>|#>>|#>)\s*(?:'[^']*'|"[^"]*"|\d+|\{)`},
+		// SSTI-007: Python sandbox-escape dunders inside a Jinja/Twig STATEMENT
+		// block {% … %}. The existing dunder rules anchor on the {{ }} expression
+		// delimiter, so a `{% set x = ''.__class__.__mro__[1].__subclasses__() %}`
+		// statement evaded the whole SSTI class. Scoped to the {% %} tag to avoid
+		// false-positives on a bare `__class__` token in benign input.
+		{ID: "SSTI-007", Name: "SSTI Statement Dunder", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "Jinja/Twig {% %} statement block with Python sandbox-escape dunder", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\{%[\s\S]{0,200}?__(?:class|subclasses|mro|globals|builtins|base|init)__`},
+		// XSS-015: modern HTML event-handler attributes the legacy handler lists
+		// omit (ontoggle/onbeforetoggle, the pointer/wheel/animation/transition
+		// families, …). Matches the HANDLER ATTRIBUTE in a tag, so JS-payload
+		// obfuscation like `ontoggle=(alert)(1)` — which breaks the `alert(`-anchored
+		// rules — can't evade it.
+		{ID: "XSS-015", Name: "XSS Modern Event Handler", Phase: core.PhaseRequestBody, Score: 100, Action: core.ActionBlock, Description: "HTML tag with a modern on* event-handler attribute", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)<[a-z][\w:-]*\b[^>]{0,200}?\son(?:toggle|beforetoggle|pointer(?:down|up|move|over|out|enter|leave|cancel|rawupdate)|auxclick|wheel|(?:animation|transition)(?:start|end|run|cancel|iteration)|beforeinput|scrollend|securitypolicyviolation|contentvisibilityautostatechange)\s*=`},
 
 		// === NoSQL Injection ===
 		// headers target dropped — `$gt`/`$ne`/`$where`-style tokens occur in
@@ -752,7 +785,7 @@ func DefaultRules() []core.Rule {
 		// ============================================================
 
 		// Next.js middleware bypass (CVE-2025-29927)
-		{ID: "CVE-2025-29927", Name: "Next.js middleware bypass", Phase: core.PhaseRequestHeaders, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "Next.js x-middleware-subrequest header forging (CVE-2025-29927)", Targets: []string{"headers.x-middleware-subrequest", "headers"}, Pattern: `(?i)middleware(?::middleware)*`},
+		{ID: "CVE-2025-29927", Name: "Next.js middleware bypass", Phase: core.PhaseRequestHeaders, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "Next.js x-middleware-subrequest header forging (CVE-2025-29927)", Targets: []string{"headers.x-middleware-subrequest", "headers"}, Pattern: `(?i)^(?:[\w./-]*/)?_?middleware(?::(?:[\w./-]*/)?_?middleware)*$`},
 
 		// Next.js cache poisoning variants
 		{ID: "CVE-2024-34351", Name: "Next.js Server Action SSRF", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 80, Action: core.ActionBlock, Description: "Next.js Server Action host-header SSRF", Targets: []string{"headers.host", "headers.origin"}, Pattern: `(?i)^(?:127\.0\.0\.1|localhost|0\.0\.0\.0|169\.254\.|::1|metadata\.internal)`},
@@ -770,7 +803,13 @@ func DefaultRules() []core.Rule {
 		{ID: "CVE-2024-21762", Name: "FortiOS SSL-VPN OOB write probe", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 80, Action: core.ActionBlock, Description: "Fortinet SSL-VPN /remote/hostcheck_validate probe", Targets: []string{"uri", "path"}, Pattern: `(?i)/remote/hostcheck_(?:validate|save)\b`},
 
 		// JetBrains TeamCity auth bypass (CVE-2024-27198)
-		{ID: "CVE-2024-27198", Name: "TeamCity auth bypass", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "TeamCity path-traversal auth bypass (CVE-2024-27198)", Targets: []string{"uri", "path"}, Pattern: `(?i)/(?:\.\.|%2e%2e)(?:/|%2f);(?:jsessionid|sid)=[^/]+/(?:app/rest|admin)`},
+		// The real CVE-2024-27198 admin-takeover requests an arbitrary unauthenticated
+		// path and smuggles a privileged REST/admin endpoint via a `;.jsp` matrix
+		// parameter (TeamCity's servlet routing serves the unauth `.jsp` view while
+		// dispatching to the REST handler), often delivered through a `jsp=` param —
+		// e.g. `/hax?jsp=/app/rest/users;.jsp`. The previous pattern modelled a
+		// `;jsessionid=` traversal that the published exploit never uses.
+		{ID: "CVE-2024-27198", Name: "TeamCity auth bypass", Phase: core.PhaseRequestHeaders, Category: "cve.2024", Score: 100, Action: core.ActionBlock, Description: "TeamCity ;.jsp matrix-parameter auth bypass (CVE-2024-27198)", Targets: []string{"uri", "path"}, Pattern: `(?i);\.jsp\b|[?&]jsp=/?(?:app/rest|admin)\b`},
 
 		// GitLab account takeover (CVE-2023-7028)
 		{ID: "CVE-2023-7028", Name: "GitLab password reset takeover", Phase: core.PhaseRequestBody, Category: "cve.2023", Score: 80, Action: core.ActionBlock, Description: "GitLab password reset with array email param (CVE-2023-7028)", Targets: []string{"body", "args"}, Pattern: `(?i)user\[email\]\[\]=.+(?:&|$).*user\[email\]\[\]=`},

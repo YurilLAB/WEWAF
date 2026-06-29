@@ -73,7 +73,14 @@ func CRSRules() []core.Rule {
 		// ============================================================
 		// REQUEST-921: Protocol Attack (PL1-PL3)
 		// ============================================================
-		{ID: "CRS-921110", Name: "CRS HTTP Request Smuggling", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.smuggling", Score: 100, Action: core.ActionBlock, Description: "CRS: HTTP smuggling attempt in body", Targets: []string{"body"}, Pattern: `(?im)(?:\r\n|\n|\r)(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s+/`},
+		// Two alternatives: (1) a method+path on a SECOND line of the body (the
+		// classic embedded-request smuggle); (2) a FULL request line at the body
+		// START — `METHOD path HTTP/N` at offset 0 — which the newline-anchored
+		// form missed, leaving the CL.0 / 0.CL desync primitive (a request-shaped
+		// body the backend may replay on a pooled keepalive connection) invisible.
+		// The offset-0 alt requires the `HTTP/` version token so a benign body
+		// merely beginning "GET /x" doesn't false-positive.
+		{ID: "CRS-921110", Name: "CRS HTTP Request Smuggling", Phase: core.PhaseRequestBody, Paranoia: 1, Category: "crs.smuggling", Score: 100, Action: core.ActionBlock, Description: "CRS: HTTP smuggling attempt in body", Targets: []string{"body"}, Pattern: `(?im)(?:\r\n|\n|\r)(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s+/|^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s+\S+\s+HTTP/\d`},
 		{ID: "CRS-921120", Name: "CRS HTTP Response Splitting", Phase: core.PhaseRequestHeaders, Paranoia: 1, Category: "crs.smuggling", Score: 100, Action: core.ActionBlock, Description: "CRS: CRLF injection in argument", Targets: []string{"args", "uri", "uri_raw"}, Pattern: `(?:\r\n|\n\r?|%0[dD]%0[aA]|%5[cC]r%5[cC]n).*?(?:HTTP/\d|Location:|Set-Cookie:|Content-Type:)`},
 		{ID: "CRS-921130", Name: "CRS Response Splitting in Header", Phase: core.PhaseRequestHeaders, Paranoia: 1, Category: "crs.smuggling", Score: 100, Action: core.ActionBlock, Description: "CRS: CRLF in header value", Targets: []string{"headers"}, Pattern: `[\r\n]|%0[dD]%0[aA]`},
 		{ID: "CRS-921140", Name: "CRS Header Injection via payload", Phase: core.PhaseRequestHeaders, Paranoia: 1, Category: "crs.smuggling", Score: 80, Action: core.ActionBlock, Description: "CRS: injection of HTTP headers via user input", Targets: []string{"args", "body"}, Pattern: `(?i)(?:\r\n|\n|%0a|%0d)+\s*(?:Set-Cookie|Location|Content-Type|Content-Length|Transfer-Encoding)\s*:`},

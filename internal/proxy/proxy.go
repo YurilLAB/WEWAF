@@ -2412,6 +2412,7 @@ var metadataIPs = map[string]struct{}{
 	"169.254.169.254": {}, // AWS, GCP, Azure, OpenStack, DO
 	"100.100.100.200": {}, // Alibaba Cloud
 	"fd00:ec2::254":   {}, // AWS IMDSv2 over IPv6
+	"168.63.129.16":   {}, // Azure WireServer / host plugin (goalstate, DHCP/DNS) — reachable from every Azure VM
 }
 
 // dangerReason is the DNS-cached version of resolvedDangerReason. The
@@ -2481,7 +2482,12 @@ func resolvedDangerReason(host string) string {
 // low-32-bit IPv4 and dials THAT, so 64:ff9b::a9fe:a9fe actually reaches
 // 169.254.169.254 — the SSRF guard must classify the embedded IPv4, not the
 // IPv6 wrapper.
-var nat64Prefix = mustParseCIDR("64:ff9b::/96")
+// nat64Prefixes are the NAT64 prefixes whose low 32 bits embed an IPv4 the
+// gateway dials: RFC 6052 well-known 64:ff9b::/96 and the RFC 8215 local-use
+// 64:ff9b:1::/48 (operators carve a /96 out of it, so the embedded IPv4 is still
+// the low 32 bits). Without the local-use prefix, 64:ff9b:1::a9fe:a9fe reaches
+// 169.254.169.254 unblocked.
+var nat64Prefixes = mustParseCIDRs([]string{"64:ff9b::/96", "64:ff9b:1::/48"})
 
 // egressBlockedRanges are the CIDRs an outbound request must never dial,
 // covering the internal/reserved ranges Go's IsPrivate/IsLoopback/IsLinkLocal
@@ -2517,10 +2523,15 @@ func mustParseCIDRs(in []string) []*net.IPNet {
 // nat64Embedded returns the IPv4 a NAT64 (RFC 6052 /96) address embeds, or nil.
 func nat64Embedded(ip net.IP) net.IP {
 	v16 := ip.To16()
-	if v16 == nil || !nat64Prefix.Contains(ip) {
+	if v16 == nil {
 		return nil
 	}
-	return net.IPv4(v16[12], v16[13], v16[14], v16[15])
+	for _, p := range nat64Prefixes {
+		if p.Contains(ip) {
+			return net.IPv4(v16[12], v16[13], v16[14], v16[15])
+		}
+	}
+	return nil
 }
 
 // classifyIP returns a non-empty block reason for any destination an outbound

@@ -187,6 +187,7 @@ var metadataIPs = []net.IP{
 	net.ParseIP("169.254.169.254"), // AWS, GCP, Azure, OpenStack, DigitalOcean
 	net.ParseIP("100.100.100.200"), // Alibaba Cloud
 	net.ParseIP("fd00:ec2::254"),   // AWS IMDS over IPv6
+	net.ParseIP("168.63.129.16"),   // Azure WireServer / host plugin
 }
 
 // targetDisallowed returns a non-empty reason if ip must not be dialed.
