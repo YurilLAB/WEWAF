@@ -17,9 +17,20 @@ func FuzzChainResume(f *testing.F) {
 	f.Add([]byte("{\n{\n{\n"))
 	f.Add([]byte("{\"seq\":18446744073709551615}\n")) // uint64 max seq
 	f.Add([]byte(""))
+	// Create ONE temp dir for the whole run and reuse a single file path each
+	// iteration (rewritten via WriteFile, which truncates). The previous
+	// per-iteration t.TempDir()+create+cleanup made every exec a handful of
+	// filesystem syscalls — ~1k execs/s vs the 100k+/s of CPU-bound targets —
+	// which under load made the post-fuzztime shutdown miss its deadline
+	// ("context deadline exceeded") without ever finding a real crash. One reused
+	// dir keeps each exec a single write + open, so the target actually explores.
+	dir, err := os.MkdirTemp("", "fuzzchainresume")
+	if err != nil {
+		f.Fatalf("MkdirTemp: %v", err)
+	}
+	f.Cleanup(func() { _ = os.RemoveAll(dir) })
+	path := filepath.Join(dir, "audit.log")
 	f.Fuzz(func(t *testing.T, data []byte) {
-		dir := t.TempDir()
-		path := filepath.Join(dir, "audit.log")
 		if err := os.WriteFile(path, data, 0o600); err != nil {
 			t.Skip()
 		}

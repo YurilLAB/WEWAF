@@ -94,6 +94,11 @@ func FuzzEngineRequest(f *testing.F) {
 	f.Add("/p?q=<script>", "id=1' OR '1'='1", "text/plain", "u=v")
 	f.Add("/a%2e%2e/b", "{\"$ne\":null}", "application/json", "k=1")
 	f.Add("/x?f=php://filter", "+ADw-script+AD4-", "text/plain; charset=utf-7", "")
+	// Regression seeds for the bypasses the bypass-hunt workflow surfaced and we
+	// closed: UNION DISTINCT SELECT (UNION rules omitted the distinct branch) and
+	// java%00script: (XSS-002 separator class omitted percent-encoded controls).
+	f.Add("/p?q=1'+UNION+DISTINCT+SELECT+a", `{"id":"1' UNION DISTINCT SELECT a FROM b-- -"}`, "application/json", "")
+	f.Add("/p?x=java%00script:alert(1)", "y=java%0bscript:alert(1)", "text/plain", "")
 	eng := newFuzzEngine(f)
 	f.Fuzz(func(t *testing.T, target, body, contentType, cookie string) {
 		// Build a request defensively; skip inputs net/http itself rejects.
