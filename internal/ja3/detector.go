@@ -78,6 +78,14 @@ func (d *Detector) SetLists(bad, good map[string]string) {
 	}
 }
 
+// maxBadJA3 bounds the bad fingerprint set. The curated defaults plus every
+// reputable JA3 feed total a few thousand entries; this ceiling is far above
+// any legitimate list but stops a compromised/hijacked feed from growing the
+// hard-block set without limit (it pairs with the feed-layer per-fetch entry
+// cap and the ±50% drift guard). Once reached, new feed hashes are dropped —
+// the FP-safe direction: we never expand the set of fingerprints that can 403.
+const maxBadJA3 = 1 << 16 // 65536
+
 // MergeBad adds entries to the bad list without touching the good list.
 // Used by the intel-feed package to layer external sources on top of the
 // curated defaults. Existing entries with the same hash are kept (the
@@ -96,6 +104,9 @@ func (d *Detector) MergeBad(entries map[string]string) int {
 		}
 		if _, exists := d.bad[k]; exists {
 			continue
+		}
+		if len(d.bad) >= maxBadJA3 {
+			break // cap reached — refuse to grow the hard-block set further
 		}
 		d.bad[k] = v
 		added++

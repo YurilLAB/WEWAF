@@ -11,6 +11,17 @@ import (
 	"strings"
 )
 
+// maxFeedEntries caps how many records a single feed body may yield. A
+// reputation feed lists specific hostile hosts/ranges and never approaches this
+// many entries (the largest public blocklists top out in the low hundreds of
+// thousands); the only ceiling otherwise is the 50 MiB body cap, which lets a
+// compromised feed parse into ~6.5M Entry structs (hundreds of MB transient
+// allocation) on a single fetch — and, on the FIRST fetch, the ±50% drift guard
+// has no prior count to compare against, so nothing else bounds it. Refusing the
+// whole feed once the cap is reached (rather than truncating) is the FP-safe
+// direction: a feed this large is anomalous, so we apply none of it.
+const maxFeedEntries = 1_000_000
+
 // ParseLinePerIP handles the most common feed format: one IP or CIDR
 // per line, possibly with `# comment` lines and blank lines. Used by
 // FireHOL Level 1, blocklist.de, CINS Score, ET compromised, and
@@ -50,6 +61,9 @@ func ParseLinePerIP(body []byte, source string) ([]Entry, error) {
 			continue
 		}
 		out = append(out, entry)
+		if len(out) >= maxFeedEntries {
+			return nil, fmt.Errorf("intel: feed %q exceeds %d entries; refusing", source, maxFeedEntries)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return out, err
@@ -66,12 +80,22 @@ func ParseLinePerIP(body []byte, source string) ([]Entry, error) {
 // link-local / loopback / RFC1918 ranges should never appear in a
 // reputation feed and including them would sever localhost / health
 // checks / internal traffic.
+//
+// The list also covers the non-unicast / reserved "martian" blocks that a
+// reputation feed must never reference because no legitimate public source
+// lives there: 0.0.0.0/8 ("this network", RFC 1122 — a /9 rooted here would
+// otherwise pass feedCIDRTooBroad's /8 threshold yet still ban ~2B public
+// addresses), 240.0.0.0/4 (reserved/Class-E, also covers 255.255.255.255
+// broadcast), and 224.0.0.0/4 + ff00::/8 (multicast). Without these, a feed
+// CIDR or host whose network address falls in one of them (e.g. 0.0.0.0/10,
+// 225.0.0.0/24, ff0e::/16) would be accepted as a ban entry.
 var dangerousFeedRanges = func() []*net.IPNet {
 	in := []string{
 		"0.0.0.0/0", "::/0",
-		"127.0.0.0/8", "::1/128",
+		"0.0.0.0/8", "127.0.0.0/8", "::1/128",
 		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 		"169.254.0.0/16", "fc00::/7", "fe80::/10",
+		"224.0.0.0/4", "240.0.0.0/4", "ff00::/8",
 	}
 	out := make([]*net.IPNet, 0, len(in))
 	for _, s := range in {
@@ -166,11 +190,11 @@ func classifyIP(s string) (Entry, bool) {
 	if ip == nil {
 		return Entry{}, false
 	}
-	// Reject loopback / link-local / unspecified bare IPs from feeds —
-	// these should never come from a reputation list and including
+	// Reject loopback / link-local / unspecified / multicast bare IPs from
+	// feeds — these should never come from a reputation list and including
 	// them in the ban set breaks local probes / health checks.
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified() || ip.IsPrivate() {
+		ip.IsUnspecified() || ip.IsPrivate() || ip.IsMulticast() {
 		return Entry{}, false
 	}
 	k := KindIPv4
@@ -178,6 +202,12 @@ func classifyIP(s string) (Entry, bool) {
 	if ip.To4() == nil {
 		k = KindIPv6
 		suffix = "/128"
+	}
+	// Run the host through the same dangerous-range guard as CIDR entries so a
+	// reserved-martian host (0.0.0.0/8 "this network", 240.0.0.0/4 reserved)
+	// can't slip in as a bare /32 — Go has no stdlib predicate for those.
+	if _, hostNet, err := net.ParseCIDR(ip.String() + suffix); err == nil && isDangerousRange(hostNet) {
+		return Entry{}, false
 	}
 	return Entry{Kind: k, Value: ip.String() + suffix, Reason: "feed"}, true
 }
@@ -234,6 +264,9 @@ func ParseSSLBLJA3(body []byte, source string) ([]Entry, error) {
 			Value:  strings.ToLower(hash),
 			Reason: reason,
 		})
+		if len(out) >= maxFeedEntries {
+			return nil, fmt.Errorf("intel: JA3 feed %q exceeds %d entries; refusing", source, maxFeedEntries)
+		}
 	}
 	if len(out) == 0 {
 		return nil, errors.New("no JA3 records parsed")
@@ -288,6 +321,9 @@ func ParseLinePerUA(body []byte, source string) ([]Entry, error) {
 			continue
 		}
 		out = append(out, Entry{Kind: KindUA, Value: line})
+		if len(out) >= maxFeedEntries {
+			return nil, fmt.Errorf("intel: UA feed %q exceeds %d entries; refusing", source, maxFeedEntries)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return out, err
@@ -329,6 +365,9 @@ func ParseCISAKEV(body []byte, source string) ([]Entry, error) {
 			Value:  v.CveID,
 			Reason: fmt.Sprintf("%s/%s: %s (added %s)", v.VendorProject, v.Product, v.VulnerabilityName, v.DateAdded),
 		})
+		if len(out) >= maxFeedEntries {
+			return nil, fmt.Errorf("intel: KEV feed %q exceeds %d entries; refusing", source, maxFeedEntries)
+		}
 	}
 	if len(out) == 0 {
 		return nil, errors.New("no KEV records parsed")
@@ -368,6 +407,9 @@ func ParseSpamhausDropJSON(body []byte, source string) ([]Entry, error) {
 		}
 		entry.Reason = rec.SBLID
 		out = append(out, entry)
+		if len(out) >= maxFeedEntries {
+			return nil, fmt.Errorf("intel: feed %q exceeds %d entries; refusing", source, maxFeedEntries)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return out, err

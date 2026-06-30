@@ -48,7 +48,10 @@ func NewConsensus(minSources int) *Consensus {
 // Bounded: once the tracked-value cap is hit, NEW medium values are not
 // recorded and therefore not enforced (fail toward NOT banning — the FP-safe
 // direction), so a feed dumping millions of unique values can't exhaust memory
-// or force bans.
+// or force bans. This deliberate freeze trades eventual detection of brand-new
+// medium values (recoverable on restart) for a hard memory bound and a
+// guarantee that a unique-value flood can never manufacture a ban; it is pinned
+// by TestConsensusBoundedCap.
 func (c *Consensus) Enforce(value, source string, conf Confidence) bool {
 	switch conf {
 	case ConfHigh:

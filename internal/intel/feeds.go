@@ -38,6 +38,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -232,6 +233,27 @@ func (m *Manager) AddSource(s Source) error {
 	}
 	if m.started.Load() {
 		return errors.New("intel: AddSource called after Start; restart required to register new feed")
+	}
+	// Transport hygiene. Only http/https feed URLs are permitted (reject
+	// file://, gopher://, ftp://, … — belt-and-suspenders against a malformed
+	// or abusive source even though redirects are already refused). Then, an
+	// ENFORCE-CAPABLE feed (medium/high confidence — it can drive bans) MUST
+	// use authenticated HTTPS transport: over plaintext http an on-path
+	// attacker can rewrite the body and inject arbitrary ban entries, which is
+	// the same primitive as a compromised feed. Such a feed is downgraded to
+	// score-only (ConfLow) rather than dropped, preserving the signal while
+	// removing the MITM-ban path. (All curated enforce-capable feeds are
+	// already https, so this is a forward guard, not a behaviour change.)
+	if err := validFeedScheme(s.URL); err != nil {
+		return fmt.Errorf("intel: source %q url: %w", s.Name, err)
+	}
+	if s.Mirror != "" {
+		if err := validFeedScheme(s.Mirror); err != nil {
+			return fmt.Errorf("intel: source %q mirror: %w", s.Name, err)
+		}
+	}
+	if s.Confidence >= ConfMedium && !isHTTPS(s.URL) {
+		s.Confidence = ConfLow
 	}
 	if s.RefreshEvery < time.Minute {
 		s.RefreshEvery = time.Hour
@@ -494,11 +516,16 @@ func (m *Manager) tryAll(ctx context.Context, s Source, st *sourceState) ([]byte
 // httpFetch performs a single GET with conditional headers. Returns
 // (body, newETag, newLastModified, err). 304 responses produce a
 // sentinel error so callers can distinguish "no change" from "failed".
-func (m *Manager) httpFetch(ctx context.Context, url, etag, modified string) ([]byte, string, string, error) {
-	if url == "" {
+func (m *Manager) httpFetch(ctx context.Context, rawURL, etag, modified string) ([]byte, string, string, error) {
+	if rawURL == "" {
 		return nil, "", "", errors.New("empty URL")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	// Defence in depth: every fetch path (primary, mirror) re-checks the scheme
+	// so a non-http(s) URL can never reach the HTTP client.
+	if err := validFeedScheme(rawURL); err != nil {
+		return nil, "", "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -536,6 +563,31 @@ func (m *Manager) httpFetch(ctx context.Context, url, etag, modified string) ([]
 		return nil, "", "", fmt.Errorf("body exceeds %d bytes", limit)
 	}
 	return body, resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), nil
+}
+
+// validFeedScheme rejects any feed URL that is not http(s) or that lacks a
+// host. Guards against file://, gopher://, ftp:// and other scheme abuse.
+func validFeedScheme(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("unparseable url: %w", err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf("unsupported scheme %q (only http/https)", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("url has no host")
+	}
+	return nil
+}
+
+// isHTTPS reports whether raw is a well-formed https URL — used to decide
+// whether an enforce-capable feed may keep its trust level.
+func isHTTPS(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.Host != ""
 }
 
 var errNotModified = errors.New("not modified")

@@ -252,6 +252,20 @@ func DefaultRules() []core.Rule {
 		// response-splitting in the raw target — encoded CR/LF followed by a
 		// header name + colon — is caught precisely by engine.crlfInjectionRe.
 		{ID: "CRLF-001", Name: "CRLF Injection", Phase: core.PhaseRequestHeaders, Score: 60, Action: core.ActionBlock, Description: "CRLF line injection sequence", Targets: []string{"args", "headers", "uri"}, Pattern: `(?i)(%0[dD]%0[aA]|%0[aA]%0[dD]|\r\n)`},
+		// CRLF-003: header injection in the request BODY. The engine's generic
+		// CRLF+header detector (crlfInjectionRe / CRLF-002) runs ONLY on the raw
+		// request target, and the body-phase CRLF rules (CRS-921140/921160)
+		// enumerate only transport headers (Set-Cookie/Location/Content-*/
+		// Transfer-Encoding) — so a CRLF-injected mail or internal-redirect header
+		// in a POST form/JSON field hits no signature. This covers the two
+		// high-severity, low-FP cases: mail-header / Bcc-relay injection
+		// (bcc/reply-to/return-path) and response-splitting into nginx/lighttpd
+		// internal-file-serving headers (x-accel-redirect/x-sendfile = arbitrary
+		// internal-file disclosure / SSRF). Matches encoded %0d%0a (urlencoded
+		// body), real CR/LF (json-decoded body) and literal \r/\n escapes (raw json
+		// body); the specific header name + colon requirement keeps benign
+		// multi-line text fields from matching.
+		{ID: "CRLF-003", Name: "Body Header Injection", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "CRLF mail/internal-redirect header injection in request body", Targets: []string{"body"}, Pattern: `(?i)(?:%0[ad]|[\r\n]|\\[rn])+\s*(?:bcc|reply-to|return-path|x-accel-redirect|x-sendfile|x-lighttpd-send-file)\s*:\s*\S`},
 
 		// === Prototype Pollution ===
 		{ID: "PROTO-001", Name: "Prototype Pollution", Phase: core.PhaseRequestBody, Score: 50, Action: core.ActionLog, Description: "Prototype pollution payload", Targets: []string{"args", "body"}, Pattern: `(?i)(__proto__|constructor\.prototype|constructor\[prototype\])`},
@@ -401,12 +415,33 @@ func DefaultRules() []core.Rule {
 		// justify that false-positive rate; the remaining alternatives are
 		// specific XPath function/axis syntax.
 		{ID: "XPATH-001", Name: "XPath Injection", Phase: core.PhaseRequestBody, Score: 60, Action: core.ActionBlock, Description: "XPath injection payload", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)(/'?\s*(?:or|and)\s+['"]?\d+['"]?\s*=\s*['"]?\d+|count\s*\(\s*child::|local-name\s*\(\s*\)|namespace-uri\s*\(\s*\)|/text\s*\(\s*\)|substring\s*\(\s*|\]\s*\|\s*//)`},
+		// XQuery (a superset of XPath) carries its own namespace-qualified RCE/SSRF
+		// vocabulary that the XPath rules above don't model. RCE-006's bare
+		// eval(/exec(/system( only catches xdmp:eval(/util:eval( incidentally (via
+		// the literal substring) and entirely misses xdmp:value/invoke/spawn/
+		// http-get/document-load and eXist process:execute (note: exec\( does NOT
+		// match execute(). Every alternative is namespace-prefixed (xdmp:/util:/
+		// system:/process:/proc:) + '(' so benign dotted Java/JS .execute( and bare
+		// value(/exec( do not match — low FP. Reachable: args are URL-decoded so
+		// xdmp%3avalue%28 -> xdmp:value(.
+		{ID: "XQUERY-001", Name: "XQuery Injection", Phase: core.PhaseRequestBody, Score: 90, Action: core.ActionBlock, Description: "XQuery (MarkLogic/eXist) RCE/SSRF function call", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)\b(?:xdmp:(?:eval|value|invoke|spawn|http-(?:get|post)|document-(?:load|get))|util:eval(?:-inline)?|system:(?:exec|as-user)|process:execute|proc:(?:system|execute))\s*\(`},
 
 		// === SSI Injection ===
 		{ID: "SSI-001", Name: "SSI Injection", Phase: core.PhaseRequestBody, Score: 80, Action: core.ActionBlock, Description: "Server-Side Include directive", Targets: []string{"args", "body", "headers"}, Pattern: `(?i)<!--#(?:include|exec|printenv|config|fsize|flastmod|echo)\s+`},
 
 		// === Cache Poisoning ===
 		{ID: "CACHE-001", Name: "Cache Poisoning Headers", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Suspicious cache poisoning headers", Targets: []string{"headers"}, Pattern: `(?i)(X-Original-Url|X-Rewrite-Url|X-Forwarded-Host|X-Forwarded-Scheme|X-HTTP-Method-Override|Transfer-Encoding)\s*:\s*[^:\r\n]{2,}`},
+		// WCD-001: web cache deception via path confusion. A dynamic/authenticated
+		// path suffixed with a matrix-parameter segment that ends in a static
+		// extension (e.g. /api/users/me;cache.css) can trick an edge cache into
+		// caching the private response under a "static asset" key any user can
+		// read. Targets uri_raw because Canonicalize strips %00 / collapses slashes
+		// and would lose the ';' delimiter. FP-safe by construction: the '^[^?]*'
+		// anchor keeps the ';' in the PATH (query-string semicolons excluded), and
+		// requiring the extension to FOLLOW the ';segment' with no intervening '/'
+		// excludes both the legit /dir/file.css and the Java /file.css;jsessionid=
+		// rewriting form. Log-level, like the other cache rules.
+		{ID: "WCD-001", Name: "Web Cache Deception", Phase: core.PhaseRequestHeaders, Score: 40, Action: core.ActionLog, Description: "Cache-deception path confusion (matrix-param before a static extension)", Targets: []string{"uri_raw"}, Pattern: `(?i)^[^?\s]*;[^?\s/]*\.(?:css|js|json|map|png|jpe?g|gif|svg|ico|woff2?|ttf|eot|webp|avif)(?:$|[?#])`},
 
 		// === HTTP Method Override ===
 		{ID: "METHOD-001", Name: "HTTP Method Override", Phase: core.PhaseRequestHeaders, Score: 30, Action: core.ActionLog, Description: "HTTP method-override header (can bypass method-based access control)", Targets: []string{"headers.x-http-method", "headers.x-http-method-override", "headers.x-method-override"}, Pattern: `(?i)^\s*(?:GET|POST|PUT|DELETE|PATCH|TRACE|TRACK|CONNECT|OPTIONS|HEAD|PROPFIND)\s*$`},
@@ -822,6 +857,14 @@ func DefaultRules() []core.Rule {
 
 		// XWiki unauthenticated RCE (CVE-2025-24893)
 		{ID: "CVE-2025-24893", Name: "XWiki SolrSearch RCE", Phase: core.PhaseRequestHeaders, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "XWiki SolrSearch Groovy injection (CVE-2025-24893)", Targets: []string{"uri", "args"}, Pattern: `(?i)SolrSearch[^?]*\?[^=]*text=[^&]*\{\{async[^}]*\}\}`},
+
+		// SharePoint "ToolShell" unauth ViewState RCE (CVE-2025-53770 / -53771).
+		// The mass-exploited July-2025 chain hits ToolPane.aspx in edit mode with a
+		// self-referential a=/ToolPane.aspx (the auth-bypass) before delivering a
+		// forged __VIEWSTATE gadget. Requiring BOTH DisplayMode=Edit AND the a=/
+		// ToolPane self-ref (either order) keeps it off legitimate authenticated
+		// SharePoint page-editing traffic (which never sends the a=/ self-ref).
+		{ID: "CVE-2025-53770", Name: "SharePoint ToolShell RCE", Phase: core.PhaseRequestHeaders, Category: "cve.2025", Score: 100, Action: core.ActionBlock, Description: "SharePoint ToolPane.aspx edit-mode auth bypass / ViewState RCE (CVE-2025-53770)", Targets: []string{"uri"}, Pattern: `(?i)/_layouts/(?:1[56])/toolpane\.aspx\?(?:[^ ]*displaymode=edit[^ ]*a=/toolpane|[^ ]*a=/toolpane[^ ]*displaymode=edit)`},
 
 		// Spring Cloud Function RCE (CVE-2022-22963) — still seen in scans
 		{ID: "CVE-2022-22963", Name: "Spring Cloud Function SpEL", Phase: core.PhaseRequestHeaders, Category: "cve.2022", Score: 100, Action: core.ActionBlock, Description: "spring.cloud.function.routing-expression header SpEL", Targets: []string{"headers"}, Pattern: `(?i)spring\.cloud\.function\.routing-expression\s*[:=]`},
