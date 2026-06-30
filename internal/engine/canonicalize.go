@@ -64,8 +64,14 @@ func Canonicalize(s string) string {
 		out = strings.ReplaceAll(out, "\x00", "")
 	}
 	out = norm.NFKC.String(out)
-	out = collapseSlashes(out)
+	// Strip zero-width / format / control runes and fold whitespace BEFORE
+	// collapsing slashes. Done in the other order, a zero-width char wedged into
+	// a "://" scheme separator (e.g. "https:​//evil") defeated
+	// collapseSlashes's scheme-second-slash preservation — the result became
+	// "https:/evil", silently evading every scheme-anchored rule (https?://,
+	// gopher://, the SSRF/open-redirect rules). Surfaced by FuzzCanonicalizeReversal.
 	out = normalizeControlAndSpace(out)
+	out = collapseSlashes(out)
 	return out
 }
 
